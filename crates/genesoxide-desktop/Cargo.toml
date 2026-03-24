@@ -1,0 +1,17 @@
+[package]
+name = "genesoxide-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "genesoxide"
+path = "src/main.rs"
+
+[dependencies]
+genesoxide-core = { path = "../genesoxide-core" }
+genesoxide-config = { path = "../genesoxide-config" }
+pixels = "0.15"
+winit = "0.30"
+gilrs = "0.11"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

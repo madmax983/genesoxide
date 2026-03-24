@@ -1,0 +1,10 @@
+[package]
+name = "genesoxide-test-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+genesoxide-core = { path = "../genesoxide-core" }
+
+[dev-dependencies]
+proptest = "1"

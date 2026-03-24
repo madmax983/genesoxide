@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/genesoxide-core",
+    "crates/genesoxide-config",
+    "crates/genesoxide-desktop",
+    "crates/genesoxide-test-harness",
+]
+
+[profile.dev.package.genesoxide-core]
+opt-level = 2

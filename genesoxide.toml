@@ -1,0 +1,8 @@
+[desktop]
+rom_path = ""
+window_scale = 3
+audio_enabled = false
+step_mode = "frame"
+
+[roms]
+sonic = ""
