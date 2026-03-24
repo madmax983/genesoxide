@@ -5,7 +5,8 @@
 //! Frontends drive it via [`Command`] and poll state via [`CoreQuery`].
 
 use crate::bus;
-use crate::cpu::Cpu;
+use crate::cpu::execute::Bus;
+use crate::cpu::{self, Cpu};
 use crate::io::ControllerPort;
 use crate::rom::{self, RomHeader};
 use crate::scheduler::Scheduler;
@@ -212,18 +213,35 @@ impl GenesisCore {
         if self.cpu.halted || self.cpu.stopped {
             return;
         }
-        // TODO: fetch, decode, execute one instruction
-        // For now, just advance PC and cycles as a stub
+
+        // Fetch the opcode word from the instruction stream.
+        let opcode = self.read_word(self.cpu.pc);
         self.cpu.pc = self.cpu.pc.wrapping_add(2);
-        self.cpu.cycles += 4;
-        self.scheduler.advance_cpu(4);
+
+        // Build a bus wrapper that borrows the non-CPU fields.
+        let mut bus = CoreBus {
+            rom: &self.rom,
+            work_ram: &mut self.work_ram,
+            vdp: &mut self.vdp,
+            port1: &mut self.port1,
+            port2: &mut self.port2,
+        };
+
+        let cycles = cpu::execute_instruction(&mut self.cpu, opcode, &mut bus);
+        let cycles_u64 = u64::from(cycles);
+        self.cpu.cycles += cycles_u64;
+        self.scheduler.advance_cpu(cycles_u64);
     }
 
     fn step_scanline(&mut self) {
-        // TODO: run CPU for one scanline's worth of cycles
-        // Genesis H40: ~488 68K cycles per scanline
-        for _ in 0..488 / 4 {
+        // Genesis H40: ~488 68K cycles per scanline.
+        // Run instructions until we've consumed enough cycles.
+        let target = self.cpu.cycles + 488;
+        while self.cpu.cycles < target {
             self.step_cpu();
+            if self.cpu.halted || self.cpu.stopped {
+                break;
+            }
         }
     }
 
@@ -264,7 +282,219 @@ impl GenesisCore {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset]
             }
-            _ => 0, // TODO: implement remaining regions
+            bus::BusRegion::IoRegisters => {
+                let reg = (addr & 0x1F) as u8;
+                match reg {
+                    0x01 => self.port1.read_data(),
+                    0x03 => self.port2.read_data(),
+                    0x05 => self.port1.read_ctrl(),
+                    0x07 => self.port2.read_ctrl(),
+                    _ => 0,
+                }
+            }
+            bus::BusRegion::Vdp => {
+                // VDP byte reads: return high or low byte of word read
+                let vdp_addr = addr & 0x1F;
+                match vdp_addr {
+                    0x04 | 0x06 => {
+                        // Status register (read-only)
+                        let status = self.vdp.read_status();
+                        if vdp_addr & 1 == 0 {
+                            (status >> 8) as u8
+                        } else {
+                            status as u8
+                        }
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Writes a byte to the bus.
+    #[allow(dead_code)]
+    fn write_byte_bus(&mut self, addr: u32, val: u8) {
+        match bus::map_region(addr) {
+            bus::BusRegion::WorkRam => {
+                let offset = (addr & 0xFFFF) as usize;
+                self.work_ram[offset] = val;
+            }
+            bus::BusRegion::IoRegisters => {
+                let reg = (addr & 0x1F) as u8;
+                match reg {
+                    0x01 => self.port1.write_data(val),
+                    0x03 => self.port2.write_data(val),
+                    0x05 => self.port1.write_ctrl(val),
+                    0x07 => self.port2.write_ctrl(val),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes a big-endian u16 to the bus.
+    #[allow(dead_code)]
+    fn write_word_bus(&mut self, addr: u32, val: u16) {
+        match bus::map_region(addr) {
+            bus::BusRegion::WorkRam => {
+                let offset = (addr & 0xFFFF) as usize;
+                self.work_ram[offset] = (val >> 8) as u8;
+                self.work_ram[offset | 1] = val as u8;
+            }
+            bus::BusRegion::Vdp => {
+                let vdp_addr = addr & 0x1F;
+                match vdp_addr {
+                    0x00 | 0x02 => self.vdp.write_data(val),
+                    0x04 | 0x06 => self.vdp.write_control(val),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bus wrapper that borrows non-CPU fields from [`GenesisCore`],
+/// allowing the CPU executor to access memory without conflicting
+/// with the mutable borrow of the CPU.
+struct CoreBus<'a> {
+    rom: &'a [u8],
+    work_ram: &'a mut Box<[u8; 0x10000]>,
+    vdp: &'a mut Vdp,
+    port1: &'a mut ControllerPort,
+    port2: &'a mut ControllerPort,
+}
+
+impl Bus for CoreBus<'_> {
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                let offset = (addr & 0x3FFFFF) as usize;
+                self.rom.get(offset).copied().unwrap_or(0)
+            }
+            bus::BusRegion::WorkRam => {
+                let offset = (addr & 0xFFFF) as usize;
+                self.work_ram[offset]
+            }
+            bus::BusRegion::IoRegisters => {
+                let reg = (addr & 0x1F) as u8;
+                match reg {
+                    0x01 => self.port1.read_data(),
+                    0x03 => self.port2.read_data(),
+                    0x05 => self.port1.read_ctrl(),
+                    0x07 => self.port2.read_ctrl(),
+                    _ => 0,
+                }
+            }
+            bus::BusRegion::Vdp => {
+                let vdp_addr = addr & 0x1F;
+                match vdp_addr {
+                    0x04 | 0x06 => {
+                        let status = self.vdp.read_status();
+                        if addr & 1 == 0 {
+                            (status >> 8) as u8
+                        } else {
+                            status as u8
+                        }
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn read_word(&mut self, addr: u32) -> u16 {
+        match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                let offset = (addr & 0x3FFFFF) as usize;
+                let hi = u16::from(*self.rom.get(offset).unwrap_or(&0));
+                let lo = u16::from(*self.rom.get(offset + 1).unwrap_or(&0));
+                (hi << 8) | lo
+            }
+            bus::BusRegion::WorkRam => {
+                let offset = (addr & 0xFFFF) as usize;
+                let hi = u16::from(self.work_ram[offset]);
+                let lo = u16::from(self.work_ram[offset | 1]);
+                (hi << 8) | lo
+            }
+            bus::BusRegion::IoRegisters => {
+                // Word reads: high byte is typically 0, low byte is the register
+                let reg = (addr & 0x1F) as u8;
+                let val = match reg {
+                    0x00 | 0x01 => self.port1.read_data(),
+                    0x02 | 0x03 => self.port2.read_data(),
+                    0x04 | 0x05 => self.port1.read_ctrl(),
+                    0x06 | 0x07 => self.port2.read_ctrl(),
+                    _ => 0,
+                };
+                u16::from(val)
+            }
+            bus::BusRegion::Vdp => {
+                let vdp_addr = addr & 0x1F;
+                match vdp_addr {
+                    0x00 | 0x02 => self.vdp.read_data(),
+                    0x04 | 0x06 => self.vdp.read_status(),
+                    0x08 | 0x0A | 0x0C | 0x0E => {
+                        // HV counter (stub: return 0 for now)
+                        0
+                    }
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn write_byte(&mut self, addr: u32, val: u8) {
+        match bus::map_region(addr) {
+            bus::BusRegion::WorkRam => {
+                let offset = (addr & 0xFFFF) as usize;
+                self.work_ram[offset] = val;
+            }
+            bus::BusRegion::IoRegisters => {
+                let reg = (addr & 0x1F) as u8;
+                match reg {
+                    0x01 => self.port1.write_data(val),
+                    0x03 => self.port2.write_data(val),
+                    0x05 => self.port1.write_ctrl(val),
+                    0x07 => self.port2.write_ctrl(val),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn write_word(&mut self, addr: u32, val: u16) {
+        match bus::map_region(addr) {
+            bus::BusRegion::WorkRam => {
+                let offset = (addr & 0xFFFF) as usize;
+                self.work_ram[offset] = (val >> 8) as u8;
+                self.work_ram[offset | 1] = val as u8;
+            }
+            bus::BusRegion::Vdp => {
+                let vdp_addr = addr & 0x1F;
+                match vdp_addr {
+                    0x00 | 0x02 => self.vdp.write_data(val),
+                    0x04 | 0x06 => self.vdp.write_control(val),
+                    _ => {}
+                }
+            }
+            bus::BusRegion::IoRegisters => {
+                let reg = (addr & 0x1F) as u8;
+                let lo = val as u8;
+                match reg {
+                    0x00 | 0x01 => self.port1.write_data(lo),
+                    0x02 | 0x03 => self.port2.write_data(lo),
+                    0x04 | 0x05 => self.port1.write_ctrl(lo),
+                    0x06 | 0x07 => self.port2.write_ctrl(lo),
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 }

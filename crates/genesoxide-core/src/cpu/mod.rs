@@ -11,9 +11,11 @@
 
 mod decode;
 mod engine;
+pub mod execute;
 
 pub use decode::{AddressingMode, Instruction, InstructionSize, decode};
 pub use engine::Cpu;
+pub use execute::{Bus, execute_instruction};
 
 use serde::{Deserialize, Serialize};
 
