@@ -2,6 +2,11 @@
 //!
 //! Provides utilities for loading test ROMs, running them for a fixed
 //! number of frames, and comparing output against golden references.
+//!
+//! Also includes the m68000-tests runner for cycle-accurate CPU validation
+//! against MAME-generated test vectors.
+
+pub mod m68k_tests;
 
 use genesoxide_core::{Command, FRAME_RGBA_BYTES, GenesisCore};
 

@@ -130,15 +130,15 @@ fn dst_ea_move(opcode: u16) -> AddressingMode {
 }
 
 /// Computes the effective address for modes that have a memory address.
-/// Returns the address in the 24-bit space. For register-direct modes,
-/// this is meaningless -- callers should use `read_ea` / `write_ea` instead.
+/// Returns the full 32-bit computed address. The bus masks to 24 bits
+/// when accessing memory. For register-direct modes, returns 0.
 fn resolve_ea(cpu: &mut Cpu, ea: AddressingMode, size: InstructionSize, bus: &mut dyn Bus) -> u32 {
     match ea {
         AddressingMode::DataDirect(_) | AddressingMode::AddrDirect(_) => {
             // No memory address for register-direct modes.
             0
         }
-        AddressingMode::AddrIndirect(reg) => cpu.read_a(reg) & 0x00FF_FFFF,
+        AddressingMode::AddrIndirect(reg) => cpu.read_a(reg),
         AddressingMode::AddrPostInc(reg) => {
             let addr = cpu.read_a(reg);
             // A7 always increments by at least 2 for byte ops (keep SP word-aligned).
@@ -148,7 +148,7 @@ fn resolve_ea(cpu: &mut Cpu, ea: AddressingMode, size: InstructionSize, bus: &mu
                 size_bytes(size)
             };
             cpu.write_a(reg, addr.wrapping_add(inc));
-            addr & 0x00FF_FFFF
+            addr
         }
         AddressingMode::AddrPreDec(reg) => {
             let dec = if reg == 7 && size == InstructionSize::Byte {
@@ -158,11 +158,11 @@ fn resolve_ea(cpu: &mut Cpu, ea: AddressingMode, size: InstructionSize, bus: &mu
             };
             let addr = cpu.read_a(reg).wrapping_sub(dec);
             cpu.write_a(reg, addr);
-            addr & 0x00FF_FFFF
+            addr
         }
         AddressingMode::AddrDisp(reg) => {
             let disp = fetch_word(cpu, bus) as i16 as i32;
-            (cpu.read_a(reg) as i32).wrapping_add(disp) as u32 & 0x00FF_FFFF
+            (cpu.read_a(reg) as i32).wrapping_add(disp) as u32
         }
         AddressingMode::AddrIndex(reg) => {
             let ext = fetch_word(cpu, bus);
@@ -170,17 +170,14 @@ fn resolve_ea(cpu: &mut Cpu, ea: AddressingMode, size: InstructionSize, bus: &mu
             compute_index_ea(cpu, base, ext)
         }
         AddressingMode::AbsShort => {
-            let addr = fetch_word(cpu, bus) as i16 as i32 as u32;
-            addr & 0x00FF_FFFF
+            // Sign-extends 16-bit address to 32 bits
+            fetch_word(cpu, bus) as i16 as i32 as u32
         }
-        AddressingMode::AbsLong => {
-            let addr = fetch_long(cpu, bus);
-            addr & 0x00FF_FFFF
-        }
+        AddressingMode::AbsLong => fetch_long(cpu, bus),
         AddressingMode::PcDisp => {
             let pc = cpu.pc; // PC of the extension word
             let disp = fetch_word(cpu, bus) as i16 as i32;
-            (pc as i32).wrapping_add(disp) as u32 & 0x00FF_FFFF
+            (pc as i32).wrapping_add(disp) as u32
         }
         AddressingMode::PcIndex => {
             let pc = cpu.pc; // PC of the extension word
@@ -189,7 +186,6 @@ fn resolve_ea(cpu: &mut Cpu, ea: AddressingMode, size: InstructionSize, bus: &mu
         }
         AddressingMode::Immediate => {
             // Immediate doesn't have an "address" in memory.
-            // We return the PC pointing at the immediate data (will be read by read_ea).
             0
         }
     }
@@ -201,20 +197,17 @@ fn compute_index_ea(cpu: &Cpu, base: u32, ext: u16) -> u32 {
     let disp = (ext & 0xFF) as i8 as i32;
     let idx_reg = ((ext >> 12) & 7) as u8;
     let idx_val = if ext & 0x8000 != 0 {
-        // Address register
         cpu.read_a(idx_reg)
     } else {
-        // Data register
         cpu.d[idx_reg as usize]
     };
     let idx_val = if ext & 0x0800 != 0 {
-        // Long index
         idx_val as i32
     } else {
         // Word index (sign-extended)
         idx_val as i16 as i32
     };
-    (base as i32).wrapping_add(disp).wrapping_add(idx_val) as u32 & 0x00FF_FFFF
+    (base as i32).wrapping_add(disp).wrapping_add(idx_val) as u32
 }
 
 /// Reads a value from an effective address.
@@ -341,6 +334,68 @@ fn set_flags_add(sr: &mut StatusRegister, src: u32, dst: u32, result: u32, size:
     };
     sr.set_flag(StatusRegister::C, carry);
     sr.set_flag(StatusRegister::X, carry);
+}
+
+/// Sets X, N, V, C flags for an extended add (ADDX): dst + src + x_in.
+///
+/// Z flag is NOT touched here — the caller handles sticky-Z semantics.
+fn set_flags_addx(
+    sr: &mut StatusRegister,
+    src: u32,
+    dst: u32,
+    x_in: u32,
+    result: u32,
+    size: InstructionSize,
+) {
+    let s = mask_value(src, size);
+    let d = mask_value(dst, size);
+    let r = mask_value(result, size);
+    let msb = msb_mask(size);
+
+    sr.set_flag(StatusRegister::N, r & msb != 0);
+    // Z: not set here — caller preserves sticky-Z
+
+    // Overflow: same two-operand formula works (src and dst signs vs result)
+    let overflow = (!(s ^ d)) & (s ^ r) & msb != 0;
+    sr.set_flag(StatusRegister::V, overflow);
+
+    // Carry: three-operand unsigned overflow
+    let carry = match size {
+        InstructionSize::Byte => d + s + x_in > 0xFF,
+        InstructionSize::Word => d + s + x_in > 0xFFFF,
+        InstructionSize::Long => (d as u64) + (s as u64) + (x_in as u64) > 0xFFFF_FFFF,
+    };
+    sr.set_flag(StatusRegister::C, carry);
+    sr.set_flag(StatusRegister::X, carry);
+}
+
+/// Sets X, N, V, C flags for an extended sub (SUBX/NEGX): dst - src - x_in.
+///
+/// Z flag is NOT touched here — the caller handles sticky-Z semantics.
+fn set_flags_subx(
+    sr: &mut StatusRegister,
+    src: u32,
+    dst: u32,
+    x_in: u32,
+    result: u32,
+    size: InstructionSize,
+) {
+    let s = mask_value(src, size);
+    let d = mask_value(dst, size);
+    let r = mask_value(result, size);
+    let msb = msb_mask(size);
+
+    sr.set_flag(StatusRegister::N, r & msb != 0);
+    // Z: not set here — caller preserves sticky-Z
+
+    // Overflow: operands different sign and result sign differs from dest
+    let overflow = (s & msb != d & msb) && (r & msb != d & msb);
+    sr.set_flag(StatusRegister::V, overflow);
+
+    // Borrow: three-operand unsigned underflow
+    let borrow = (s as u64) + (x_in as u64) > (d as u64);
+    sr.set_flag(StatusRegister::C, borrow);
+    sr.set_flag(StatusRegister::X, borrow);
 }
 
 /// Sets all flags (X, N, Z, V, C) for a SUB operation (dst - src).
@@ -486,7 +541,7 @@ pub fn deliver_interrupt(cpu: &mut Cpu, bus: &mut dyn Bus, level: u8) -> u32 {
     // Read vector from auto-vector table
     let vector_addr = 0x60 + u32::from(level) * 4;
     let handler = read_long(bus, vector_addr);
-    cpu.pc = handler & 0x00FF_FFFF;
+    cpu.pc = handler;
 
     44 // interrupt processing takes ~44 cycles
 }
@@ -946,9 +1001,12 @@ fn exec_addx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
         let src = mask_value(cpu.d[ry as usize], size);
         let dst = mask_value(cpu.d[rx as usize], size);
         let result = dst.wrapping_add(src).wrapping_add(x_bit);
-        set_flags_add(&mut cpu.sr, src.wrapping_add(x_bit), dst, result, size);
-        // ADDX: Z flag is only cleared, never set (sticky zero)
-        if mask_value(result, size) != 0 {
+        let old_z = cpu.sr.flag(StatusRegister::Z);
+        set_flags_addx(&mut cpu.sr, src, dst, x_bit, result, size);
+        // ADDX: Z is only cleared, never set (sticky for multi-precision)
+        if mask_value(result, size) == 0 {
+            cpu.sr.set_flag(StatusRegister::Z, old_z);
+        } else {
             cpu.sr.set_flag(StatusRegister::Z, false);
         }
         match size {
@@ -967,8 +1025,11 @@ fn exec_addx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
         let src = read_ea(cpu, src_ea, size, bus);
         let (dst, addr) = read_ea_with_addr(cpu, dst_ea, size, bus);
         let result = dst.wrapping_add(src).wrapping_add(x_bit);
-        set_flags_add(&mut cpu.sr, src.wrapping_add(x_bit), dst, result, size);
-        if mask_value(result, size) != 0 {
+        let old_z = cpu.sr.flag(StatusRegister::Z);
+        set_flags_addx(&mut cpu.sr, src, dst, x_bit, result, size);
+        if mask_value(result, size) == 0 {
+            cpu.sr.set_flag(StatusRegister::Z, old_z);
+        } else {
             cpu.sr.set_flag(StatusRegister::Z, false);
         }
         write_to_addr(bus, addr, size, result);
@@ -1097,8 +1158,12 @@ fn exec_subx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
         let src = mask_value(cpu.d[ry as usize], size);
         let dst = mask_value(cpu.d[rx as usize], size);
         let result = dst.wrapping_sub(src).wrapping_sub(x_bit);
-        set_flags_sub(&mut cpu.sr, src.wrapping_add(x_bit), dst, result, size);
-        if mask_value(result, size) != 0 {
+        let old_z = cpu.sr.flag(StatusRegister::Z);
+        set_flags_subx(&mut cpu.sr, src, dst, x_bit, result, size);
+        // SUBX: Z is only cleared, never set (sticky for multi-precision)
+        if mask_value(result, size) == 0 {
+            cpu.sr.set_flag(StatusRegister::Z, old_z);
+        } else {
             cpu.sr.set_flag(StatusRegister::Z, false);
         }
         match size {
@@ -1116,8 +1181,11 @@ fn exec_subx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
         let src = read_ea(cpu, src_ea, size, bus);
         let (dst, addr) = read_ea_with_addr(cpu, dst_ea, size, bus);
         let result = dst.wrapping_sub(src).wrapping_sub(x_bit);
-        set_flags_sub(&mut cpu.sr, src.wrapping_add(x_bit), dst, result, size);
-        if mask_value(result, size) != 0 {
+        let old_z = cpu.sr.flag(StatusRegister::Z);
+        set_flags_subx(&mut cpu.sr, src, dst, x_bit, result, size);
+        if mask_value(result, size) == 0 {
+            cpu.sr.set_flag(StatusRegister::Z, old_z);
+        } else {
             cpu.sr.set_flag(StatusRegister::Z, false);
         }
         write_to_addr(bus, addr, size, result);
@@ -1277,9 +1345,12 @@ fn exec_negx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
     let (val, addr) = read_ea_with_addr(cpu, ea, size, bus);
     let x_bit: u32 = if cpu.sr.flag(StatusRegister::X) { 1 } else { 0 };
     let result = 0u32.wrapping_sub(val).wrapping_sub(x_bit);
-    set_flags_sub(&mut cpu.sr, val.wrapping_add(x_bit), 0, result, size);
-    // NEGX: Z is only cleared, never set (sticky)
-    if mask_value(result, size) != 0 {
+    let old_z = cpu.sr.flag(StatusRegister::Z);
+    set_flags_subx(&mut cpu.sr, val, 0, x_bit, result, size);
+    // NEGX: Z is only cleared, never set (sticky for multi-precision)
+    if mask_value(result, size) == 0 {
+        cpu.sr.set_flag(StatusRegister::Z, old_z);
+    } else {
         cpu.sr.set_flag(StatusRegister::Z, false);
     }
     match ea {
@@ -1679,17 +1750,19 @@ fn exec_rod(cpu: &mut Cpu, opcode: u16, size: InstructionSize) -> u32 {
     }
 
     let mut carry = false;
-    let effective_count = count % bits;
 
+    // Don't reduce count % bits — the VALUE wraps after `bits` rotations,
+    // but the CARRY depends on the actual last bit shifted out.
+    // count is at most 63, so iterating directly is trivially fast.
     if direction == 1 {
         // ROL
-        for _ in 0..effective_count {
+        for _ in 0..count {
             carry = val & msb != 0;
             val = mask_value((val << 1) | (if carry { 1 } else { 0 }), size);
         }
     } else {
         // ROR
-        for _ in 0..effective_count {
+        for _ in 0..count {
             carry = val & 1 != 0;
             val = mask_value((val >> 1) | (if carry { msb } else { 0 }), size);
         }
@@ -2012,25 +2085,17 @@ fn exec_bcc(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     // the base is PC after the opcode. For 16/32-bit, it's also after the opcode.
     let base_pc = cpu.pc; // PC after fetching the opcode word (already advanced by caller)
 
+    // On the 68000, disp8 == 0 means 16-bit displacement follows.
+    // disp8 == 0xFF (-1) is a normal 8-bit displacement (32-bit is 68020+ only).
     let displacement = if disp8 == 0 {
-        // 16-bit displacement follows
         let w = fetch_word(cpu, bus);
         w as i16 as i32
-    } else if disp8 == -1 {
-        // 32-bit displacement follows (68020+, but handle gracefully)
-        let l = fetch_long(cpu, bus);
-        l as i32
     } else {
         disp8 as i32
     };
 
     if evaluate_condition(&cpu.sr, condition) {
-        // Branch taken: base is PC of the extension word (= PC after opcode)
-        // Wait -- the 68000 computes Bcc target as (PC of opcode + 2) + displacement.
-        // Our `base_pc` is already (PC of opcode + 2) since the caller advanced PC.
-        // But if we fetched a 16-bit displacement, PC moved further. We need base_pc
-        // which was captured before the displacement fetch.
-        cpu.pc = (base_pc as i32).wrapping_add(displacement) as u32 & 0x00FF_FFFF;
+        cpu.pc = (base_pc as i32).wrapping_add(displacement) as u32;
         10
     } else {
         8
@@ -2050,7 +2115,7 @@ fn exec_bsr(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 
     // Push return address (PC after the entire BSR instruction including displacement word)
     push_long(cpu, bus, cpu.pc);
-    cpu.pc = (base_pc as i32).wrapping_add(displacement) as u32 & 0x00FF_FFFF;
+    cpu.pc = (base_pc as i32).wrapping_add(displacement) as u32;
     18
 }
 
@@ -2071,7 +2136,7 @@ fn exec_dbcc(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 
     if counter != 0xFFFF {
         // Counter not exhausted: branch
-        cpu.pc = (base_pc as i32).wrapping_add(displacement) as u32 & 0x00FF_FFFF;
+        cpu.pc = (base_pc as i32).wrapping_add(displacement) as u32;
         10
     } else {
         // Counter exhausted: fall through
@@ -2105,7 +2170,7 @@ fn exec_scc(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 fn exec_jmp(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let ea = src_ea(opcode);
     let addr = resolve_ea(cpu, ea, InstructionSize::Long, bus);
-    cpu.pc = addr & 0x00FF_FFFF;
+    cpu.pc = addr;
     match ea {
         AddressingMode::AddrIndirect(_) => 8,
         AddressingMode::AddrDisp(_) => 10,
@@ -2122,7 +2187,7 @@ fn exec_jsr(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let ea = src_ea(opcode);
     let addr = resolve_ea(cpu, ea, InstructionSize::Long, bus);
     push_long(cpu, bus, cpu.pc);
-    cpu.pc = addr & 0x00FF_FFFF;
+    cpu.pc = addr;
     match ea {
         AddressingMode::AddrIndirect(_) => 16,
         AddressingMode::AddrDisp(_) => 18,
@@ -2136,7 +2201,7 @@ fn exec_jsr(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 }
 
 fn exec_rts(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
-    cpu.pc = pop_long(cpu, bus) & 0x00FF_FFFF;
+    cpu.pc = pop_long(cpu, bus);
     16
 }
 
@@ -2152,7 +2217,7 @@ fn exec_rte(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
         cpu.ssp = cpu.sp();
         // The SP we just used was the SSP; the new mode is user, so set_sp will set USP
     }
-    cpu.pc = new_pc & 0x00FF_FFFF;
+    cpu.pc = new_pc;
     20
 }
 
@@ -2161,7 +2226,7 @@ fn exec_rtr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
     let new_pc = pop_long(cpu, bus);
     // RTR restores only the CCR (lower byte), not the system byte
     cpu.sr.0 = (cpu.sr.0 & 0xFF00) | (ccr & 0x001F);
-    cpu.pc = new_pc & 0x00FF_FFFF;
+    cpu.pc = new_pc;
     20
 }
 
