@@ -441,6 +441,56 @@ fn pop_word(cpu: &mut Cpu, bus: &mut dyn Bus) -> u16 {
     bus.read_word(sp & 0x00FF_FFFF)
 }
 
+// ── Interrupt delivery ──────────────────────────────────────────────────
+
+/// Delivers an interrupt to the CPU at the given level (1-7).
+///
+/// The 68000 interrupt sequence:
+/// 1. Push SR (with current flags and interrupt mask)
+/// 2. Push PC (return address)
+/// 3. Enter supervisor mode
+/// 4. Set interrupt mask to the accepted level
+/// 5. Clear trace flag
+/// 6. Read the vector address from the exception vector table
+/// 7. Jump to the interrupt handler
+///
+/// Auto-vectors are at addresses 0x64 + (level * 4).
+/// Level 6 = V-blank (vector at 0x78).
+/// Level 4 = H-blank (vector at 0x70).
+///
+/// Returns the number of cycles consumed (44 for interrupt processing).
+pub fn deliver_interrupt(cpu: &mut Cpu, bus: &mut dyn Bus, level: u8) -> u32 {
+    // Only deliver if the interrupt level exceeds the current mask
+    // (level 7 is non-maskable)
+    let mask = cpu.sr.interrupt_mask();
+    if level < 7 && level <= mask {
+        return 0;
+    }
+
+    // If CPU is stopped (STOP instruction), wake it up
+    cpu.stopped = false;
+
+    // Save current state
+    let old_sr = cpu.sr.0;
+    let old_pc = cpu.pc;
+
+    // Enter supervisor mode, set interrupt mask, clear trace
+    cpu.sr.set_flag(StatusRegister::S, true);
+    cpu.sr.set_interrupt_mask(level);
+    cpu.sr.set_flag(StatusRegister::T, false);
+
+    // Push SR and PC onto supervisor stack
+    push_long(cpu, bus, old_pc);
+    push_word(cpu, bus, old_sr);
+
+    // Read vector from auto-vector table
+    let vector_addr = 0x60 + u32::from(level) * 4;
+    let handler = read_long(bus, vector_addr);
+    cpu.pc = handler & 0x00FF_FFFF;
+
+    44 // interrupt processing takes ~44 cycles
+}
+
 // ── Main executor ────────────────────────────────────────────────────────
 
 /// Executes one decoded instruction.

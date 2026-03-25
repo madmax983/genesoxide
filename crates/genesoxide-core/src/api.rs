@@ -168,6 +168,24 @@ impl GenesisCore {
         self.paused
     }
 
+    /// Returns the CPU program counter (debug).
+    #[must_use]
+    pub fn cpu_pc(&self) -> u32 {
+        self.cpu.pc
+    }
+
+    /// Returns the CPU supervisor stack pointer (debug).
+    #[must_use]
+    pub fn cpu_ssp(&self) -> u32 {
+        self.cpu.ssp
+    }
+
+    /// Returns a VDP snapshot for debugging.
+    #[must_use]
+    pub fn vdp_snapshot(&self) -> crate::vdp::VdpSnapshot {
+        self.vdp.snapshot()
+    }
+
     // --- Internal ---
 
     fn controller_port_mut(&mut self, port: u8) -> &mut ControllerPort {
@@ -269,9 +287,24 @@ impl GenesisCore {
                 self.vdp.render_scanline(scanline);
             }
 
-            // At scanline 224: enter V-blank
+            // At scanline 224: enter V-blank and fire V-blank interrupt
             if scanline == ACTIVE_SCANLINES {
                 self.vdp.set_vblank(true);
+
+                // Fire level 6 interrupt if V-interrupt is enabled (reg 1, bit 5)
+                let vint_enabled = self.vdp.read_register(1) & 0x20 != 0;
+                if vint_enabled {
+                    let mut bus = CoreBus {
+                        rom: &self.rom,
+                        work_ram: &mut self.work_ram,
+                        vdp: &mut self.vdp,
+                        port1: &mut self.port1,
+                        port2: &mut self.port2,
+                    };
+                    let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
+                    self.cpu.cycles += u64::from(cycles);
+                    self.scheduler.advance_cpu(u64::from(cycles));
+                }
             }
         }
 

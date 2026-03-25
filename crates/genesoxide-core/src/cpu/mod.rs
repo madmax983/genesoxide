@@ -15,6 +15,7 @@ pub mod execute;
 
 pub use decode::{AddressingMode, Instruction, InstructionSize, decode};
 pub use engine::Cpu;
+pub use execute::deliver_interrupt;
 pub use execute::{Bus, execute_instruction};
 
 use serde::{Deserialize, Serialize};

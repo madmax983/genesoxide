@@ -291,6 +291,16 @@ impl Vdp {
         result
     }
 
+    /// Reads a VDP register value.
+    #[must_use]
+    pub fn read_register(&self, reg: usize) -> u8 {
+        if reg < VDP_REGISTER_COUNT {
+            self.registers[reg]
+        } else {
+            0
+        }
+    }
+
     /// Reads the VDP status register.
     #[must_use]
     pub fn read_status(&self) -> u16 {
