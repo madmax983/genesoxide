@@ -239,6 +239,10 @@ impl GenesisCore {
         let target = self.cpu.cycles + 488;
         while self.cpu.cycles < target {
             self.step_cpu();
+            // After each instruction, check if DMA is pending
+            if self.vdp.dma_pending() {
+                self.execute_vdp_dma();
+            }
             if self.cpu.halted || self.cpu.stopped {
                 break;
             }
@@ -249,12 +253,58 @@ impl GenesisCore {
         if self.paused {
             return;
         }
-        for _ in 0..SCANLINES_PER_FRAME {
+
+        // Clear V-blank at frame start
+        self.vdp.set_vblank(false);
+
+        for scanline in 0..SCANLINES_PER_FRAME {
+            // Begin scanline timing
+            self.vdp.begin_scanline(scanline);
+
+            // Run CPU for this scanline
             self.step_scanline();
+
+            // Render visible scanlines
+            if scanline < ACTIVE_SCANLINES {
+                self.vdp.render_scanline(scanline);
+            }
+
+            // At scanline 224: enter V-blank
+            if scanline == ACTIVE_SCANLINES {
+                self.vdp.set_vblank(true);
+            }
         }
+
+        self.vdp.end_frame();
         self.port1.reset_th_counter();
         self.port2.reset_th_counter();
         self.frame_count += 1;
+    }
+
+    /// Executes a pending VDP DMA transfer by providing a bus read callback.
+    fn execute_vdp_dma(&mut self) {
+        // We need to read from the 68K bus, so we build a closure that
+        // accesses ROM and work RAM.
+        let rom = &self.rom;
+        let work_ram = &self.work_ram;
+        let mut read_word = |addr: u32| -> u16 {
+            match bus::map_region(addr) {
+                bus::BusRegion::CartridgeRom => {
+                    let offset = (addr & 0x3FFFFF) as usize;
+                    let hi = u16::from(*rom.get(offset).unwrap_or(&0));
+                    let lo = u16::from(*rom.get(offset + 1).unwrap_or(&0));
+                    (hi << 8) | lo
+                }
+                bus::BusRegion::WorkRam => {
+                    let offset = (addr & 0xFFFF) as usize;
+                    let hi = u16::from(work_ram[offset]);
+                    let lo = u16::from(work_ram[offset | 1]);
+                    (hi << 8) | lo
+                }
+                _ => 0,
+            }
+        };
+        self.vdp.run_dma(&mut read_word);
     }
 
     /// Reads a big-endian u32 from the bus.
