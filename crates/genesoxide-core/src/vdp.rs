@@ -112,6 +112,8 @@ pub struct Vdp {
     h_interrupt_pending: bool,
     /// Combined control code (CD5-CD0) from two-word command sequence.
     control_code: u8,
+    /// Odd frame toggle — flipped each frame for interlace/status register.
+    odd_frame: bool,
 }
 
 impl Vdp {
@@ -137,6 +139,7 @@ impl Vdp {
             h_interrupt_counter: 0,
             h_interrupt_pending: false,
             control_code: 0,
+            odd_frame: false,
         }
     }
 
@@ -319,9 +322,17 @@ impl Vdp {
     #[must_use]
     pub fn read_status(&self) -> u16 {
         let mut status: u16 = 0x3400; // Always set bits
+        // Bit 9: FIFO empty (always set — no FIFO emulation)
+        status |= 0x0200;
+        // Bit 3: V-blank
         if self.in_vblank {
             status |= 0x0008;
         }
+        // Bit 4: Odd frame (toggles each frame)
+        if self.odd_frame {
+            status |= 0x0010;
+        }
+        // Bit 2: H-blank
         if self.in_hblank {
             status |= 0x0004;
         }
@@ -498,6 +509,7 @@ impl Vdp {
     pub fn end_frame(&mut self) {
         self.scanline = 0;
         self.in_hblank = false;
+        self.odd_frame = !self.odd_frame;
     }
 
     // ---- Rendering ----
@@ -1759,5 +1771,30 @@ mod tests {
         vdp.scanline = 0xEB;
         let hv = vdp.read_hv_counter();
         assert_eq!((hv >> 8) as u8, 0xE5);
+    }
+
+    // ---- Status register completeness tests ----
+
+    #[test]
+    fn status_register_fifo_empty_set() {
+        let vdp = Vdp::new();
+        assert_ne!(
+            vdp.read_status() & 0x0200,
+            0,
+            "FIFO empty bit should be set"
+        );
+    }
+
+    #[test]
+    fn status_register_odd_frame_toggles() {
+        let mut vdp = Vdp::new();
+        let status1 = vdp.read_status();
+        vdp.end_frame();
+        let status2 = vdp.read_status();
+        assert_ne!(
+            status1 & 0x0010,
+            status2 & 0x0010,
+            "odd frame bit should toggle"
+        );
     }
 }
