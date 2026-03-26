@@ -213,6 +213,16 @@ impl GenesisCore {
         self.cpu.ssp
     }
 
+    /// Z80 debug accessors.
+    #[must_use]
+    pub fn z80_pc(&self) -> u16 { self.z80.pc }
+    #[must_use]
+    pub fn z80_cycles(&self) -> u64 { self.z80.cycles }
+    #[must_use]
+    pub fn z80_bus_requested(&self) -> bool { self.z80_bus_requested }
+    #[must_use]
+    pub fn z80_in_reset(&self) -> bool { self.z80_reset }
+
     /// Returns a VDP snapshot for debugging.
     #[must_use]
     pub fn vdp_snapshot(&self) -> crate::vdp::VdpSnapshot {
@@ -792,14 +802,13 @@ impl Bus for CoreBus<'_> {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                let offset = addr & 0x01FF;
-                match offset {
-                    0x0000..=0x0001 => {
-                        // Z80 bus request: bit 0 of written value
+                // 0xA11100 = Z80 bus request, 0xA11200 = Z80 reset
+                let reg = addr & 0xFFFF;
+                match reg {
+                    0x1100..=0x1101 => {
                         *self.z80_bus_requested = val & 0x01 != 0;
                     }
-                    0x0100..=0x0101 => {
-                        // Z80 reset: bit 0 = 0 means assert reset
+                    0x1200..=0x1201 => {
                         *self.z80_reset = val & 0x01 == 0;
                     }
                     _ => {}
@@ -874,14 +883,13 @@ impl Bus for CoreBus<'_> {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                let offset = addr & 0x01FF;
-                match offset {
-                    0x0000..=0x0001 => {
-                        // Z80 bus request: bit 8 of word (high byte bit 0)
+                // 0xA11100 = Z80 bus request, 0xA11200 = Z80 reset
+                let reg = addr & 0xFFFF;
+                match reg {
+                    0x1100..=0x1101 => {
                         *self.z80_bus_requested = (val >> 8) & 0x01 != 0;
                     }
-                    0x0100..=0x0101 => {
-                        // Z80 reset: bit 8 = 0 means assert reset
+                    0x1200..=0x1201 => {
                         *self.z80_reset = (val >> 8) & 0x01 == 0;
                     }
                     _ => {}
