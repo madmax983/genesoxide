@@ -371,12 +371,18 @@ impl GenesisCore {
             bus::BusRegion::IoRegisters => {
                 let reg = (addr & 0x1F) as u8;
                 match reg {
-                    0x01 => self.port1.read_data(),
-                    0x03 => self.port2.read_data(),
-                    0x05 => self.port1.read_ctrl(),
-                    0x07 => self.port2.read_ctrl(),
+                    0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
+                    0x02 | 0x03 => self.port1.read_data(),
+                    0x04 | 0x05 => self.port2.read_data(),
+                    0x08 | 0x09 => self.port1.read_ctrl(),
+                    0x0A | 0x0B => self.port2.read_ctrl(),
                     _ => 0,
                 }
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request (0xA11100): always grant (Z80 not emulated)
+                // Z80 reset (0xA11200): acknowledge
+                0x01
             }
             bus::BusRegion::Vdp => {
                 // VDP byte reads: return high or low byte of word read
@@ -409,12 +415,15 @@ impl GenesisCore {
             bus::BusRegion::IoRegisters => {
                 let reg = (addr & 0x1F) as u8;
                 match reg {
-                    0x01 => self.port1.write_data(val),
-                    0x03 => self.port2.write_data(val),
-                    0x05 => self.port1.write_ctrl(val),
-                    0x07 => self.port2.write_ctrl(val),
+                    0x02 | 0x03 => self.port1.write_data(val),
+                    0x04 | 0x05 => self.port2.write_data(val),
+                    0x08 | 0x09 => self.port1.write_ctrl(val),
+                    0x0A | 0x0B => self.port2.write_ctrl(val),
                     _ => {}
                 }
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request/reset — absorbed (Z80 not emulated)
             }
             _ => {}
         }
@@ -428,6 +437,20 @@ impl GenesisCore {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = (val >> 8) as u8;
                 self.work_ram[offset | 1] = val as u8;
+            }
+            bus::BusRegion::IoRegisters => {
+                let reg = (addr & 0x1F) as u8;
+                let lo = val as u8;
+                match reg {
+                    0x02 | 0x03 => self.port1.write_data(lo),
+                    0x04 | 0x05 => self.port2.write_data(lo),
+                    0x08 | 0x09 => self.port1.write_ctrl(lo),
+                    0x0A | 0x0B => self.port2.write_ctrl(lo),
+                    _ => {}
+                }
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request/reset — absorbed (Z80 not emulated)
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -467,12 +490,18 @@ impl Bus for CoreBus<'_> {
             bus::BusRegion::IoRegisters => {
                 let reg = (addr & 0x1F) as u8;
                 match reg {
-                    0x01 => self.port1.read_data(),
-                    0x03 => self.port2.read_data(),
-                    0x05 => self.port1.read_ctrl(),
-                    0x07 => self.port2.read_ctrl(),
+                    0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
+                    0x02 | 0x03 => self.port1.read_data(),
+                    0x04 | 0x05 => self.port2.read_data(),
+                    0x08 | 0x09 => self.port1.read_ctrl(),
+                    0x0A | 0x0B => self.port2.read_ctrl(),
                     _ => 0,
                 }
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request (0xA11100): always grant (Z80 not emulated)
+                // Z80 reset (0xA11200): acknowledge
+                0x01
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -507,16 +536,21 @@ impl Bus for CoreBus<'_> {
                 (hi << 8) | lo
             }
             bus::BusRegion::IoRegisters => {
-                // Word reads: high byte is typically 0, low byte is the register
                 let reg = (addr & 0x1F) as u8;
                 let val = match reg {
-                    0x00 | 0x01 => self.port1.read_data(),
-                    0x02 | 0x03 => self.port2.read_data(),
-                    0x04 | 0x05 => self.port1.read_ctrl(),
-                    0x06 | 0x07 => self.port2.read_ctrl(),
+                    0x00 | 0x01 => 0xA0, // Version register
+                    0x02 | 0x03 => self.port1.read_data(),
+                    0x04 | 0x05 => self.port2.read_data(),
+                    0x08 | 0x09 => self.port1.read_ctrl(),
+                    0x0A | 0x0B => self.port2.read_ctrl(),
                     _ => 0,
                 };
                 u16::from(val)
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request (0xA11100): always grant (Z80 not emulated)
+                // Z80 reset (0xA11200): acknowledge
+                0x0001
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -543,12 +577,15 @@ impl Bus for CoreBus<'_> {
             bus::BusRegion::IoRegisters => {
                 let reg = (addr & 0x1F) as u8;
                 match reg {
-                    0x01 => self.port1.write_data(val),
-                    0x03 => self.port2.write_data(val),
-                    0x05 => self.port1.write_ctrl(val),
-                    0x07 => self.port2.write_ctrl(val),
+                    0x02 | 0x03 => self.port1.write_data(val),
+                    0x04 | 0x05 => self.port2.write_data(val),
+                    0x08 | 0x09 => self.port1.write_ctrl(val),
+                    0x0A | 0x0B => self.port2.write_ctrl(val),
                     _ => {}
                 }
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request/reset — absorbed (Z80 not emulated)
             }
             _ => {}
         }
@@ -573,12 +610,15 @@ impl Bus for CoreBus<'_> {
                 let reg = (addr & 0x1F) as u8;
                 let lo = val as u8;
                 match reg {
-                    0x00 | 0x01 => self.port1.write_data(lo),
-                    0x02 | 0x03 => self.port2.write_data(lo),
-                    0x04 | 0x05 => self.port1.write_ctrl(lo),
-                    0x06 | 0x07 => self.port2.write_ctrl(lo),
+                    0x02 | 0x03 => self.port1.write_data(lo),
+                    0x04 | 0x05 => self.port2.write_data(lo),
+                    0x08 | 0x09 => self.port1.write_ctrl(lo),
+                    0x0A | 0x0B => self.port2.write_ctrl(lo),
                     _ => {}
                 }
+            }
+            bus::BusRegion::ControlRegisters => {
+                // Z80 bus request/reset — absorbed (Z80 not emulated)
             }
             _ => {}
         }
@@ -640,5 +680,21 @@ mod tests {
         let mut core = GenesisCore::new();
         core.work_ram[0x1234] = 0xAB;
         assert_eq!(core.read_byte(0xFF1234), 0xAB);
+    }
+
+    #[test]
+    fn io_version_register_returns_region() {
+        let core = GenesisCore::new();
+        let val = core.read_byte(0xA10001);
+        // Should be 0xA0 (overseas NTSC), not controller data (0x7F)
+        assert_eq!(val, 0xA0);
+    }
+
+    #[test]
+    fn z80_bus_request_grants_immediately() {
+        let core = GenesisCore::new();
+        // Reading Z80 bus request should show bus granted
+        let val = core.read_byte(0xA11100);
+        assert_eq!(val & 0x01, 0x01);
     }
 }
