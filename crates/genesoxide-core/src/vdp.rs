@@ -108,6 +108,8 @@ pub struct Vdp {
     dma_fill_pending: bool,
     /// H-interrupt counter (reloaded from register 0x0A each frame).
     h_interrupt_counter: i16,
+    /// H-interrupt pending flag — set when counter expires and H-int is enabled.
+    h_interrupt_pending: bool,
     /// Combined control code (CD5-CD0) from two-word command sequence.
     control_code: u8,
 }
@@ -133,6 +135,7 @@ impl Vdp {
             dma_pending: false,
             dma_fill_pending: false,
             h_interrupt_counter: 0,
+            h_interrupt_pending: false,
             control_code: 0,
         }
     }
@@ -153,6 +156,17 @@ impl Vdp {
     #[must_use]
     pub fn in_vblank(&self) -> bool {
         self.in_vblank
+    }
+
+    /// Returns true if an H-interrupt is pending delivery to the CPU.
+    #[must_use]
+    pub fn h_interrupt_pending(&self) -> bool {
+        self.h_interrupt_pending
+    }
+
+    /// Clears the pending H-interrupt flag after the CPU acknowledges it.
+    pub fn clear_h_interrupt(&mut self) {
+        self.h_interrupt_pending = false;
     }
 
     /// Writes to the VDP control port.
@@ -443,10 +457,19 @@ impl Vdp {
         self.scanline = line;
         self.in_hblank = true;
 
-        // H-interrupt counter management
         if line == 0 {
-            // Reload at the start of each frame
+            // Reload counter at start of frame
             self.h_interrupt_counter = i16::from(self.registers[0x0A]);
+        } else if line < 224 {
+            // Active scanlines: decrement counter
+            self.h_interrupt_counter -= 1;
+            if self.h_interrupt_counter < 0 {
+                // Counter expired — reload and fire interrupt if enabled
+                self.h_interrupt_counter = i16::from(self.registers[0x0A]);
+                if self.registers[0] & 0x10 != 0 {
+                    self.h_interrupt_pending = true;
+                }
+            }
         }
     }
 
@@ -1659,5 +1682,42 @@ mod tests {
             &green,
             "pixel 160 should be green (window, right side)"
         );
+    }
+
+    #[test]
+    fn h_interrupt_counter_fires_at_zero() {
+        let mut vdp = Vdp::new();
+        vdp.registers[0x0A] = 0x03; // fire every 4 scanlines
+        vdp.registers[0] = 0x10; // enable H-interrupt
+
+        vdp.begin_scanline(0); // counter loaded with 3
+        assert!(!vdp.h_interrupt_pending());
+
+        vdp.begin_scanline(1); // counter = 2
+        assert!(!vdp.h_interrupt_pending());
+
+        vdp.begin_scanline(2); // counter = 1
+        assert!(!vdp.h_interrupt_pending());
+
+        vdp.begin_scanline(3); // counter = 0
+        assert!(!vdp.h_interrupt_pending());
+
+        vdp.begin_scanline(4); // counter was 0, now -1 < 0, fire!
+        assert!(vdp.h_interrupt_pending());
+        vdp.clear_h_interrupt();
+
+        vdp.begin_scanline(5); // counter reloaded to 3, decremented to 2
+        assert!(!vdp.h_interrupt_pending());
+    }
+
+    #[test]
+    fn h_interrupt_disabled_does_not_fire() {
+        let mut vdp = Vdp::new();
+        vdp.registers[0x0A] = 0x00; // fire every scanline
+        vdp.registers[0] = 0x00; // H-interrupt DISABLED
+
+        vdp.begin_scanline(0);
+        vdp.begin_scanline(1); // would fire if enabled
+        assert!(!vdp.h_interrupt_pending());
     }
 }
