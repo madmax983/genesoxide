@@ -832,11 +832,10 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── CB prefix (bit operations) ────────────────────────────
         0xCB => {
-            // Placeholder: consume the sub-opcode byte, return 4 T-states.
-            let _sub = fetch_byte(cpu, bus);
+            let sub = fetch_byte(cpu, bus);
             // Increment R for the second fetch.
             cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_add(1)) & 0x7F);
-            4
+            execute_cb(cpu, bus, sub)
         }
 
         // ── CALL nn ───────────────────────────────────────────────
@@ -876,9 +875,9 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── DD prefix (IX operations) ─────────────────────────────
         0xDD => {
-            let _sub = fetch_byte(cpu, bus);
+            let sub = fetch_byte(cpu, bus);
             cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_add(1)) & 0x7F);
-            4
+            execute_ddfd(cpu, bus, sub, true)
         }
 
         // ── EX (SP),HL ────────────────────────────────────────────
@@ -907,9 +906,9 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── ED prefix (extended operations) ───────────────────────
         0xED => {
-            let _sub = fetch_byte(cpu, bus);
+            let sub = fetch_byte(cpu, bus);
             cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_add(1)) & 0x7F);
-            4
+            execute_ed(cpu, bus, sub)
         }
 
         // ── DI ────────────────────────────────────────────────────
@@ -936,14 +935,1329 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── FD prefix (IY operations) ─────────────────────────────
         0xFD => {
-            let _sub = fetch_byte(cpu, bus);
+            let sub = fetch_byte(cpu, bus);
             cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_add(1)) & 0x7F);
-            4
+            execute_ddfd(cpu, bus, sub, false)
         }
 
         // Catch-all for any remaining opcodes — should not be reached
         // since we cover 0x00-0xFF above.
         #[allow(unreachable_patterns)]
         _ => 4,
+    }
+}
+
+// ── CB prefix handler ──────────────────────────────────────────────────
+
+/// Executes a CB-prefixed opcode. Returns T-states consumed (excluding the
+/// 4 T-states for fetching the CB byte itself — caller adds those implicitly
+/// via the main fetch). Total is 8 for register ops, 15 for (HL) modify, 12 for BIT (HL).
+fn execute_cb(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
+    let reg = sub & 0x07;
+    let op = sub >> 6;
+    let bit = (sub >> 3) & 0x07;
+
+    match op {
+        0 => {
+            // Rotate/shift operations (0x00-0x3F)
+            let val = read_reg8(cpu, bus, reg);
+            let result = match bit {
+                0 => {
+                    // RLC
+                    let bit7 = (val >> 7) & 1;
+                    let r = (val << 1) | bit7;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                1 => {
+                    // RRC
+                    let bit0 = val & 1;
+                    let r = (val >> 1) | (bit0 << 7);
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                2 => {
+                    // RL
+                    let old_c = if cpu.flag(FLAG_C) { 1u8 } else { 0 };
+                    let bit7 = (val >> 7) & 1;
+                    let r = (val << 1) | old_c;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                3 => {
+                    // RR
+                    let old_c = if cpu.flag(FLAG_C) { 0x80u8 } else { 0 };
+                    let bit0 = val & 1;
+                    let r = (val >> 1) | old_c;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                4 => {
+                    // SLA
+                    let bit7 = (val >> 7) & 1;
+                    let r = val << 1;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                5 => {
+                    // SRA
+                    let bit0 = val & 1;
+                    let r = (val >> 1) | (val & 0x80); // preserve sign bit
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                6 => {
+                    // SLL (undocumented) — shift left, bit 0 = 1
+                    let bit7 = (val >> 7) & 1;
+                    let r = (val << 1) | 1;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                7 => {
+                    // SRL
+                    let bit0 = val & 1;
+                    let r = val >> 1;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                _ => unreachable!(),
+            };
+            write_reg8(cpu, bus, reg, result);
+            if reg == 6 { 15 } else { 8 }
+        }
+        1 => {
+            // BIT b,r (0x40-0x7F)
+            let val = read_reg8(cpu, bus, reg);
+            let tested = val & (1 << bit);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            cpu.set_flag(FLAG_Z, tested == 0);
+            cpu.set_flag(FLAG_H, true);
+            cpu.set_flag(FLAG_S, bit == 7 && tested != 0);
+            cpu.set_flag(FLAG_PV, tested == 0); // same as Z
+            cpu.set_flag(FLAG_C, old_c);
+            // N = 0 already
+            if reg == 6 {
+                // BIT b,(HL): X and Y from high byte of WZ (internal MEMPTR)
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                12
+            } else {
+                // BIT b,r: X and Y from the value tested
+                cpu.set_flag(FLAG_X, val & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, val & FLAG_Y != 0);
+                8
+            }
+        }
+        2 => {
+            // RES b,r (0x80-0xBF)
+            let val = read_reg8(cpu, bus, reg);
+            let result = val & !(1 << bit);
+            write_reg8(cpu, bus, reg, result);
+            if reg == 6 { 15 } else { 8 }
+        }
+        3 => {
+            // SET b,r (0xC0-0xFF)
+            let val = read_reg8(cpu, bus, reg);
+            let result = val | (1 << bit);
+            write_reg8(cpu, bus, reg, result);
+            if reg == 6 { 15 } else { 8 }
+        }
+        _ => unreachable!(),
+    }
+}
+
+// ── ED prefix handler ──────────────────────────────────────────────────
+
+/// Reads a 16-bit register pair for ED instructions (BC=0, DE=1, HL=2, SP=3).
+#[inline]
+fn read_reg16_ed(cpu: &Z80, pair: u8) -> u16 {
+    match pair {
+        0 => cpu.bc(),
+        1 => cpu.de(),
+        2 => cpu.hl(),
+        3 => cpu.sp,
+        _ => unreachable!(),
+    }
+}
+
+/// Writes a 16-bit register pair for ED instructions.
+#[inline]
+fn write_reg16_ed(cpu: &mut Z80, pair: u8, val: u16) {
+    match pair {
+        0 => cpu.set_bc(val),
+        1 => cpu.set_de(val),
+        2 => cpu.set_hl(val),
+        3 => cpu.sp = val,
+        _ => unreachable!(),
+    }
+}
+
+/// Executes an ED-prefixed opcode. Returns T-states.
+fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
+    match sub {
+        // ── IN r,(C) — 0x40,0x48,0x50,0x58,0x60,0x68,0x70,0x78
+        0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 => {
+            let port = cpu.bc();
+            let val = bus.read_port(port);
+            let reg = (sub >> 3) & 0x07;
+            if reg != 6 {
+                // reg 6 = "IN (C)" / "IN F,(C)" — reads but doesn't store (flags only)
+                write_reg8(cpu, bus, reg, val);
+            }
+            // Set flags: S, Z, H=0, PV=parity, N=0, C unchanged
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            set_sz_xy(cpu, val);
+            cpu.set_flag(FLAG_PV, parity(val));
+            cpu.set_flag(FLAG_C, old_c);
+            // H = 0, N = 0 already
+            12
+        }
+
+        // ── OUT (C),r — 0x41,0x49,0x51,0x59,0x61,0x69,0x71,0x79
+        0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 => {
+            let port = cpu.bc();
+            let reg = (sub >> 3) & 0x07;
+            let val = if reg == 6 {
+                0
+            } else {
+                read_reg8(cpu, bus, reg)
+            };
+            bus.write_port(port, val);
+            12
+        }
+
+        // ── SBC HL,rr — 0x42,0x52,0x62,0x72
+        0x42 | 0x52 | 0x62 | 0x72 => {
+            let pair = (sub >> 4) & 0x03;
+            let hl = cpu.hl();
+            let rr = read_reg16_ed(cpu, pair);
+            let carry = if cpu.flag(FLAG_C) { 1u32 } else { 0 };
+            let result32 = (hl as u32).wrapping_sub(rr as u32).wrapping_sub(carry);
+            let result = result32 as u16;
+            cpu.set_hl(result);
+
+            cpu.f = FLAG_N;
+            cpu.set_flag(FLAG_S, result & 0x8000 != 0);
+            cpu.set_flag(FLAG_Z, result == 0);
+            cpu.set_flag(FLAG_H, ((hl ^ rr ^ result) >> 8) & 0x10 != 0);
+            // Overflow: operands different sign, result sign differs from HL
+            let hl_s = hl as i16;
+            let rr_s = rr as i16;
+            let c_s = carry as i16;
+            let expected = (hl_s as i32) - (rr_s as i32) - (c_s as i32);
+            cpu.set_flag(FLAG_PV, !(-32768..=32767).contains(&expected));
+            cpu.set_flag(FLAG_C, (hl as u32) < (rr as u32) + carry);
+            let high = (result >> 8) as u8;
+            cpu.set_flag(FLAG_X, high & FLAG_X != 0);
+            cpu.set_flag(FLAG_Y, high & FLAG_Y != 0);
+            15
+        }
+
+        // ── ADC HL,rr — 0x4A,0x5A,0x6A,0x7A
+        0x4A | 0x5A | 0x6A | 0x7A => {
+            let pair = (sub >> 4) & 0x03;
+            let hl = cpu.hl();
+            let rr = read_reg16_ed(cpu, pair);
+            let carry = if cpu.flag(FLAG_C) { 1u32 } else { 0 };
+            let result32 = (hl as u32) + (rr as u32) + carry;
+            let result = result32 as u16;
+            cpu.set_hl(result);
+
+            cpu.f = 0; // N = 0
+            cpu.set_flag(FLAG_S, result & 0x8000 != 0);
+            cpu.set_flag(FLAG_Z, result == 0);
+            cpu.set_flag(FLAG_H, ((hl ^ rr ^ result) >> 8) & 0x10 != 0);
+            let hl_s = hl as i16;
+            let rr_s = rr as i16;
+            let c_s = carry as i16;
+            let expected = (hl_s as i32) + (rr_s as i32) + (c_s as i32);
+            cpu.set_flag(FLAG_PV, !(-32768..=32767).contains(&expected));
+            cpu.set_flag(FLAG_C, result32 > 0xFFFF);
+            let high = (result >> 8) as u8;
+            cpu.set_flag(FLAG_X, high & FLAG_X != 0);
+            cpu.set_flag(FLAG_Y, high & FLAG_Y != 0);
+            15
+        }
+
+        // ── LD (nn),rr — 0x43,0x53,0x63,0x73
+        0x43 | 0x53 | 0x63 | 0x73 => {
+            let addr = fetch_word(cpu, bus);
+            let pair = (sub >> 4) & 0x03;
+            let val = read_reg16_ed(cpu, pair);
+            bus.write_byte(addr, val as u8);
+            bus.write_byte(addr.wrapping_add(1), (val >> 8) as u8);
+            20
+        }
+
+        // ── LD rr,(nn) — 0x4B,0x5B,0x6B,0x7B
+        0x4B | 0x5B | 0x6B | 0x7B => {
+            let addr = fetch_word(cpu, bus);
+            let pair = (sub >> 4) & 0x03;
+            let lo = bus.read_byte(addr);
+            let hi = bus.read_byte(addr.wrapping_add(1));
+            let val = (u16::from(hi) << 8) | u16::from(lo);
+            write_reg16_ed(cpu, pair, val);
+            20
+        }
+
+        // ── NEG — 0x44 and mirrors 0x4C,0x54,0x5C,0x64,0x6C,0x74,0x7C
+        0x44 | 0x4C | 0x54 | 0x5C | 0x64 | 0x6C | 0x74 | 0x7C => {
+            let old_a = cpu.a;
+            cpu.a = 0u8.wrapping_sub(old_a);
+            let result = cpu.a;
+            cpu.f = FLAG_N;
+            set_sz_xy(cpu, result);
+            cpu.set_flag(FLAG_H, (old_a & 0x0F) != 0);
+            cpu.set_flag(FLAG_PV, old_a == 0x80);
+            cpu.set_flag(FLAG_C, old_a != 0);
+            8
+        }
+
+        // ── RETN — 0x45 and mirrors 0x55,0x65,0x75
+        0x45 | 0x55 | 0x65 | 0x75 => {
+            cpu.pc = pop(cpu, bus);
+            cpu.iff1 = cpu.iff2;
+            14
+        }
+
+        // ── RETI — 0x4D and mirrors 0x5D,0x6D,0x7D
+        0x4D | 0x5D | 0x6D | 0x7D => {
+            cpu.pc = pop(cpu, bus);
+            cpu.iff1 = cpu.iff2;
+            14
+        }
+
+        // ── IM 0 — 0x46, 0x4E, 0x66, 0x6E
+        0x46 | 0x4E | 0x66 | 0x6E => {
+            cpu.im = 0;
+            8
+        }
+
+        // ── IM 1 — 0x56, 0x76
+        0x56 | 0x76 => {
+            cpu.im = 1;
+            8
+        }
+
+        // ── IM 2 — 0x5E, 0x7E
+        0x5E | 0x7E => {
+            cpu.im = 2;
+            8
+        }
+
+        // ── LD I,A — 0x47
+        0x47 => {
+            cpu.i = cpu.a;
+            9
+        }
+
+        // ── LD R,A — 0x4F
+        0x4F => {
+            cpu.r = cpu.a;
+            9
+        }
+
+        // ── LD A,I — 0x57
+        0x57 => {
+            cpu.a = cpu.i;
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            set_sz_xy(cpu, cpu.a);
+            cpu.set_flag(FLAG_PV, cpu.iff2);
+            cpu.set_flag(FLAG_C, old_c);
+            // H = 0, N = 0 already
+            9
+        }
+
+        // ── LD A,R — 0x5F
+        0x5F => {
+            cpu.a = cpu.r;
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            set_sz_xy(cpu, cpu.a);
+            cpu.set_flag(FLAG_PV, cpu.iff2);
+            cpu.set_flag(FLAG_C, old_c);
+            9
+        }
+
+        // ── RRD — 0x67
+        0x67 => {
+            let addr = cpu.hl();
+            let mem = bus.read_byte(addr);
+            let old_a = cpu.a;
+            cpu.a = (old_a & 0xF0) | (mem & 0x0F);
+            let new_mem = ((old_a & 0x0F) << 4) | ((mem >> 4) & 0x0F);
+            bus.write_byte(addr, new_mem);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            set_sz_xy(cpu, cpu.a);
+            cpu.set_flag(FLAG_PV, parity(cpu.a));
+            cpu.set_flag(FLAG_C, old_c);
+            18
+        }
+
+        // ── RLD — 0x6F
+        0x6F => {
+            let addr = cpu.hl();
+            let mem = bus.read_byte(addr);
+            let old_a = cpu.a;
+            cpu.a = (old_a & 0xF0) | ((mem >> 4) & 0x0F);
+            let new_mem = ((mem & 0x0F) << 4) | (old_a & 0x0F);
+            bus.write_byte(addr, new_mem);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            set_sz_xy(cpu, cpu.a);
+            cpu.set_flag(FLAG_PV, parity(cpu.a));
+            cpu.set_flag(FLAG_C, old_c);
+            18
+        }
+
+        // ── LDI — 0xA0
+        0xA0 => {
+            let val = bus.read_byte(cpu.hl());
+            bus.write_byte(cpu.de(), val);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            cpu.set_de(cpu.de().wrapping_add(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            let n = cpu.a.wrapping_add(val);
+            cpu.set_flag(FLAG_H, false);
+            cpu.set_flag(FLAG_N, false);
+            cpu.set_flag(FLAG_PV, cpu.bc() != 0);
+            cpu.set_flag(FLAG_X, n & 0x08 != 0); // bit 3
+            cpu.set_flag(FLAG_Y, n & 0x02 != 0); // bit 1
+            16
+        }
+
+        // ── LDD — 0xA8
+        0xA8 => {
+            let val = bus.read_byte(cpu.hl());
+            bus.write_byte(cpu.de(), val);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            cpu.set_de(cpu.de().wrapping_sub(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            let n = cpu.a.wrapping_add(val);
+            cpu.set_flag(FLAG_H, false);
+            cpu.set_flag(FLAG_N, false);
+            cpu.set_flag(FLAG_PV, cpu.bc() != 0);
+            cpu.set_flag(FLAG_X, n & 0x08 != 0);
+            cpu.set_flag(FLAG_Y, n & 0x02 != 0);
+            16
+        }
+
+        // ── CPI — 0xA1
+        0xA1 => {
+            let val = bus.read_byte(cpu.hl());
+            let result = cpu.a.wrapping_sub(val);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            let hf = (cpu.a & 0x0F) < (val & 0x0F);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = FLAG_N;
+            cpu.set_flag(FLAG_S, result & 0x80 != 0);
+            cpu.set_flag(FLAG_Z, result == 0);
+            cpu.set_flag(FLAG_H, hf);
+            cpu.set_flag(FLAG_PV, cpu.bc() != 0);
+            cpu.set_flag(FLAG_C, old_c);
+            let n = result.wrapping_sub(if hf { 1 } else { 0 });
+            cpu.set_flag(FLAG_X, n & 0x08 != 0); // bit 3
+            cpu.set_flag(FLAG_Y, n & 0x02 != 0); // bit 1
+            16
+        }
+
+        // ── CPD — 0xA9
+        0xA9 => {
+            let val = bus.read_byte(cpu.hl());
+            let result = cpu.a.wrapping_sub(val);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            let hf = (cpu.a & 0x0F) < (val & 0x0F);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = FLAG_N;
+            cpu.set_flag(FLAG_S, result & 0x80 != 0);
+            cpu.set_flag(FLAG_Z, result == 0);
+            cpu.set_flag(FLAG_H, hf);
+            cpu.set_flag(FLAG_PV, cpu.bc() != 0);
+            cpu.set_flag(FLAG_C, old_c);
+            let n = result.wrapping_sub(if hf { 1 } else { 0 });
+            cpu.set_flag(FLAG_X, n & 0x08 != 0);
+            cpu.set_flag(FLAG_Y, n & 0x02 != 0);
+            16
+        }
+
+        // ── INI — 0xA2
+        0xA2 => {
+            let port = cpu.bc();
+            let val = bus.read_port(port);
+            bus.write_byte(cpu.hl(), val);
+            cpu.b = cpu.b.wrapping_sub(1);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            cpu.set_flag(FLAG_Z, cpu.b == 0);
+            cpu.set_flag(FLAG_N, true);
+            // S, H, PV, C are "undefined" per Zilog but jsmoo expects specific values
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.c.wrapping_add(1) as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            16
+        }
+
+        // ── IND — 0xAA
+        0xAA => {
+            let port = cpu.bc();
+            let val = bus.read_port(port);
+            bus.write_byte(cpu.hl(), val);
+            cpu.b = cpu.b.wrapping_sub(1);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.c.wrapping_sub(1) as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            16
+        }
+
+        // ── OUTI — 0xA3
+        0xA3 => {
+            let val = bus.read_byte(cpu.hl());
+            cpu.b = cpu.b.wrapping_sub(1);
+            let port = cpu.bc();
+            bus.write_port(port, val);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.l as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            16
+        }
+
+        // ── OUTD — 0xAB
+        0xAB => {
+            let val = bus.read_byte(cpu.hl());
+            cpu.b = cpu.b.wrapping_sub(1);
+            let port = cpu.bc();
+            bus.write_port(port, val);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.l as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            16
+        }
+
+        // ── LDIR — 0xB0
+        0xB0 => {
+            let val = bus.read_byte(cpu.hl());
+            bus.write_byte(cpu.de(), val);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            cpu.set_de(cpu.de().wrapping_add(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            cpu.set_flag(FLAG_H, false);
+            cpu.set_flag(FLAG_N, false);
+            if cpu.bc() != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                cpu.set_flag(FLAG_PV, true);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                cpu.set_flag(FLAG_PV, false);
+                let n = cpu.a.wrapping_add(val);
+                cpu.set_flag(FLAG_X, n & 0x08 != 0);
+                cpu.set_flag(FLAG_Y, n & 0x02 != 0);
+                16
+            }
+        }
+
+        // ── LDDR — 0xB8
+        0xB8 => {
+            let val = bus.read_byte(cpu.hl());
+            bus.write_byte(cpu.de(), val);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            cpu.set_de(cpu.de().wrapping_sub(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            cpu.set_flag(FLAG_H, false);
+            cpu.set_flag(FLAG_N, false);
+            if cpu.bc() != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                cpu.set_flag(FLAG_PV, true);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                cpu.set_flag(FLAG_PV, false);
+                let n = cpu.a.wrapping_add(val);
+                cpu.set_flag(FLAG_X, n & 0x08 != 0);
+                cpu.set_flag(FLAG_Y, n & 0x02 != 0);
+                16
+            }
+        }
+
+        // ── CPIR — 0xB1
+        0xB1 => {
+            let val = bus.read_byte(cpu.hl());
+            let result = cpu.a.wrapping_sub(val);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            let hf = (cpu.a & 0x0F) < (val & 0x0F);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = FLAG_N;
+            cpu.set_flag(FLAG_S, result & 0x80 != 0);
+            cpu.set_flag(FLAG_Z, result == 0);
+            cpu.set_flag(FLAG_H, hf);
+            cpu.set_flag(FLAG_PV, cpu.bc() != 0);
+            cpu.set_flag(FLAG_C, old_c);
+            if cpu.bc() != 0 && result != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                let n = result.wrapping_sub(if hf { 1 } else { 0 });
+                cpu.set_flag(FLAG_X, n & 0x08 != 0);
+                cpu.set_flag(FLAG_Y, n & 0x02 != 0);
+                16
+            }
+        }
+
+        // ── CPDR — 0xB9
+        0xB9 => {
+            let val = bus.read_byte(cpu.hl());
+            let result = cpu.a.wrapping_sub(val);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            cpu.set_bc(cpu.bc().wrapping_sub(1));
+            let hf = (cpu.a & 0x0F) < (val & 0x0F);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = FLAG_N;
+            cpu.set_flag(FLAG_S, result & 0x80 != 0);
+            cpu.set_flag(FLAG_Z, result == 0);
+            cpu.set_flag(FLAG_H, hf);
+            cpu.set_flag(FLAG_PV, cpu.bc() != 0);
+            cpu.set_flag(FLAG_C, old_c);
+            if cpu.bc() != 0 && result != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                let n = result.wrapping_sub(if hf { 1 } else { 0 });
+                cpu.set_flag(FLAG_X, n & 0x08 != 0);
+                cpu.set_flag(FLAG_Y, n & 0x02 != 0);
+                16
+            }
+        }
+
+        // ── INIR — 0xB2
+        0xB2 => {
+            let port = cpu.bc();
+            let val = bus.read_port(port);
+            bus.write_byte(cpu.hl(), val);
+            cpu.b = cpu.b.wrapping_sub(1);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.c.wrapping_add(1) as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            if cpu.b != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                16
+            }
+        }
+
+        // ── INDR — 0xBA
+        0xBA => {
+            let port = cpu.bc();
+            let val = bus.read_port(port);
+            bus.write_byte(cpu.hl(), val);
+            cpu.b = cpu.b.wrapping_sub(1);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.c.wrapping_sub(1) as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            if cpu.b != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                16
+            }
+        }
+
+        // ── OTIR — 0xB3
+        0xB3 => {
+            let val = bus.read_byte(cpu.hl());
+            cpu.b = cpu.b.wrapping_sub(1);
+            let port = cpu.bc();
+            bus.write_port(port, val);
+            cpu.set_hl(cpu.hl().wrapping_add(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.l as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            if cpu.b != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                16
+            }
+        }
+
+        // ── OTDR — 0xBB
+        0xBB => {
+            let val = bus.read_byte(cpu.hl());
+            cpu.b = cpu.b.wrapping_sub(1);
+            let port = cpu.bc();
+            bus.write_port(port, val);
+            cpu.set_hl(cpu.hl().wrapping_sub(1));
+            set_sz_xy(cpu, cpu.b);
+            cpu.set_flag(FLAG_N, val & 0x80 != 0);
+            let k = val as u16 + cpu.l as u16;
+            cpu.set_flag(FLAG_H, k > 255);
+            cpu.set_flag(FLAG_C, k > 255);
+            cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
+            if cpu.b != 0 {
+                cpu.pc = cpu.pc.wrapping_sub(2);
+                cpu.wz = cpu.pc.wrapping_add(1);
+                let wz_hi = (cpu.wz >> 8) as u8;
+                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                21
+            } else {
+                16
+            }
+        }
+
+        // ── Undefined ED opcodes → NOP-like (8 T-states total)
+        _ => 8,
+    }
+}
+
+// ── DD/FD prefix handler ───────────────────────────────────────────────
+
+/// Reads the high byte of IX or IY.
+#[inline]
+fn index_high(cpu: &Z80, is_ix: bool) -> u8 {
+    if is_ix {
+        (cpu.ix >> 8) as u8
+    } else {
+        (cpu.iy >> 8) as u8
+    }
+}
+
+/// Reads the low byte of IX or IY.
+#[inline]
+fn index_low(cpu: &Z80, is_ix: bool) -> u8 {
+    if is_ix { cpu.ix as u8 } else { cpu.iy as u8 }
+}
+
+/// Reads the full IX or IY register.
+#[inline]
+fn index_reg(cpu: &Z80, is_ix: bool) -> u16 {
+    if is_ix { cpu.ix } else { cpu.iy }
+}
+
+/// Sets the full IX or IY register.
+#[inline]
+fn set_index_reg(cpu: &mut Z80, is_ix: bool, val: u16) {
+    if is_ix {
+        cpu.ix = val;
+    } else {
+        cpu.iy = val;
+    }
+}
+
+/// Sets the high byte of IX or IY.
+#[inline]
+fn set_index_high(cpu: &mut Z80, is_ix: bool, val: u8) {
+    if is_ix {
+        cpu.ix = (cpu.ix & 0x00FF) | (u16::from(val) << 8);
+    } else {
+        cpu.iy = (cpu.iy & 0x00FF) | (u16::from(val) << 8);
+    }
+}
+
+/// Sets the low byte of IX or IY.
+#[inline]
+fn set_index_low(cpu: &mut Z80, is_ix: bool, val: u8) {
+    if is_ix {
+        cpu.ix = (cpu.ix & 0xFF00) | u16::from(val);
+    } else {
+        cpu.iy = (cpu.iy & 0xFF00) | u16::from(val);
+    }
+}
+
+/// Reads an 8-bit register for DD/FD prefixed ops.
+/// H maps to IXH/IYH, L maps to IXL/IYL (undocumented).
+/// (HL) maps to (IX+d)/(IY+d) — caller must handle that case separately.
+#[inline]
+fn read_reg8_indexed(cpu: &Z80, bus: &mut dyn Bus, reg: u8, is_ix: bool) -> u8 {
+    match reg {
+        0 => cpu.b,
+        1 => cpu.c,
+        2 => cpu.d,
+        3 => cpu.e,
+        4 => index_high(cpu, is_ix),
+        5 => index_low(cpu, is_ix),
+        6 => bus.read_byte(cpu.hl()), // shouldn't be called for (HL)
+        7 => cpu.a,
+        _ => unreachable!(),
+    }
+}
+
+/// Writes an 8-bit register for DD/FD prefixed ops.
+#[inline]
+fn write_reg8_indexed(cpu: &mut Z80, bus: &mut dyn Bus, reg: u8, val: u8, is_ix: bool) {
+    match reg {
+        0 => cpu.b = val,
+        1 => cpu.c = val,
+        2 => cpu.d = val,
+        3 => cpu.e = val,
+        4 => set_index_high(cpu, is_ix, val),
+        5 => set_index_low(cpu, is_ix, val),
+        6 => bus.write_byte(cpu.hl(), val), // shouldn't be called for (HL)
+        7 => cpu.a = val,
+        _ => unreachable!(),
+    }
+}
+
+/// Reads a 16-bit register pair for DD/FD ADD instructions,
+/// where pair 2 = IX/IY instead of HL.
+#[inline]
+fn read_reg16_indexed(cpu: &Z80, pair: u8, is_ix: bool) -> u16 {
+    match pair {
+        0 => cpu.bc(),
+        1 => cpu.de(),
+        2 => index_reg(cpu, is_ix),
+        3 => cpu.sp,
+        _ => unreachable!(),
+    }
+}
+
+/// Executes a DD/FD-prefixed opcode. is_ix = true for DD (IX), false for FD (IY).
+/// Returns total T-states for the prefixed instruction.
+fn execute_ddfd(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8, is_ix: bool) -> u8 {
+    match sub {
+        // DD/FD followed by another prefix: treat current as NOP, let main loop
+        // re-process. We already consumed the sub-opcode byte and incremented R.
+        // The next prefix byte will be re-fetched by the main loop.
+        // Actually, we need to "put back" the PC so the next instruction can be
+        // fetched. We decrement PC by 1 to re-fetch the prefix byte.
+        0xDD | 0xFD | 0xED => {
+            // Treat current prefix as NOP (4 T-states), re-process next byte
+            cpu.pc = cpu.pc.wrapping_sub(1);
+            // Undo the R increment for the sub-opcode (we already incremented for
+            // the prefix and the sub-opcode, but we want only the prefix increment)
+            cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_sub(1)) & 0x7F);
+            4
+        }
+
+        // ── DD/FD CB — indexed bit operations
+        0xCB => {
+            // DD CB dd op / FD CB dd op
+            // The displacement byte comes BEFORE the opcode byte
+            let d = fetch_byte(cpu, bus) as i8;
+            let op = fetch_byte(cpu, bus);
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            execute_ddfd_cb(cpu, bus, op, addr)
+        }
+
+        // ── LD IX/IY,nn — 0x21
+        0x21 => {
+            let val = fetch_word(cpu, bus);
+            set_index_reg(cpu, is_ix, val);
+            14
+        }
+
+        // ── LD (nn),IX/IY — 0x22
+        0x22 => {
+            let addr = fetch_word(cpu, bus);
+            let val = index_reg(cpu, is_ix);
+            bus.write_byte(addr, val as u8);
+            bus.write_byte(addr.wrapping_add(1), (val >> 8) as u8);
+            20
+        }
+
+        // ── INC IX/IY — 0x23
+        0x23 => {
+            let val = index_reg(cpu, is_ix).wrapping_add(1);
+            set_index_reg(cpu, is_ix, val);
+            10
+        }
+
+        // ── INC IXH/IYH — 0x24
+        0x24 => {
+            let val = index_high(cpu, is_ix);
+            let result = alu_inc(cpu, val);
+            set_index_high(cpu, is_ix, result);
+            8
+        }
+
+        // ── DEC IXH/IYH — 0x25
+        0x25 => {
+            let val = index_high(cpu, is_ix);
+            let result = alu_dec(cpu, val);
+            set_index_high(cpu, is_ix, result);
+            8
+        }
+
+        // ── LD IXH/IYH,n — 0x26
+        0x26 => {
+            let val = fetch_byte(cpu, bus);
+            set_index_high(cpu, is_ix, val);
+            11
+        }
+
+        // ── LD IX/IY,(nn) — 0x2A
+        0x2A => {
+            let addr = fetch_word(cpu, bus);
+            let lo = bus.read_byte(addr);
+            let hi = bus.read_byte(addr.wrapping_add(1));
+            set_index_reg(cpu, is_ix, (u16::from(hi) << 8) | u16::from(lo));
+            20
+        }
+
+        // ── DEC IX/IY — 0x2B
+        0x2B => {
+            let val = index_reg(cpu, is_ix).wrapping_sub(1);
+            set_index_reg(cpu, is_ix, val);
+            10
+        }
+
+        // ── INC IXL/IYL — 0x2C
+        0x2C => {
+            let val = index_low(cpu, is_ix);
+            let result = alu_inc(cpu, val);
+            set_index_low(cpu, is_ix, result);
+            8
+        }
+
+        // ── DEC IXL/IYL — 0x2D
+        0x2D => {
+            let val = index_low(cpu, is_ix);
+            let result = alu_dec(cpu, val);
+            set_index_low(cpu, is_ix, result);
+            8
+        }
+
+        // ── LD IXL/IYL,n — 0x2E
+        0x2E => {
+            let val = fetch_byte(cpu, bus);
+            set_index_low(cpu, is_ix, val);
+            11
+        }
+
+        // ── ADD IX/IY,rr — 0x09,0x19,0x29,0x39
+        0x09 | 0x19 | 0x29 | 0x39 => {
+            let pair = (sub >> 4) & 0x03;
+            let idx = index_reg(cpu, is_ix) as u32;
+            let rr = read_reg16_indexed(cpu, pair, is_ix) as u32;
+            let result = idx + rr;
+            set_index_reg(cpu, is_ix, result as u16);
+            // Preserve S, Z, PV
+            cpu.set_flag(FLAG_H, ((idx ^ rr ^ result) >> 8) & 0x10 != 0);
+            cpu.set_flag(FLAG_N, false);
+            cpu.set_flag(FLAG_C, result > 0xFFFF);
+            let high = (result >> 8) as u8;
+            cpu.set_flag(FLAG_X, high & FLAG_X != 0);
+            cpu.set_flag(FLAG_Y, high & FLAG_Y != 0);
+            15
+        }
+
+        // ── INC (IX/IY+d) — 0x34
+        0x34 => {
+            let d = fetch_byte(cpu, bus) as i8;
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            let val = bus.read_byte(addr);
+            let result = alu_inc(cpu, val);
+            bus.write_byte(addr, result);
+            23
+        }
+
+        // ── DEC (IX/IY+d) — 0x35
+        0x35 => {
+            let d = fetch_byte(cpu, bus) as i8;
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            let val = bus.read_byte(addr);
+            let result = alu_dec(cpu, val);
+            bus.write_byte(addr, result);
+            23
+        }
+
+        // ── LD (IX/IY+d),n — 0x36
+        0x36 => {
+            let d = fetch_byte(cpu, bus) as i8;
+            let n = fetch_byte(cpu, bus);
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            bus.write_byte(addr, n);
+            19
+        }
+
+        // ── LD r,(IX/IY+d) — reg in bits 5-3 of sub-opcode
+        // 0x46: LD B,(IX+d)  0x4E: LD C,(IX+d)
+        // 0x56: LD D,(IX+d)  0x5E: LD E,(IX+d)
+        // 0x66: LD H,(IX+d)  0x6E: LD L,(IX+d)  0x7E: LD A,(IX+d)
+        0x46 | 0x4E | 0x56 | 0x5E | 0x66 | 0x6E | 0x7E => {
+            let d = fetch_byte(cpu, bus) as i8;
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            let val = bus.read_byte(addr);
+            let dst = (sub >> 3) & 0x07;
+            // Write to actual register (not indexed version) for dst=4,5
+            write_reg8(cpu, bus, dst, val);
+            19
+        }
+
+        // ── LD (IX/IY+d),r — reg in bits 2-0 of sub-opcode
+        // 0x70: LD (IX+d),B  0x71: LD (IX+d),C  0x72: LD (IX+d),D
+        // 0x73: LD (IX+d),E  0x74: LD (IX+d),H  0x75: LD (IX+d),L
+        // 0x77: LD (IX+d),A
+        0x70 | 0x71 | 0x72 | 0x73 | 0x74 | 0x75 | 0x77 => {
+            let d = fetch_byte(cpu, bus) as i8;
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            let src = sub & 0x07;
+            // Read from actual register (not indexed version) for src=4,5
+            let val = read_reg8(cpu, bus, src);
+            bus.write_byte(addr, val);
+            19
+        }
+
+        // ── LD r,r' with IXH/IXL substitution (undocumented)
+        // These are register-to-register loads where H→IXH, L→IXL
+        // Covers 0x40-0x6F range (excluding (HL) cases handled above)
+        // and 0x78-0x7F (excluding 0x7E handled above)
+        0x40..=0x45
+        | 0x47..=0x4D
+        | 0x4F..=0x55
+        | 0x57..=0x5D
+        | 0x5F
+        | 0x60..=0x65
+        | 0x67..=0x6D
+        | 0x6F
+        | 0x78..=0x7D
+        | 0x7F => {
+            let dst = (sub >> 3) & 0x07;
+            let src = sub & 0x07;
+            let val = read_reg8_indexed(cpu, bus, src, is_ix);
+            write_reg8_indexed(cpu, bus, dst, val, is_ix);
+            8
+        }
+
+        // ── ALU A,(IX/IY+d)
+        // ADD: 0x86  ADC: 0x8E  SUB: 0x96  SBC: 0x9E
+        // AND: 0xA6  XOR: 0xAE  OR:  0xB6  CP:  0xBE
+        0x86 | 0x8E | 0x96 | 0x9E | 0xA6 | 0xAE | 0xB6 | 0xBE => {
+            let d = fetch_byte(cpu, bus) as i8;
+            let addr = index_reg(cpu, is_ix).wrapping_add(d as u16);
+            let val = bus.read_byte(addr);
+            let alu_op = (sub >> 3) & 0x07;
+            match alu_op {
+                0 => alu_add(cpu, val),
+                1 => alu_adc(cpu, val),
+                2 => alu_sub(cpu, val),
+                3 => alu_sbc(cpu, val),
+                4 => alu_and(cpu, val),
+                5 => alu_xor(cpu, val),
+                6 => alu_or(cpu, val),
+                7 => alu_cp(cpu, val),
+                _ => unreachable!(),
+            }
+            19
+        }
+
+        // ── ALU A,r with IXH/IXL substitution (undocumented)
+        // ADD A,IXH/IXL, ADC, SUB, SBC, AND, XOR, OR, CP
+        0x80..=0x85
+        | 0x87..=0x8D
+        | 0x8F..=0x95
+        | 0x97..=0x9D
+        | 0x9F
+        | 0xA0..=0xA5
+        | 0xA7..=0xAD
+        | 0xAF..=0xB5
+        | 0xB7..=0xBD
+        | 0xBF => {
+            let src = sub & 0x07;
+            let val = read_reg8_indexed(cpu, bus, src, is_ix);
+            let alu_op = (sub >> 3) & 0x07;
+            match alu_op {
+                0 => alu_add(cpu, val),
+                1 => alu_adc(cpu, val),
+                2 => alu_sub(cpu, val),
+                3 => alu_sbc(cpu, val),
+                4 => alu_and(cpu, val),
+                5 => alu_xor(cpu, val),
+                6 => alu_or(cpu, val),
+                7 => alu_cp(cpu, val),
+                _ => unreachable!(),
+            }
+            8
+        }
+
+        // ── POP IX/IY — 0xE1
+        0xE1 => {
+            let val = pop(cpu, bus);
+            set_index_reg(cpu, is_ix, val);
+            14
+        }
+
+        // ── EX (SP),IX/IY — 0xE3
+        0xE3 => {
+            let lo = bus.read_byte(cpu.sp);
+            let hi = bus.read_byte(cpu.sp.wrapping_add(1));
+            let old_idx = index_reg(cpu, is_ix);
+            set_index_reg(cpu, is_ix, (u16::from(hi) << 8) | u16::from(lo));
+            bus.write_byte(cpu.sp, old_idx as u8);
+            bus.write_byte(cpu.sp.wrapping_add(1), (old_idx >> 8) as u8);
+            23
+        }
+
+        // ── PUSH IX/IY — 0xE5
+        0xE5 => {
+            let val = index_reg(cpu, is_ix);
+            push(cpu, bus, val);
+            15
+        }
+
+        // ── JP (IX/IY) — 0xE9
+        0xE9 => {
+            cpu.pc = index_reg(cpu, is_ix);
+            8
+        }
+
+        // ── LD SP,IX/IY — 0xF9
+        0xF9 => {
+            cpu.sp = index_reg(cpu, is_ix);
+            10
+        }
+
+        // Any other opcode under DD/FD is executed as normal (no prefix effect).
+        // We need to re-execute the sub-opcode as a normal instruction.
+        // Since we already consumed it, we put it back and re-execute.
+        _ => {
+            // Undo: put the sub-opcode byte back by rewinding PC
+            cpu.pc = cpu.pc.wrapping_sub(1);
+            // Undo the R increment for the sub-opcode
+            cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_sub(1)) & 0x7F);
+            // Execute as normal (the main execute will re-fetch and re-increment R)
+            // But we already consumed 4 T-states for the prefix fetch.
+            // The re-execute will add the normal instruction cycles.
+            // We return 4 for the prefix NOP and let the caller handle it...
+            // Actually, for jsmoo tests, these are executed as one instruction.
+            // We need to just execute the normal instruction and add 4.
+            // Re-fetch and execute:
+            let cycles = execute_instruction(cpu, bus);
+            // The execute_instruction already incremented R for the sub-opcode,
+            // which is what we want (total R increments = 2 for prefix + sub).
+            // But we un-decremented R above, so the net is correct.
+            4 + cycles
+        }
+    }
+}
+
+// ── DD CB / FD CB handler ──────────────────────────────────────────────
+
+/// Executes a DD CB dd op / FD CB dd op instruction.
+/// `addr` is the pre-computed IX/IY + d address.
+/// `op` is the CB-style operation byte.
+/// Returns T-states for the indexed bit operation portion.
+fn execute_ddfd_cb(cpu: &mut Z80, bus: &mut dyn Bus, op: u8, addr: u16) -> u8 {
+    let reg = op & 0x07;
+    let bit = (op >> 3) & 0x07;
+    let operation = op >> 6;
+
+    match operation {
+        0 => {
+            // Rotate/shift at (IX/IY+d) with undocumented copy to register
+            let val = bus.read_byte(addr);
+            let result = match bit {
+                0 => {
+                    // RLC
+                    let bit7 = (val >> 7) & 1;
+                    let r = (val << 1) | bit7;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                1 => {
+                    // RRC
+                    let bit0 = val & 1;
+                    let r = (val >> 1) | (bit0 << 7);
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                2 => {
+                    // RL
+                    let old_c = if cpu.flag(FLAG_C) { 1u8 } else { 0 };
+                    let bit7 = (val >> 7) & 1;
+                    let r = (val << 1) | old_c;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                3 => {
+                    // RR
+                    let old_c = if cpu.flag(FLAG_C) { 0x80u8 } else { 0 };
+                    let bit0 = val & 1;
+                    let r = (val >> 1) | old_c;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                4 => {
+                    // SLA
+                    let bit7 = (val >> 7) & 1;
+                    let r = val << 1;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                5 => {
+                    // SRA
+                    let bit0 = val & 1;
+                    let r = (val >> 1) | (val & 0x80);
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                6 => {
+                    // SLL (undocumented)
+                    let bit7 = (val >> 7) & 1;
+                    let r = (val << 1) | 1;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit7 != 0);
+                    r
+                }
+                7 => {
+                    // SRL
+                    let bit0 = val & 1;
+                    let r = val >> 1;
+                    cpu.f = 0;
+                    set_sz_xy(cpu, r);
+                    cpu.set_flag(FLAG_PV, parity(r));
+                    cpu.set_flag(FLAG_C, bit0 != 0);
+                    r
+                }
+                _ => unreachable!(),
+            };
+            bus.write_byte(addr, result);
+            // Undocumented: also store result in register (unless reg==6, memory only)
+            if reg != 6 {
+                write_reg8(cpu, bus, reg, result);
+            }
+            23
+        }
+        1 => {
+            // BIT b,(IX/IY+d)
+            let val = bus.read_byte(addr);
+            let tested = val & (1 << bit);
+            let old_c = cpu.flag(FLAG_C);
+            cpu.f = 0;
+            cpu.set_flag(FLAG_Z, tested == 0);
+            cpu.set_flag(FLAG_H, true);
+            cpu.set_flag(FLAG_S, bit == 7 && tested != 0);
+            cpu.set_flag(FLAG_PV, tested == 0);
+            cpu.set_flag(FLAG_C, old_c);
+            // X and Y from high byte of computed address
+            let addr_hi = (addr >> 8) as u8;
+            cpu.set_flag(FLAG_X, addr_hi & FLAG_X != 0);
+            cpu.set_flag(FLAG_Y, addr_hi & FLAG_Y != 0);
+            20
+        }
+        2 => {
+            // RES b,(IX/IY+d) with undocumented copy
+            let val = bus.read_byte(addr);
+            let result = val & !(1 << bit);
+            bus.write_byte(addr, result);
+            if reg != 6 {
+                write_reg8(cpu, bus, reg, result);
+            }
+            23
+        }
+        3 => {
+            // SET b,(IX/IY+d) with undocumented copy
+            let val = bus.read_byte(addr);
+            let result = val | (1 << bit);
+            bus.write_byte(addr, result);
+            if reg != 6 {
+                write_reg8(cpu, bus, reg, result);
+            }
+            23
+        }
+        _ => unreachable!(),
     }
 }

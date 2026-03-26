@@ -209,6 +209,7 @@ pub fn load_cpu_state(cpu: &mut Z80, state: &TestState) {
 
     cpu.halted = false;
     cpu.cycles = 0;
+    cpu.wz = state.wz;
 }
 
 // ── State comparison ───────────────────────────────────────────────────

@@ -108,6 +108,8 @@ pub struct Z80 {
     // ── Internal state ──────────────────────────────────────────────
     /// EI delays enabling interrupts by one instruction.
     pub ei_pending: bool,
+    /// Internal WZ/MEMPTR register (used for undocumented flag behavior).
+    pub wz: u16,
 }
 
 impl Z80 {
@@ -143,6 +145,7 @@ impl Z80 {
             halted: false,
             cycles: 0,
             ei_pending: false,
+            wz: 0,
         }
     }
 
@@ -247,6 +250,7 @@ impl Z80 {
             halted: self.halted,
             cycles: self.cycles,
             ei_pending: self.ei_pending,
+            wz: self.wz,
         }
     }
 }
@@ -290,6 +294,7 @@ pub struct Z80Snapshot {
     pub halted: bool,
     pub cycles: u64,
     pub ei_pending: bool,
+    pub wz: u16,
 }
 
 #[cfg(test)]

@@ -179,6 +179,398 @@ fn daa() {
     run_opcode_tests("27.json");
 }
 
+// ── CB prefix (bit operations) ──────────────────────────────────────────
+
+#[test]
+fn cb_rlc_b() {
+    run_opcode_tests("cb 00.json");
+}
+
+#[test]
+fn cb_rrc_b() {
+    run_opcode_tests("cb 08.json");
+}
+
+#[test]
+fn cb_rl_b() {
+    run_opcode_tests("cb 10.json");
+}
+
+#[test]
+fn cb_rr_b() {
+    run_opcode_tests("cb 18.json");
+}
+
+#[test]
+fn cb_sla_b() {
+    run_opcode_tests("cb 20.json");
+}
+
+#[test]
+fn cb_sra_b() {
+    run_opcode_tests("cb 28.json");
+}
+
+#[test]
+fn cb_sll_b() {
+    run_opcode_tests("cb 30.json");
+}
+
+#[test]
+fn cb_srl_b() {
+    run_opcode_tests("cb 38.json");
+}
+
+#[test]
+fn cb_rlc_hl() {
+    run_opcode_tests("cb 06.json");
+}
+
+#[test]
+fn cb_bit_0_b() {
+    run_opcode_tests("cb 40.json");
+}
+
+#[test]
+fn cb_bit_7_a() {
+    run_opcode_tests("cb 7f.json");
+}
+
+#[test]
+fn cb_bit_0_hl() {
+    run_opcode_tests("cb 46.json");
+}
+
+#[test]
+fn cb_res_0_b() {
+    run_opcode_tests("cb 80.json");
+}
+
+#[test]
+fn cb_res_0_hl() {
+    run_opcode_tests("cb 86.json");
+}
+
+#[test]
+fn cb_set_0_b() {
+    run_opcode_tests("cb c0.json");
+}
+
+#[test]
+fn cb_set_0_hl() {
+    run_opcode_tests("cb c6.json");
+}
+
+// ── ED prefix (extended operations) ────────────────────────────────────
+
+#[test]
+fn ed_in_b_c() {
+    run_opcode_tests("ed 40.json");
+}
+
+#[test]
+fn ed_out_c_b() {
+    run_opcode_tests("ed 41.json");
+}
+
+#[test]
+fn ed_sbc_hl_bc() {
+    run_opcode_tests("ed 42.json");
+}
+
+#[test]
+fn ed_adc_hl_bc() {
+    run_opcode_tests("ed 4a.json");
+}
+
+#[test]
+fn ed_ld_nn_bc() {
+    run_opcode_tests("ed 43.json");
+}
+
+#[test]
+fn ed_ld_bc_nn() {
+    run_opcode_tests("ed 4b.json");
+}
+
+#[test]
+fn ed_neg() {
+    run_opcode_tests("ed 44.json");
+}
+
+#[test]
+fn ed_retn() {
+    run_opcode_tests("ed 45.json");
+}
+
+#[test]
+fn ed_reti() {
+    run_opcode_tests("ed 4d.json");
+}
+
+#[test]
+fn ed_im_0() {
+    run_opcode_tests("ed 46.json");
+}
+
+#[test]
+fn ed_im_1() {
+    run_opcode_tests("ed 56.json");
+}
+
+#[test]
+fn ed_im_2() {
+    run_opcode_tests("ed 5e.json");
+}
+
+#[test]
+fn ed_ld_i_a() {
+    run_opcode_tests("ed 47.json");
+}
+
+#[test]
+fn ed_ld_r_a() {
+    run_opcode_tests("ed 4f.json");
+}
+
+#[test]
+fn ed_ld_a_i() {
+    run_opcode_tests("ed 57.json");
+}
+
+#[test]
+fn ed_ld_a_r() {
+    run_opcode_tests("ed 5f.json");
+}
+
+#[test]
+fn ed_rrd() {
+    run_opcode_tests("ed 67.json");
+}
+
+#[test]
+fn ed_rld() {
+    run_opcode_tests("ed 6f.json");
+}
+
+#[test]
+fn ed_ldi() {
+    run_opcode_tests("ed a0.json");
+}
+
+#[test]
+fn ed_ldd() {
+    run_opcode_tests("ed a8.json");
+}
+
+#[test]
+fn ed_cpi() {
+    run_opcode_tests("ed a1.json");
+}
+
+#[test]
+fn ed_cpd() {
+    run_opcode_tests("ed a9.json");
+}
+
+#[test]
+fn ed_ldir() {
+    run_opcode_tests("ed b0.json");
+}
+
+#[test]
+fn ed_lddr() {
+    run_opcode_tests("ed b8.json");
+}
+
+#[test]
+fn ed_cpir() {
+    run_opcode_tests("ed b1.json");
+}
+
+#[test]
+fn ed_cpdr() {
+    run_opcode_tests("ed b9.json");
+}
+
+#[test]
+fn ed_ini() {
+    run_opcode_tests("ed a2.json");
+}
+
+#[test]
+fn ed_ind() {
+    run_opcode_tests("ed aa.json");
+}
+
+#[test]
+fn ed_outi() {
+    run_opcode_tests("ed a3.json");
+}
+
+#[test]
+fn ed_outd() {
+    run_opcode_tests("ed ab.json");
+}
+
+#[test]
+fn ed_inir() {
+    run_opcode_tests("ed b2.json");
+}
+
+#[test]
+fn ed_indr() {
+    run_opcode_tests("ed ba.json");
+}
+
+#[test]
+fn ed_otir() {
+    run_opcode_tests("ed b3.json");
+}
+
+#[test]
+fn ed_otdr() {
+    run_opcode_tests("ed bb.json");
+}
+
+// ── DD prefix (IX operations) ──────────────────────────────────────────
+
+#[test]
+fn dd_ld_ix_nn() {
+    run_opcode_tests("dd 21.json");
+}
+
+#[test]
+fn dd_add_ix_bc() {
+    run_opcode_tests("dd 09.json");
+}
+
+#[test]
+fn dd_ld_b_ix_d() {
+    run_opcode_tests("dd 46.json");
+}
+
+#[test]
+fn dd_ld_ix_d_b() {
+    run_opcode_tests("dd 70.json");
+}
+
+#[test]
+fn dd_inc_ix_d() {
+    run_opcode_tests("dd 34.json");
+}
+
+#[test]
+fn dd_dec_ix_d() {
+    run_opcode_tests("dd 35.json");
+}
+
+#[test]
+fn dd_add_a_ix_d() {
+    run_opcode_tests("dd 86.json");
+}
+
+#[test]
+fn dd_pop_ix() {
+    run_opcode_tests("dd e1.json");
+}
+
+#[test]
+fn dd_push_ix() {
+    run_opcode_tests("dd e5.json");
+}
+
+#[test]
+fn dd_ld_b_ixh() {
+    run_opcode_tests("dd 44.json");
+}
+
+#[test]
+fn dd_ld_b_ixl() {
+    run_opcode_tests("dd 45.json");
+}
+
+#[test]
+fn dd_jp_ix() {
+    run_opcode_tests("dd e9.json");
+}
+
+#[test]
+fn dd_ld_sp_ix() {
+    run_opcode_tests("dd f9.json");
+}
+
+// ── FD prefix (IY operations) ──────────────────────────────────────────
+
+#[test]
+fn fd_ld_iy_nn() {
+    run_opcode_tests("fd 21.json");
+}
+
+#[test]
+fn fd_add_iy_bc() {
+    run_opcode_tests("fd 09.json");
+}
+
+#[test]
+fn fd_ld_b_iy_d() {
+    run_opcode_tests("fd 46.json");
+}
+
+#[test]
+fn fd_push_iy() {
+    run_opcode_tests("fd e5.json");
+}
+
+// ── DD CB prefix (indexed bit operations) ──────────────────────────────
+
+#[test]
+fn ddcb_rlc_ix_d() {
+    run_opcode_tests("dd cb __ 06.json");
+}
+
+#[test]
+fn ddcb_bit_0_ix_d() {
+    run_opcode_tests("dd cb __ 46.json");
+}
+
+#[test]
+fn ddcb_res_0_ix_d() {
+    run_opcode_tests("dd cb __ 86.json");
+}
+
+#[test]
+fn ddcb_set_0_ix_d() {
+    run_opcode_tests("dd cb __ c6.json");
+}
+
+#[test]
+fn ddcb_rlc_ix_d_b() {
+    run_opcode_tests("dd cb __ 00.json");
+}
+
+// ── FD CB prefix (indexed bit operations) ──────────────────────────────
+
+#[test]
+fn fdcb_rlc_iy_d() {
+    run_opcode_tests("fd cb __ 06.json");
+}
+
+#[test]
+fn fdcb_bit_0_iy_d() {
+    run_opcode_tests("fd cb __ 46.json");
+}
+
+#[test]
+fn fdcb_res_0_iy_d() {
+    run_opcode_tests("fd cb __ 86.json");
+}
+
+#[test]
+fn fdcb_set_0_iy_d() {
+    run_opcode_tests("fd cb __ c6.json");
+}
+
 // ── Full suite runner ───────────────────────────────────────────────────
 
 /// Runs every .json file in the test directory and reports a summary.
