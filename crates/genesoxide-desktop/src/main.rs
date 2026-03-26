@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -86,6 +87,8 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &PathBuf) -> Result<()> {
         scale,
         window: None,
         pixels: None,
+        last_frame_time: None,
+        frame_duration: Duration::from_nanos(16_686_116), // 1 / 59.92 Hz
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
@@ -97,6 +100,8 @@ struct App {
     scale: u32,
     window: Option<Window>,
     pixels: Option<Pixels<'static>>,
+    last_frame_time: Option<Instant>,
+    frame_duration: Duration,
 }
 
 impl ApplicationHandler for App {
@@ -186,15 +191,20 @@ impl ApplicationHandler for App {
                     let _ = pixels.render();
                 }
 
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.last_frame_time = Some(Instant::now());
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(last) = self.last_frame_time {
+            let elapsed = last.elapsed();
+            if elapsed < self.frame_duration {
+                std::thread::sleep(self.frame_duration - elapsed);
+            }
+        }
+
         if let Some(window) = &self.window {
             window.request_redraw();
         }
