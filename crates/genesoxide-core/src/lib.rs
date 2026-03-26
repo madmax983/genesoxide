@@ -11,6 +11,7 @@ pub mod psg;
 pub mod rom;
 pub mod scheduler;
 pub mod vdp;
+pub mod ym2612;
 pub mod z80;
 
 pub use api::{Button, Command, CoreQuery, GenesisCore};
