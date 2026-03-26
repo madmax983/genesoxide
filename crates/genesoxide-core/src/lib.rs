@@ -12,4 +12,4 @@ pub mod scheduler;
 pub mod vdp;
 
 pub use api::{Button, Command, CoreQuery, GenesisCore};
-pub use api::{FRAME_HEIGHT, FRAME_RGBA_BYTES, FRAME_WIDTH};
+pub use api::{FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_RGBA_BYTES, FRAME_WIDTH};

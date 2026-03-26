@@ -20,6 +20,9 @@ pub const FRAME_HEIGHT: usize = 224;
 pub const FRAME_RGBA_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
 /// NTSC frame rate in millihertz (59.92 Hz * 1000).
 pub const FPS_MILLI: u32 = 59_920;
+/// NTSC frame period in nanoseconds.
+/// Derived from master clock: 53_693_175 Hz / (3420 dots × 262 lines) = 59.9227 Hz.
+pub const FRAME_PERIOD_NS: u64 = 16_688_155;
 
 /// Scanlines per frame (NTSC): 224 active + 38 blanking = 262 total.
 pub const SCANLINES_PER_FRAME: u16 = 262;
