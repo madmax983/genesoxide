@@ -517,9 +517,51 @@ impl Vdp {
 
     /// Returns the nametable base address for the window plane.
     #[must_use]
-    #[allow(dead_code)]
     fn window_nametable_addr(&self) -> usize {
         usize::from(self.registers[0x03] & 0x3E) << 10
+    }
+
+    /// Returns the horizontal pixel range where the window plane is active.
+    /// Returns (left_pixel, right_pixel).
+    #[must_use]
+    fn window_h_range(&self, screen_width: u16) -> (u16, u16) {
+        let reg = self.registers[0x11];
+        let cells = u16::from(reg & 0x1F);
+        let pixels = cells * 8;
+        if reg & 0x80 != 0 {
+            // Window on the right side
+            (pixels.min(screen_width), screen_width)
+        } else {
+            // Window on the left side
+            (0, pixels.min(screen_width))
+        }
+    }
+
+    /// Returns the vertical scanline range where the window plane is active.
+    /// Returns (top_line, bottom_line).
+    #[must_use]
+    fn window_v_range(&self) -> (u16, u16) {
+        let reg = self.registers[0x12];
+        let cells = u16::from(reg & 0x1F);
+        let lines = cells * 8;
+        if reg & 0x80 != 0 {
+            // Window below the split line
+            (lines, 224)
+        } else {
+            // Window above the split line
+            (0, lines)
+        }
+    }
+
+    /// Returns the nametable width in cells for the window plane.
+    /// H40 mode = 64 cells wide, H32 mode = 32 cells wide.
+    #[must_use]
+    fn window_nametable_width(&self) -> u16 {
+        if self.registers[0x0C] & 0x81 != 0 {
+            64
+        } else {
+            32
+        }
     }
 
     /// Returns the H-scroll data table base address.
@@ -707,21 +749,63 @@ impl Vdp {
             }
         }
 
-        // Step 3: Scroll A
-        for x in 0..width {
-            let vscroll_a = self.vscroll_for_column(x / 8, 0);
-            let plane_y = line.wrapping_add(vscroll_a) % (v_cells * 8);
-            let plane_x = (x as i16).wrapping_sub(hscroll_a) as u16 % (h_cells * 8);
+        // Step 3: Scroll A + Window plane
+        // The window plane REPLACES Scroll A in its active region.
+        // Compute window coverage for this scanline.
+        let (win_left, win_right) = self.window_h_range(width);
+        let (win_top, win_bottom) = self.window_v_range();
+        let window_active_on_line = line >= win_top && line < win_bottom;
 
-            if let Some((color, pri)) =
-                self.render_plane_pixel(nt_a, plane_x, plane_y, h_cells, v_cells)
-            {
-                let xi = x as usize;
-                let pri_level = if pri { 2 } else { 1 };
-                // Scroll A draws over Scroll B at same or higher priority
-                if pri_level >= pixel_priority[xi] {
-                    pixel_color[xi] = color;
-                    pixel_priority[xi] = pri_level;
+        for x in 0..width {
+            let xi = x as usize;
+            let in_window = window_active_on_line && x >= win_left && x < win_right;
+
+            if in_window {
+                // Window plane: does NOT scroll, coordinates are screen-relative
+                let nt_win = self.window_nametable_addr();
+                let win_nt_width = self.window_nametable_width();
+
+                let tile_col = x / 8;
+                let tile_row = line / 8;
+                let nt_offset = (tile_row * win_nt_width + tile_col) as usize * 2;
+                let nt_addr = nt_win + nt_offset;
+                let entry = self.vram_read_word(nt_addr);
+
+                let priority = entry & 0x8000 != 0;
+                let palette = ((entry >> 13) & 0x03) as u8;
+                let vflip = entry & 0x1000 != 0;
+                let hflip = entry & 0x0800 != 0;
+                let tile_index = entry & 0x07FF;
+
+                let row_in_tile = (line % 8) as u8;
+                let col_in_tile = (x % 8) as u8;
+
+                let color_index =
+                    self.tile_pixel(tile_index, row_in_tile, col_in_tile, hflip, vflip);
+                if color_index != 0 {
+                    // Non-transparent window pixel replaces Scroll A
+                    let pri_level = if priority { 2 } else { 1 };
+                    if pri_level >= pixel_priority[xi] {
+                        pixel_color[xi] = self.resolve_color(palette, color_index);
+                        pixel_priority[xi] = pri_level;
+                    }
+                }
+                // Transparent window pixels let Scroll B (already composited) show through
+            } else {
+                // Outside window region: render Scroll A as normal
+                let vscroll_a = self.vscroll_for_column(x / 8, 0);
+                let plane_y = line.wrapping_add(vscroll_a) % (v_cells * 8);
+                let plane_x = (x as i16).wrapping_sub(hscroll_a) as u16 % (h_cells * 8);
+
+                if let Some((color, pri)) =
+                    self.render_plane_pixel(nt_a, plane_x, plane_y, h_cells, v_cells)
+                {
+                    let pri_level = if pri { 2 } else { 1 };
+                    // Scroll A draws over Scroll B at same or higher priority
+                    if pri_level >= pixel_priority[xi] {
+                        pixel_color[xi] = color;
+                        pixel_priority[xi] = pri_level;
+                    }
                 }
             }
         }
@@ -1428,5 +1512,152 @@ mod tests {
         // Invalid (0b10) treated as 32
         vdp.registers[0x10] = 0x22;
         assert_eq!(vdp.scroll_size(), (32, 32));
+    }
+
+    // ---- Window plane tests ----
+
+    #[test]
+    fn window_plane_renders_over_scroll_a() {
+        let mut vdp = setup_vdp_for_rendering();
+
+        // Set up colors: palette 0 color 1 = red, palette 0 color 2 = green
+        vdp.cram[1] = 0x000E; // red
+        vdp.cram[2] = 0x00E0; // green
+
+        // Tile 1: solid red (for Scroll A)
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        // Tile 2: solid green (for window)
+        write_tile_pattern(&mut vdp, 2, &[[2u8; 8]; 8]);
+
+        // Fill Scroll A nametable with tile 1 (red) across the full row
+        let nt_a = vdp.scroll_a_nametable_addr();
+        let (h_cells, _) = vdp.scroll_size();
+        for col in 0..h_cells {
+            vram_write_word(&mut vdp, nt_a + col as usize * 2, 0x0001);
+        }
+
+        // Window nametable at 0xA000 (reg 0x03 = 0x28 -> 0x28 & 0x3E = 0x28, 0x28 << 10 = 0xA000)
+        vdp.registers[0x03] = 0x28;
+        let nt_win = vdp.window_nametable_addr();
+        assert_eq!(nt_win, 0xA000);
+
+        // Fill window nametable with tile 2 (green) across the full row
+        // Window nametable width in H40 mode = 64 cells
+        let win_nt_width: u16 = 64;
+        for col in 0..win_nt_width {
+            vram_write_word(&mut vdp, nt_win + col as usize * 2, 0x0002);
+        }
+
+        // Configure window: left 20 cells (160 pixels), full vertical
+        // Register 0x11: left side (bit 7 = 0), cell count = 20 (0x14)
+        vdp.registers[0x11] = 0x14;
+        // Register 0x12: full vertical (bit 7 = 0), cell count = 31 (0x1F) -> 248 lines, covers 224
+        vdp.registers[0x12] = 0x1F;
+
+        vdp.render_scanline(0);
+
+        // Pixel 0 should be green (window plane)
+        let green = Vdp::color_to_rgba(0x00E0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &green,
+            "pixel 0 should be green (window)"
+        );
+
+        // Pixel 160 should be red (Scroll A, outside window)
+        let red = Vdp::color_to_rgba(0x000E);
+        let offset = 160 * 4;
+        assert_eq!(
+            &vdp.framebuffer[offset..offset + 4],
+            &red,
+            "pixel 160 should be red (scroll A outside window)"
+        );
+    }
+
+    #[test]
+    fn window_plane_disabled_shows_scroll_a() {
+        let mut vdp = setup_vdp_for_rendering();
+
+        // Set up color: palette 0 color 1 = red
+        vdp.cram[1] = 0x000E; // red
+
+        // Tile 1: solid red
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+
+        // Scroll A nametable: tile 1 at position (0,0)
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001);
+
+        // Window registers at 0 — no coverage
+        // Register 0x11 = 0x00: left side, 0 cells -> (0, 0) range = empty
+        vdp.registers[0x11] = 0x00;
+        // Register 0x12 = 0x00: top side, 0 cells -> (0, 0) range = empty
+        vdp.registers[0x12] = 0x00;
+
+        vdp.render_scanline(0);
+
+        // Pixel 0 should be red (Scroll A, no window active)
+        let red = Vdp::color_to_rgba(0x000E);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &red,
+            "pixel 0 should be red (scroll A, no window)"
+        );
+    }
+
+    #[test]
+    fn window_plane_right_side() {
+        let mut vdp = setup_vdp_for_rendering();
+
+        // Set up colors: palette 0 color 1 = red, palette 0 color 2 = green
+        vdp.cram[1] = 0x000E; // red
+        vdp.cram[2] = 0x00E0; // green
+
+        // Tile 1: solid red (for Scroll A)
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        // Tile 2: solid green (for window)
+        write_tile_pattern(&mut vdp, 2, &[[2u8; 8]; 8]);
+
+        // Fill Scroll A nametable with tile 1 (red) across full row
+        let nt_a = vdp.scroll_a_nametable_addr();
+        let (h_cells, _) = vdp.scroll_size();
+        for col in 0..h_cells {
+            vram_write_word(&mut vdp, nt_a + col as usize * 2, 0x0001);
+        }
+
+        // Window nametable at 0xA000
+        vdp.registers[0x03] = 0x28;
+        let nt_win = vdp.window_nametable_addr();
+
+        // Fill window nametable with tile 2 (green) across full row
+        let win_nt_width: u16 = 64;
+        for col in 0..win_nt_width {
+            vram_write_word(&mut vdp, nt_win + col as usize * 2, 0x0002);
+        }
+
+        // Configure window on right side from cell 20 rightward, full vertical
+        // Register 0x11: right side (bit 7 = 1), cell count = 20 -> 0x80 | 0x14 = 0x94
+        vdp.registers[0x11] = 0x94;
+        // Register 0x12: full vertical coverage
+        vdp.registers[0x12] = 0x1F;
+
+        vdp.render_scanline(0);
+
+        // Pixel 0 should be red (Scroll A, left of window)
+        let red = Vdp::color_to_rgba(0x000E);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &red,
+            "pixel 0 should be red (scroll A, left of window)"
+        );
+
+        // Pixel 160 should be green (window, right side)
+        let green = Vdp::color_to_rgba(0x00E0);
+        let offset = 160 * 4;
+        assert_eq!(
+            &vdp.framebuffer[offset..offset + 4],
+            &green,
+            "pixel 160 should be green (window, right side)"
+        );
     }
 }
