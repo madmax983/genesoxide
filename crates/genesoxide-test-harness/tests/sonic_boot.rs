@@ -129,3 +129,104 @@ fn sonic_renders_hud() {
         "HUD area should have visible content from window plane ({top_area_pixels} pixels)"
     );
 }
+
+/// Debug: dump VDP state during zone title card to diagnose z-ordering.
+#[test]
+#[ignore]
+fn sonic_title_card_debug() {
+    let rom = match load_sonic() {
+        Some(r) => r,
+        None => {
+            eprintln!("Sonic ROM not found, skipping");
+            return;
+        }
+    };
+
+    let mut core = GenesisCore::new();
+    core.execute(Command::LoadRom(rom));
+
+    // Press Start to skip title screen
+    for _ in 0..200 {
+        core.execute(Command::StepFrame);
+    }
+    core.execute(Command::PressButton {
+        port: 0,
+        button: genesoxide_core::Button::Start,
+    });
+    core.execute(Command::StepFrame);
+    core.execute(Command::ReleaseButton {
+        port: 0,
+        button: genesoxide_core::Button::Start,
+    });
+
+    // Run frames during the title card
+    for frame in 0..120 {
+        core.execute(Command::StepFrame);
+        let snap = core.vdp_snapshot();
+        let win_h = snap.registers[0x11];
+        let win_v = snap.registers[0x12];
+
+        // Scroll A nametable base
+        let nt_a_base = usize::from(snap.registers[0x02] & 0x38) << 10;
+        let h_cells: usize = match snap.registers[0x10] & 0x03 {
+            0 => 32,
+            1 => 64,
+            3 => 128,
+            _ => 32,
+        };
+
+        // Sample nametable priority around screen middle (rows 12-18, lines 96-144)
+        let mut hi = 0u32;
+        let mut lo = 0u32;
+        for row in 12..18 {
+            for col in 0..h_cells.min(40) {
+                let offset = (row * h_cells + col) * 2;
+                let addr = nt_a_base + offset;
+                if addr + 1 < snap.vram.len() {
+                    let entry = u16::from(snap.vram[addr]) << 8 | u16::from(snap.vram[addr + 1]);
+                    let tile = entry & 0x07FF;
+                    if tile != 0 {
+                        if entry & 0x8000 != 0 {
+                            hi += 1;
+                        } else {
+                            lo += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sample sprite attributes (first 10 sprites)
+        let sat_base = usize::from(snap.registers[0x05] & 0x7F) << 9;
+        let mut sprite_info = Vec::new();
+        let mut idx = 0u8;
+        for _ in 0..10 {
+            let ea = sat_base + usize::from(idx) * 8;
+            if ea + 7 >= snap.vram.len() {
+                break;
+            }
+            let w0 = u16::from(snap.vram[ea]) << 8 | u16::from(snap.vram[ea + 1]);
+            let w1 = u16::from(snap.vram[ea + 2]) << 8 | u16::from(snap.vram[ea + 3]);
+            let w2 = u16::from(snap.vram[ea + 4]) << 8 | u16::from(snap.vram[ea + 5]);
+            let w3 = u16::from(snap.vram[ea + 6]) << 8 | u16::from(snap.vram[ea + 7]);
+            let sy = (w0 & 0x03FF).wrapping_sub(128);
+            let sx = (w3 & 0x01FF).wrapping_sub(128);
+            let vs = ((w1 >> 8) & 3) + 1;
+            let hs = ((w1 >> 10) & 3) + 1;
+            let pri = if w2 & 0x8000 != 0 { "HI" } else { "lo" };
+            let link = w1 & 0x7F;
+            sprite_info.push(format!("#{idx}({sx},{sy} {hs}x{vs} {pri})"));
+            if link == 0 {
+                break;
+            }
+            idx = link as u8;
+        }
+
+        if frame < 5 || frame % 10 == 0 || (frame >= 30 && frame <= 50) {
+            eprintln!(
+                "F{frame:3}: win_h=0x{win_h:02X} win_v=0x{win_v:02X} scrollA_pri(hi={hi}/lo={lo}) sprites=[{}]",
+                sprite_info.join(", ")
+            );
+        }
+    }
+}

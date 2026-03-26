@@ -732,11 +732,7 @@ fn full_suite() {
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("Cannot read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "bin")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "bin"))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -756,8 +752,11 @@ fn full_suite() {
         if failed > 0 {
             eprintln!("FAIL  {filename}: {failed}/{} failed", passed + failed);
             for f in &failures {
-                eprintln!("      {} — {:?}", f.test_name,
-                    f.mismatches.iter().map(|m| &m.field).collect::<Vec<_>>());
+                eprintln!(
+                    "      {} — {:?}",
+                    f.test_name,
+                    f.mismatches.iter().map(|m| &m.field).collect::<Vec<_>>()
+                );
             }
             failed_instructions.push(filename.to_string());
         } else {
@@ -777,7 +776,10 @@ fn full_suite() {
     }
     eprintln!("════════════════════════════════════════════");
 
-    assert_eq!(total_failed, 0, "{total_failed} tests failed across the full suite");
+    assert_eq!(
+        total_failed, 0,
+        "{total_failed} tests failed across the full suite"
+    );
 }
 
 /// Runs all tests but skips exception-generating cases (address errors,
@@ -790,11 +792,7 @@ fn no_exception_suite() {
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("Cannot read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "bin")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "bin"))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -810,11 +808,13 @@ fn no_exception_suite() {
 
         // Count how many are skipped
         let all_tests = m68k_tests::load_test_file(&path);
-        let skipped = all_tests.iter().filter(|t| m68k_tests::is_exception_test(t)).count();
+        let skipped = all_tests
+            .iter()
+            .filter(|t| m68k_tests::is_exception_test(t))
+            .count();
         total_skipped += skipped;
 
-        let (passed, failed, failures) =
-            m68k_tests::run_test_file_filtered(&path, 3, true);
+        let (passed, failed, failures) = m68k_tests::run_test_file_filtered(&path, 3, true);
         total_passed += passed;
         total_failed += failed;
 
@@ -841,7 +841,10 @@ fn no_exception_suite() {
     eprintln!("\n════════════════════════════════════════════");
     eprintln!(
         "Total: {} passed, {} failed, {} skipped ({} instructions tested)",
-        total_passed, total_failed, total_skipped, entries.len()
+        total_passed,
+        total_failed,
+        total_skipped,
+        entries.len()
     );
     if !failed_instructions.is_empty() {
         eprintln!("Failed: {}", failed_instructions.join(", "));
@@ -850,4 +853,3 @@ fn no_exception_suite() {
 
     assert_eq!(total_failed, 0, "{total_failed} non-exception tests failed");
 }
-

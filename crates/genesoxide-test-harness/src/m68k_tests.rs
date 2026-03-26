@@ -122,7 +122,8 @@ impl<'a> Reader<'a> {
         let numbytes = self.read_u32_le();
         let magic = self.read_u32_le();
         assert_eq!(
-            magic, expected_magic,
+            magic,
+            expected_magic,
             "Bad magic: expected {expected_magic:#010X}, got {magic:#010X} at offset {}",
             self.pos - 4
         );
@@ -166,7 +167,10 @@ fn parse_state(r: &mut Reader<'_>) -> TestState {
     for _ in 0..num_rams {
         let addr = r.read_u32_le();
         let data = r.read_u16_le();
-        debug_assert!(addr < 0x100_0000, "RAM address out of 24-bit range: {addr:#X}");
+        debug_assert!(
+            addr < 0x100_0000,
+            "RAM address out of 24-bit range: {addr:#X}"
+        );
         ram.push((addr, data));
     }
 
@@ -218,7 +222,8 @@ fn parse_test(r: &mut Reader<'_>) -> TestCase {
 
 /// Loads all test cases from a `.json.bin` file.
 pub fn load_test_file(path: &Path) -> Vec<TestCase> {
-    let data = std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+    let data =
+        std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
     let mut r = Reader::new(&data);
 
     let magic = r.read_u32_le();

@@ -2433,7 +2433,10 @@ fn exec_abcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 
     let (src, dst) = if rm == 0 {
         // Data register
-        ((cpu.d[ry as usize] & 0xFF) as u8, (cpu.d[rx as usize] & 0xFF) as u8)
+        (
+            (cpu.d[ry as usize] & 0xFF) as u8,
+            (cpu.d[rx as usize] & 0xFF) as u8,
+        )
     } else {
         // Predecrement -(Ay), -(Ax). A7 decrements by 2 to stay word-aligned.
         let dec_y = if ry == 7 { 2 } else { 1 };
@@ -2442,10 +2445,17 @@ fn exec_abcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
         cpu.write_a(ry, src_addr);
         let dst_addr = cpu.read_a(rx).wrapping_sub(dec_x);
         cpu.write_a(rx, dst_addr);
-        (bus.read_byte(src_addr & 0x00FF_FFFF), bus.read_byte(dst_addr & 0x00FF_FFFF))
+        (
+            bus.read_byte(src_addr & 0x00FF_FFFF),
+            bus.read_byte(dst_addr & 0x00FF_FFFF),
+        )
     };
 
-    let extend = if cpu.sr.flag(StatusRegister::X) { 1u16 } else { 0 };
+    let extend = if cpu.sr.flag(StatusRegister::X) {
+        1u16
+    } else {
+        0
+    };
     let result = bcd_add(src, dst, extend);
 
     cpu.sr.set_flag(StatusRegister::X, result.carry);
@@ -2476,7 +2486,10 @@ fn exec_sbcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let rm = (opcode >> 3) & 1;
 
     let (src, dst) = if rm == 0 {
-        ((cpu.d[ry as usize] & 0xFF) as u8, (cpu.d[rx as usize] & 0xFF) as u8)
+        (
+            (cpu.d[ry as usize] & 0xFF) as u8,
+            (cpu.d[rx as usize] & 0xFF) as u8,
+        )
     } else {
         // A7 decrements by 2 to stay word-aligned
         let dec_y = if ry == 7 { 2 } else { 1 };
@@ -2485,10 +2498,17 @@ fn exec_sbcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
         cpu.write_a(ry, src_addr);
         let dst_addr = cpu.read_a(rx).wrapping_sub(dec_x);
         cpu.write_a(rx, dst_addr);
-        (bus.read_byte(src_addr & 0x00FF_FFFF), bus.read_byte(dst_addr & 0x00FF_FFFF))
+        (
+            bus.read_byte(src_addr & 0x00FF_FFFF),
+            bus.read_byte(dst_addr & 0x00FF_FFFF),
+        )
     };
 
-    let extend = if cpu.sr.flag(StatusRegister::X) { 1u16 } else { 0 };
+    let extend = if cpu.sr.flag(StatusRegister::X) {
+        1u16
+    } else {
+        0
+    };
     let result = bcd_sub(src, dst, extend);
 
     cpu.sr.set_flag(StatusRegister::X, result.carry);
@@ -2515,7 +2535,11 @@ fn exec_nbcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let ea = src_ea(opcode);
     let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
     let dst = val as u8;
-    let extend = if cpu.sr.flag(StatusRegister::X) { 1u16 } else { 0 };
+    let extend = if cpu.sr.flag(StatusRegister::X) {
+        1u16
+    } else {
+        0
+    };
     let result = bcd_sub(dst, 0, extend);
 
     cpu.sr.set_flag(StatusRegister::X, result.carry);
@@ -2609,7 +2633,11 @@ fn bcd_sub(src: u8, dst: u8, extend: u16) -> BcdResult {
     let binary_borrow = result & 0x100 != 0;
 
     // Low nibble correction
-    let low_borrow = (dst16 & 0x0F).wrapping_sub(src16 & 0x0F).wrapping_sub(extend) & 0x10 != 0;
+    let low_borrow = (dst16 & 0x0F)
+        .wrapping_sub(src16 & 0x0F)
+        .wrapping_sub(extend)
+        & 0x10
+        != 0;
     if low_borrow {
         result = result.wrapping_sub(0x06);
     }
