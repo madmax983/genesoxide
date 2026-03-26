@@ -7,6 +7,7 @@ pub mod api;
 pub mod bus;
 pub mod cpu;
 pub mod io;
+pub mod psg;
 pub mod rom;
 pub mod scheduler;
 pub mod vdp;
