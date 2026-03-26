@@ -466,6 +466,31 @@ fn evaluate_condition(sr: &StatusRegister, condition: u8) -> bool {
     }
 }
 
+// ── SR update with mode-switching ────────────────────────────────────────
+
+/// Valid SR bit mask: T(15), S(13), IPM(10-8), X(4), N(3), Z(2), V(1), C(0).
+/// Bits 5-7, 11-12, and 14 are unused and always read as 0 on real hardware.
+const SR_MASK: u16 = 0xA71F;
+
+/// Safely updates the full SR, handling supervisor↔user mode transitions.
+///
+/// On the real 68000, changing the S bit in the status register swaps the
+/// active stack pointer. We must snapshot the current SP *before* touching
+/// SR so we don't lose the old value. Unused bits are masked to 0.
+fn update_sr(cpu: &mut Cpu, new_sr: u16) {
+    let was_super = cpu.sr.supervisor();
+    let old_sp = if was_super { cpu.ssp } else { cpu.usp };
+    cpu.sr = StatusRegister::new(new_sr & SR_MASK);
+    let now_super = cpu.sr.supervisor();
+    if was_super && !now_super {
+        // Supervisor → User: save old SSP
+        cpu.ssp = old_sp;
+    } else if !was_super && now_super {
+        // User → Supervisor: save old USP
+        cpu.usp = old_sp;
+    }
+}
+
 // ── Stack operations ─────────────────────────────────────────────────────
 
 /// Pushes a 32-bit long onto the stack (pre-decrement A7 by 4).
@@ -582,6 +607,11 @@ pub fn execute_instruction(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32
         Instruction::MulS => exec_muls(cpu, opcode, bus),
         Instruction::DivU => exec_divu(cpu, opcode, bus),
         Instruction::DivS => exec_divs(cpu, opcode, bus),
+        Instruction::Abcd => exec_abcd(cpu, opcode, bus),
+        Instruction::Sbcd => exec_sbcd(cpu, opcode, bus),
+        Instruction::Nbcd => exec_nbcd(cpu, opcode, bus),
+        Instruction::Chk => exec_chk(cpu, opcode, bus),
+        Instruction::Tas => exec_tas(cpu, opcode, bus),
         Instruction::Clr(size) => exec_clr(cpu, opcode, size, bus),
         Instruction::Neg(size) => exec_neg(cpu, opcode, size, bus),
         Instruction::NegX(size) => exec_negx(cpu, opcode, size, bus),
@@ -745,15 +775,19 @@ fn exec_movem(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn B
         // Register to memory
         match ea {
             AddressingMode::AddrPreDec(reg) => {
-                // Predecrement mode: registers stored in reverse order (A7..A0, D7..D0)
+                // Predecrement mode: the mask bits are REVERSED compared to
+                // other modes. Bit 0 = A7, bit 7 = A0, bit 8 = D7, bit 15 = D0.
+                // We iterate from bit 0 up: A7 stored first (at highest addr),
+                // D0 stored last (at lowest addr).
                 let mut addr = cpu.read_a(reg);
-                for i in (0..16).rev() {
+                for i in 0..16u16 {
                     if mask & (1 << i) != 0 {
                         addr = addr.wrapping_sub(step);
+                        // Reversed mapping: bits 0-7 = A7..A0, bits 8-15 = D7..D0
                         let val = if i < 8 {
-                            cpu.d[i as usize]
+                            cpu.read_a(7 - i as u8)
                         } else {
-                            cpu.read_a((i - 8) as u8)
+                            cpu.d[(15 - i) as usize]
                         };
                         if size == InstructionSize::Long {
                             write_long(bus, addr & 0x00FF_FFFF, val);
@@ -1242,10 +1276,12 @@ fn exec_divu(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let remainder = dividend % divisor;
 
     if quotient > 0xFFFF {
-        // Overflow
+        // Overflow: register unchanged, V=1, C=0, N=1, Z=0
+        // (hardware always sets N on overflow since the result is large)
+        cpu.sr.set_flag(StatusRegister::N, true);
+        cpu.sr.set_flag(StatusRegister::Z, false);
         cpu.sr.set_flag(StatusRegister::V, true);
         cpu.sr.set_flag(StatusRegister::C, false);
-        // N and Z are undefined on overflow, but register is unchanged
     } else {
         cpu.d[reg] = (remainder << 16) | (quotient & 0xFFFF);
         cpu.sr.set_flag(StatusRegister::N, quotient & 0x8000 != 0);
@@ -1271,7 +1307,9 @@ fn exec_divs(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let remainder = dividend % divisor;
 
     if !(-0x8000..=0x7FFF).contains(&quotient) {
-        // Overflow
+        // Overflow: register unchanged, V=1, C=0, N=1, Z=0
+        cpu.sr.set_flag(StatusRegister::N, true);
+        cpu.sr.set_flag(StatusRegister::Z, false);
         cpu.sr.set_flag(StatusRegister::V, true);
         cpu.sr.set_flag(StatusRegister::C, false);
     } else {
@@ -1739,7 +1777,7 @@ fn exec_rod(cpu: &mut Cpu, opcode: u16, size: InstructionSize) -> u32 {
         cpu.d[count_field as usize] % 64
     };
 
-    let bits = size_bits(size);
+    let _bits = size_bits(size);
     let msb = msb_mask(size);
     let mut val = mask_value(cpu.d[reg], size);
 
@@ -2208,15 +2246,11 @@ fn exec_rts(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
 fn exec_rte(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
     let new_sr = pop_word(cpu, bus);
     let new_pc = pop_long(cpu, bus);
-
-    // If switching from supervisor to user mode, swap stack pointers
-    let was_super = cpu.sr.supervisor();
-    cpu.sr = StatusRegister::new(new_sr);
-    if was_super && !cpu.sr.supervisor() {
-        // Save SSP, restore USP
-        cpu.ssp = cpu.sp();
-        // The SP we just used was the SSP; the new mode is user, so set_sp will set USP
-    }
+    // Save SSP after pops (it has already been incremented by 6)
+    let ssp_after_pop = cpu.ssp;
+    update_sr(cpu, new_sr);
+    // If we were in supervisor mode, the pops advanced SSP. Preserve that.
+    cpu.ssp = ssp_after_pop;
     cpu.pc = new_pc;
     20
 }
@@ -2254,7 +2288,12 @@ fn exec_unlk(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 
 fn exec_stop(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
     let imm = fetch_word(cpu, bus);
-    cpu.sr = StatusRegister::new(imm);
+    if !cpu.sr.supervisor() {
+        // Privilege violation — exception vector 8
+        exec_exception(cpu, bus, 8);
+        return 34;
+    }
+    update_sr(cpu, imm);
     cpu.stopped = true;
     4
 }
@@ -2319,7 +2358,7 @@ fn exec_andi_ccr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
 
 fn exec_andi_sr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
     let imm = fetch_word(cpu, bus);
-    cpu.sr.0 &= imm;
+    update_sr(cpu, cpu.sr.0 & imm);
     20
 }
 
@@ -2331,7 +2370,7 @@ fn exec_ori_ccr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
 
 fn exec_ori_sr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
     let imm = fetch_word(cpu, bus);
-    cpu.sr.0 |= imm;
+    update_sr(cpu, cpu.sr.0 | imm);
     20
 }
 
@@ -2343,22 +2382,14 @@ fn exec_eori_ccr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
 
 fn exec_eori_sr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
     let imm = fetch_word(cpu, bus);
-    cpu.sr.0 ^= imm;
+    update_sr(cpu, cpu.sr.0 ^ imm);
     20
 }
 
 fn exec_move_to_sr(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let ea = src_ea(opcode);
     let val = read_ea(cpu, ea, InstructionSize::Word, bus) as u16;
-    let was_super = cpu.sr.supervisor();
-    cpu.sr = StatusRegister::new(val);
-    if was_super && !cpu.sr.supervisor() {
-        // Switched to user mode
-        cpu.ssp = cpu.sp();
-    } else if !was_super && cpu.sr.supervisor() {
-        // Switched to supervisor mode
-        cpu.usp = cpu.sp();
-    }
+    update_sr(cpu, val);
     12
 }
 
@@ -2389,6 +2420,283 @@ fn exec_move_usp(cpu: &mut Cpu, opcode: u16) -> u32 {
         cpu.write_a(reg, cpu.usp);
     }
     4
+}
+
+// ── BCD Arithmetic ──────────────────────────────────────────────────────
+
+/// ABCD: Add BCD with extend.
+/// Format: 1100 Rx 1 0000 m Ry  (m=0: Dy,Dx  m=1: -(Ay),-(Ax))
+fn exec_abcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    let rx = ((opcode >> 9) & 7) as u8;
+    let ry = (opcode & 7) as u8;
+    let rm = (opcode >> 3) & 1;
+
+    let (src, dst) = if rm == 0 {
+        // Data register
+        ((cpu.d[ry as usize] & 0xFF) as u8, (cpu.d[rx as usize] & 0xFF) as u8)
+    } else {
+        // Predecrement -(Ay), -(Ax). A7 decrements by 2 to stay word-aligned.
+        let dec_y = if ry == 7 { 2 } else { 1 };
+        let dec_x = if rx == 7 { 2 } else { 1 };
+        let src_addr = cpu.read_a(ry).wrapping_sub(dec_y);
+        cpu.write_a(ry, src_addr);
+        let dst_addr = cpu.read_a(rx).wrapping_sub(dec_x);
+        cpu.write_a(rx, dst_addr);
+        (bus.read_byte(src_addr & 0x00FF_FFFF), bus.read_byte(dst_addr & 0x00FF_FFFF))
+    };
+
+    let extend = if cpu.sr.flag(StatusRegister::X) { 1u16 } else { 0 };
+    let result = bcd_add(src, dst, extend);
+
+    cpu.sr.set_flag(StatusRegister::X, result.carry);
+    cpu.sr.set_flag(StatusRegister::C, result.carry);
+    if result.value != 0 {
+        cpu.sr.set_flag(StatusRegister::Z, false);
+    }
+    // N is undefined on real hardware; MAME sets it from MSB of result
+    cpu.sr.set_flag(StatusRegister::N, result.value & 0x80 != 0);
+    // V is undefined on real hardware
+    cpu.sr.set_flag(StatusRegister::V, result.overflow);
+
+    if rm == 0 {
+        cpu.d[rx as usize] = (cpu.d[rx as usize] & 0xFFFF_FF00) | u32::from(result.value);
+        6
+    } else {
+        let dst_addr = cpu.read_a(rx);
+        bus.write_byte(dst_addr & 0x00FF_FFFF, result.value);
+        18
+    }
+}
+
+/// SBCD: Subtract BCD with extend.
+/// Format: 1000 Rx 1 0000 m Ry  (m=0: Dy,Dx  m=1: -(Ay),-(Ax))
+fn exec_sbcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    let rx = ((opcode >> 9) & 7) as u8;
+    let ry = (opcode & 7) as u8;
+    let rm = (opcode >> 3) & 1;
+
+    let (src, dst) = if rm == 0 {
+        ((cpu.d[ry as usize] & 0xFF) as u8, (cpu.d[rx as usize] & 0xFF) as u8)
+    } else {
+        // A7 decrements by 2 to stay word-aligned
+        let dec_y = if ry == 7 { 2 } else { 1 };
+        let dec_x = if rx == 7 { 2 } else { 1 };
+        let src_addr = cpu.read_a(ry).wrapping_sub(dec_y);
+        cpu.write_a(ry, src_addr);
+        let dst_addr = cpu.read_a(rx).wrapping_sub(dec_x);
+        cpu.write_a(rx, dst_addr);
+        (bus.read_byte(src_addr & 0x00FF_FFFF), bus.read_byte(dst_addr & 0x00FF_FFFF))
+    };
+
+    let extend = if cpu.sr.flag(StatusRegister::X) { 1u16 } else { 0 };
+    let result = bcd_sub(src, dst, extend);
+
+    cpu.sr.set_flag(StatusRegister::X, result.carry);
+    cpu.sr.set_flag(StatusRegister::C, result.carry);
+    if result.value != 0 {
+        cpu.sr.set_flag(StatusRegister::Z, false);
+    }
+    cpu.sr.set_flag(StatusRegister::N, result.value & 0x80 != 0);
+    cpu.sr.set_flag(StatusRegister::V, result.overflow);
+
+    if rm == 0 {
+        cpu.d[rx as usize] = (cpu.d[rx as usize] & 0xFFFF_FF00) | u32::from(result.value);
+        6
+    } else {
+        let dst_addr = cpu.read_a(rx);
+        bus.write_byte(dst_addr & 0x00FF_FFFF, result.value);
+        18
+    }
+}
+
+/// NBCD: Negate BCD (0 - dst - X).
+/// Format: 0100 1000 00mm mrrr
+fn exec_nbcd(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    let ea = src_ea(opcode);
+    let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
+    let dst = val as u8;
+    let extend = if cpu.sr.flag(StatusRegister::X) { 1u16 } else { 0 };
+    let result = bcd_sub(dst, 0, extend);
+
+    cpu.sr.set_flag(StatusRegister::X, result.carry);
+    cpu.sr.set_flag(StatusRegister::C, result.carry);
+    if result.value != 0 {
+        cpu.sr.set_flag(StatusRegister::Z, false);
+    }
+    cpu.sr.set_flag(StatusRegister::N, result.value & 0x80 != 0);
+    cpu.sr.set_flag(StatusRegister::V, result.overflow);
+
+    match ea {
+        AddressingMode::DataDirect(reg) => {
+            cpu.d[reg as usize] = (cpu.d[reg as usize] & 0xFFFF_FF00) | u32::from(result.value);
+            6
+        }
+        _ => {
+            bus.write_byte(addr & 0x00FF_FFFF, result.value);
+            8
+        }
+    }
+}
+
+struct BcdResult {
+    value: u8,
+    carry: bool,
+    overflow: bool,
+}
+
+/// BCD addition: dst + src + extend, with decimal correction.
+///
+/// V flag: set if the MSB (bit 7) changes from 0→1 during BCD correction.
+/// This matches the real 68000 hardware behavior as replicated by MAME.
+fn bcd_add(src: u8, dst: u8, extend: u16) -> BcdResult {
+    let src16 = u16::from(src);
+    let dst16 = u16::from(dst);
+
+    // Low nibble
+    let low = (dst16 & 0x0F) + (src16 & 0x0F) + extend;
+
+    // Binary result (before correction)
+    let mut result = dst16 + src16 + extend;
+
+    // Check binary carry BEFORE corrections
+    let binary_carry = result > 0x99;
+
+    // Save ~bit7 of uncorrected result for V flag
+    let v_pre = !result;
+
+    // BCD correction: low nibble
+    if low > 0x09 {
+        result = result.wrapping_add(0x06);
+    }
+
+    // BCD correction: high nibble (only when binary result > 0x99)
+    if binary_carry {
+        result = result.wrapping_add(0x60);
+    }
+
+    // Carry: only from binary overflow (low correction doesn't cause decimal carry)
+    let carry = binary_carry;
+
+    // V: set if bit 7 transitioned 0→1 due to correction
+    let overflow = (v_pre & result & 0x80) != 0;
+
+    BcdResult {
+        value: (result & 0xFF) as u8,
+        carry,
+        overflow,
+    }
+}
+
+/// BCD subtraction: dst - src - extend, with decimal correction.
+///
+/// The carry flag is set when the overall BCD operation borrows (either from
+/// the original binary subtraction OR from the low-nibble correction causing
+/// a wrap). The 0x60 correction is only applied when the original binary
+/// subtraction itself borrowed.
+///
+/// V flag: set if the MSB (bit 7) changes from 1→0 during BCD correction.
+fn bcd_sub(src: u8, dst: u8, extend: u16) -> BcdResult {
+    let src16 = u16::from(src);
+    let dst16 = u16::from(dst);
+
+    // Full binary subtraction (before correction)
+    let mut result = dst16.wrapping_sub(src16).wrapping_sub(extend);
+
+    // Save bit7 of uncorrected result for V flag
+    let v_pre = result;
+
+    // Check binary borrow BEFORE corrections
+    let binary_borrow = result & 0x100 != 0;
+
+    // Low nibble correction
+    let low_borrow = (dst16 & 0x0F).wrapping_sub(src16 & 0x0F).wrapping_sub(extend) & 0x10 != 0;
+    if low_borrow {
+        result = result.wrapping_sub(0x06);
+    }
+
+    // High nibble correction only when original binary subtraction borrowed
+    if binary_borrow {
+        result = result.wrapping_sub(0x60);
+    }
+
+    // Carry: set if result after corrections has borrow (either binary or
+    // correction-induced). Check bit 8 after low correction.
+    let carry = (result & 0x100) != 0 || binary_borrow;
+
+    // V: set if bit 7 transitioned 1→0 due to correction
+    let overflow = (v_pre & !result & 0x80) != 0;
+
+    BcdResult {
+        value: (result & 0xFF) as u8,
+        carry,
+        overflow,
+    }
+}
+
+// ── CHK ──────────────────────────────────────────────────────────────────
+
+/// CHK: Check Register Against Bounds.
+/// If Dn < 0 or Dn > source, trigger CHK exception (vector 6).
+/// Flags: N set if Dn < 0, cleared if Dn > upper. Z, V, C undefined but
+/// MAME clears them on the non-exception path.
+fn exec_chk(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    let reg = ((opcode >> 9) & 7) as usize;
+    let ea = src_ea(opcode);
+    let upper = read_ea(cpu, ea, InstructionSize::Word, bus) as u16;
+    let val = (cpu.d[reg] & 0xFFFF) as u16;
+    let val_signed = val as i16;
+
+    if val_signed < 0 {
+        cpu.sr.set_flag(StatusRegister::N, true);
+        cpu.sr.set_flag(StatusRegister::Z, false);
+        cpu.sr.set_flag(StatusRegister::V, false);
+        cpu.sr.set_flag(StatusRegister::C, false);
+        exec_exception(cpu, bus, 6);
+        40
+    } else if val > upper {
+        cpu.sr.set_flag(StatusRegister::N, false);
+        cpu.sr.set_flag(StatusRegister::Z, false);
+        cpu.sr.set_flag(StatusRegister::V, false);
+        cpu.sr.set_flag(StatusRegister::C, false);
+        exec_exception(cpu, bus, 6);
+        40
+    } else {
+        // No exception: N, Z, V, C are undefined but MAME clears V and C
+        cpu.sr.set_flag(StatusRegister::N, val & 0x8000 != 0);
+        cpu.sr.set_flag(StatusRegister::Z, val == 0);
+        cpu.sr.set_flag(StatusRegister::V, false);
+        cpu.sr.set_flag(StatusRegister::C, false);
+        10
+    }
+}
+
+// ── TAS ──────────────────────────────────────────────────────────────────
+
+/// TAS: Test and Set (atomic read-modify-write).
+/// Tests the byte, sets flags, then sets bit 7.
+fn exec_tas(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    let ea = src_ea(opcode);
+    let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
+    let val = val as u8;
+
+    // Set flags based on the original value
+    cpu.sr.set_flag(StatusRegister::N, val & 0x80 != 0);
+    cpu.sr.set_flag(StatusRegister::Z, val == 0);
+    cpu.sr.set_flag(StatusRegister::V, false);
+    cpu.sr.set_flag(StatusRegister::C, false);
+
+    // Set bit 7
+    let result = val | 0x80;
+    match ea {
+        AddressingMode::DataDirect(reg) => {
+            cpu.d[reg as usize] = (cpu.d[reg as usize] & 0xFFFF_FF00) | u32::from(result);
+            4
+        }
+        _ => {
+            bus.write_byte(addr & 0x00FF_FFFF, result);
+            14
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════

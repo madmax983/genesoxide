@@ -97,6 +97,16 @@ pub enum Instruction {
     DivU,
     /// DIVS source, Dn
     DivS,
+    /// ABCD (BCD add)
+    Abcd,
+    /// SBCD (BCD subtract)
+    Sbcd,
+    /// NBCD (BCD negate)
+    Nbcd,
+    /// CHK source, Dn
+    Chk,
+    /// TAS destination
+    Tas,
     /// CLR destination
     Clr(InstructionSize),
     /// NEG destination
@@ -598,6 +608,11 @@ fn decode_group4(opcode: u16) -> Instruction {
         };
     }
 
+    // TAS: 0100 1010 11mm mrrr
+    if opcode & 0xFFC0 == 0x4AC0 {
+        return Instruction::Tas;
+    }
+
     // TST: 0100 1010 ssmm mrrr
     if opcode & 0xFF00 == 0x4A00 {
         let size_bits = ((opcode >> 6) & 3) as u8;
@@ -605,6 +620,16 @@ fn decode_group4(opcode: u16) -> Instruction {
             Some(size) => Instruction::Tst(size),
             None => Instruction::Illegal,
         };
+    }
+
+    // NBCD: 0100 1000 00mm mrrr
+    if opcode & 0xFFC0 == 0x4800 {
+        return Instruction::Nbcd;
+    }
+
+    // CHK: 0100 rrr1 10mm mrrr
+    if opcode & 0xF1C0 == 0x4180 {
+        return Instruction::Chk;
     }
 
     Instruction::Illegal
@@ -651,6 +676,7 @@ fn decode_group6(opcode: u16) -> Instruction {
 /// Group 8 (1000): OR / DIVU / DIVS / SBCD.
 fn decode_group8(opcode: u16) -> Instruction {
     let opmode = ((opcode >> 6) & 7) as u8;
+    let ea_mode = ((opcode >> 3) & 7) as u8;
 
     match opmode {
         // OR <ea>, Dn (byte/word/long)
@@ -659,8 +685,15 @@ fn decode_group8(opcode: u16) -> Instruction {
         2 => Instruction::Or(InstructionSize::Long),
         // DIVU: 1000 rrr0 11mm mrrr
         3 => Instruction::DivU,
-        // OR Dn, <ea> (byte/word)
-        4 => Instruction::Or(InstructionSize::Byte),
+        // OR Dn, <ea> / SBCD
+        4 => {
+            if ea_mode == 0 || ea_mode == 1 {
+                // SBCD: 1000 rrr1 0000 mrrr (m=0: Dy,Dx  m=1: -(Ay),-(Ax))
+                Instruction::Sbcd
+            } else {
+                Instruction::Or(InstructionSize::Byte)
+            }
+        }
         5 => Instruction::Or(InstructionSize::Word),
         6 => Instruction::Or(InstructionSize::Long),
         // DIVS: 1000 rrr1 11mm mrrr
@@ -763,9 +796,9 @@ fn decode_group_c(opcode: u16) -> Instruction {
         3 => Instruction::MulU,
         // AND Dn, <ea> / ABCD / EXG
         4 => {
-            if ea_mode == 0 {
-                // ABCD Dy, Dx — skip for now
-                Instruction::Illegal
+            if ea_mode == 0 || ea_mode == 1 {
+                // ABCD: 1100 rrr1 0000 mrrr (m=0: Dy,Dx  m=1: -(Ay),-(Ax))
+                Instruction::Abcd
             } else {
                 Instruction::And(InstructionSize::Byte)
             }

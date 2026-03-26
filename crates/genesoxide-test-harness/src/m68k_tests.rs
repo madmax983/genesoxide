@@ -369,9 +369,11 @@ fn compare_state(cpu: &Cpu, bus: &TestBus, expected: &TestState) -> Vec<Mismatch
     }
 
     // PC mapping: the test's PC is the "next prefetch address", which is
-    // always 4 bytes ahead of where our emulator's PC ends up.
-    // The 68000 keeps a 2-word prefetch queue, so test_pc = our_pc + 4.
-    let expected_our_pc = expected.pc.wrapping_sub(4);
+    // normally 4 bytes ahead of where our emulator's PC ends up (the 68000
+    // keeps a 2-word prefetch queue). However, when the CPU is stopped
+    // (STOP instruction), no additional prefetch occurs, so the offset is 0.
+    let prefetch_offset = if cpu.stopped { 0 } else { 4 };
+    let expected_our_pc = expected.pc.wrapping_sub(prefetch_offset);
     if cpu.pc != expected_our_pc {
         mismatches.push(Mismatch {
             field: "PC".into(),

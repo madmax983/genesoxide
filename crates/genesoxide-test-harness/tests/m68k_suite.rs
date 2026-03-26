@@ -850,3 +850,4 @@ fn no_exception_suite() {
 
     assert_eq!(total_failed, 0, "{total_failed} non-exception tests failed");
 }
+
