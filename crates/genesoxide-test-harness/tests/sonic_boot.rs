@@ -1,15 +1,20 @@
-//! Diagnostic: check if Sonic produces visible pixels.
+//! Sonic the Hedgehog integration tests.
 //! Run with: cargo test -p genesoxide-test-harness --test sonic_boot -- --nocapture
 
 use genesoxide_core::{Command, GenesisCore};
 
+const SONIC_ROM_PATH: &str =
+    r"C:\Users\markm\AppData\Local\Temp\sonic_test\Sonic The Hedgehog (USA, Europe).md";
+
+fn load_sonic() -> Option<Vec<u8>> {
+    std::fs::read(SONIC_ROM_PATH).ok()
+}
+
 #[test]
 fn sonic_boot_diagnostic() {
-    let rom_path =
-        r"C:\Users\markm\AppData\Local\Temp\sonic_test\Sonic The Hedgehog (USA, Europe).md";
-    let rom = match std::fs::read(rom_path) {
-        Ok(r) => r,
-        Err(_) => {
+    let rom = match load_sonic() {
+        Some(r) => r,
+        None => {
             eprintln!("Sonic ROM not found, skipping");
             return;
         }
@@ -59,4 +64,68 @@ fn sonic_boot_diagnostic() {
             }
         }
     }
+}
+
+/// Verifies that the window plane (HUD) renders visible content
+/// once Sonic enters gameplay. Requires the SEGA logo + title screen
+/// to complete (~200 frames), then pressing Start, then running
+/// a few frames into Green Hill Zone.
+#[test]
+fn sonic_renders_hud() {
+    let rom = match load_sonic() {
+        Some(r) => r,
+        None => {
+            eprintln!("Sonic ROM not found, skipping");
+            return;
+        }
+    };
+
+    let mut core = GenesisCore::new();
+    core.execute(Command::LoadRom(rom));
+
+    // Skip past SEGA logo and into title screen (~200 frames)
+    for _ in 0..200 {
+        core.execute(Command::StepFrame);
+    }
+
+    // Press Start to begin the game
+    core.execute(Command::PressButton {
+        port: 0,
+        button: genesoxide_core::Button::Start,
+    });
+    core.execute(Command::StepFrame);
+    core.execute(Command::ReleaseButton {
+        port: 0,
+        button: genesoxide_core::Button::Start,
+    });
+
+    // Run into gameplay (~120 more frames for zone title card to clear)
+    for _ in 0..120 {
+        core.execute(Command::StepFrame);
+    }
+
+    let fb = core.framebuffer_rgba();
+    let total_pixels = 320 * 224;
+    let non_black: usize = fb
+        .chunks(4)
+        .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+        .count();
+
+    // Check the HUD region (top 32 pixel rows) for non-background content
+    let top_area_pixels: usize = fb[..320 * 32 * 4]
+        .chunks(4)
+        .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+        .count();
+
+    eprintln!("Total non-black pixels: {non_black}/{total_pixels}");
+    eprintln!("Top 32 rows non-black: {top_area_pixels}/{}", 320 * 32);
+
+    assert!(
+        non_black > 1000,
+        "Frame should have substantial rendered content ({non_black} non-black pixels)"
+    );
+    assert!(
+        top_area_pixels > 50,
+        "HUD area should have visible content from window plane ({top_area_pixels} pixels)"
+    );
 }

@@ -395,9 +395,9 @@ impl GenesisCore {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): always grant (Z80 not emulated)
-                // Z80 reset (0xA11200): acknowledge
-                0x01
+                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
+                // Since Z80 is not emulated, bus is always available.
+                0x00
             }
             bus::BusRegion::Vdp => {
                 // VDP byte reads: return high or low byte of word read
@@ -514,9 +514,8 @@ impl Bus for CoreBus<'_> {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): always grant (Z80 not emulated)
-                // Z80 reset (0xA11200): acknowledge
-                0x01
+                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
+                0x00
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -563,9 +562,8 @@ impl Bus for CoreBus<'_> {
                 u16::from(val)
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): always grant (Z80 not emulated)
-                // Z80 reset (0xA11200): acknowledge
-                0x0001
+                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
+                0x0000
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -705,8 +703,8 @@ mod tests {
     #[test]
     fn z80_bus_request_grants_immediately() {
         let core = GenesisCore::new();
-        // Reading Z80 bus request should show bus granted
+        // Z80 bus request: bit 0 = 0 means bus granted to 68K
         let val = core.read_byte(0xA11100);
-        assert_eq!(val & 0x01, 0x01);
+        assert_eq!(val & 0x01, 0x00, "bit 0 should be 0 (bus granted)");
     }
 }
