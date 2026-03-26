@@ -10,6 +10,7 @@ pub mod io;
 pub mod rom;
 pub mod scheduler;
 pub mod vdp;
+pub mod z80;
 
 pub use api::{Button, Command, CoreQuery, GenesisCore};
 pub use api::{FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_RGBA_BYTES, FRAME_WIDTH};
