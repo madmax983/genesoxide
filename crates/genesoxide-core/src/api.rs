@@ -572,10 +572,7 @@ impl Bus for CoreBus<'_> {
                 match vdp_addr {
                     0x00 | 0x02 => self.vdp.read_data(),
                     0x04 | 0x06 => self.vdp.read_status(),
-                    0x08 | 0x0A | 0x0C | 0x0E => {
-                        // HV counter (stub: return 0 for now)
-                        0
-                    }
+                    0x08 | 0x0A | 0x0C | 0x0E => self.vdp.read_hv_counter(),
                     _ => 0,
                 }
             }
