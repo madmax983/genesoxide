@@ -7,6 +7,8 @@
 //! genesoxide info sonic.bin
 //! ```
 
+mod audio;
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -82,11 +84,17 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &PathBuf) -> Result<()> {
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    let audio = audio::AudioOutput::open();
+    if audio.is_none() {
+        eprintln!("Warning: no audio output device available");
+    }
+
     let mut app = App {
         core,
         scale,
         window: None,
         pixels: None,
+        audio,
         last_frame_time: None,
         frame_duration: Duration::from_nanos(FRAME_PERIOD_NS),
     };
@@ -100,6 +108,7 @@ struct App {
     scale: u32,
     window: Option<Window>,
     pixels: Option<Pixels<'static>>,
+    audio: Option<audio::AudioOutput>,
     last_frame_time: Option<Instant>,
     frame_duration: Duration,
 }
@@ -183,6 +192,13 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 // Step one frame
                 self.core.execute(Command::StepFrame);
+
+                // Push audio samples to output
+                if let Some(audio) = &mut self.audio {
+                    let samples = self.core.audio_samples();
+                    audio.push_samples(samples);
+                    self.core.clear_audio_buffer();
+                }
 
                 // Copy framebuffer to pixel surface
                 if let Some(pixels) = &mut self.pixels {
