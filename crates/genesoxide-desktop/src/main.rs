@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use genesoxide_config::GenesisConfig;
-use genesoxide_core::{Command, FRAME_HEIGHT, FRAME_WIDTH, GenesisCore};
+use genesoxide_core::{Command, FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_WIDTH, GenesisCore};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -88,7 +88,7 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &PathBuf) -> Result<()> {
         window: None,
         pixels: None,
         last_frame_time: None,
-        frame_duration: Duration::from_nanos(16_686_116), // 1 / 59.92 Hz
+        frame_duration: Duration::from_nanos(FRAME_PERIOD_NS),
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
