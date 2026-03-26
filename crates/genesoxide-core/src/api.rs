@@ -11,6 +11,7 @@ use crate::io::ControllerPort;
 use crate::rom::{self, RomHeader};
 use crate::scheduler::Scheduler;
 use crate::vdp::Vdp;
+use crate::z80;
 
 /// Genesis visible frame width in pixels (H40 mode).
 pub const FRAME_WIDTH: usize = 320;
@@ -96,6 +97,16 @@ pub struct GenesisCore {
     rom_header: Option<RomHeader>,
     /// 64KB work RAM.
     work_ram: Box<[u8; 0x10000]>,
+    /// Z80 CPU.
+    z80: z80::Z80,
+    /// 8KB Z80 RAM.
+    z80_ram: Box<[u8; 0x2000]>,
+    /// 68K ROM bank register (9 bits, shifted left 15).
+    z80_bank: u32,
+    /// 68K has requested Z80 bus.
+    z80_bus_requested: bool,
+    /// Z80 in reset state.
+    z80_reset: bool,
     /// Frame counter.
     frame_count: u64,
     /// Emulation speed in permille.
@@ -117,6 +128,11 @@ impl GenesisCore {
             rom: Vec::new(),
             rom_header: None,
             work_ram: Box::new([0; 0x10000]),
+            z80: z80::Z80::new(),
+            z80_ram: Box::new([0; 0x2000]),
+            z80_bank: 0,
+            z80_bus_requested: false,
+            z80_reset: true, // Z80 starts in reset
             frame_count: 0,
             speed_permille: 1000,
             paused: false,
@@ -189,6 +205,12 @@ impl GenesisCore {
         self.vdp.snapshot()
     }
 
+    /// Returns a Z80 snapshot for save states and debugging.
+    #[must_use]
+    pub fn z80_snapshot(&self) -> z80::Z80Snapshot {
+        self.z80.snapshot()
+    }
+
     // --- Internal ---
 
     fn controller_port_mut(&mut self, port: u8) -> &mut ControllerPort {
@@ -210,6 +232,11 @@ impl GenesisCore {
         self.vdp = Vdp::new();
         self.scheduler = Scheduler::new();
         self.work_ram.fill(0);
+        self.z80 = z80::Z80::new();
+        self.z80_ram.fill(0);
+        self.z80_bank = 0;
+        self.z80_bus_requested = false;
+        self.z80_reset = true;
         self.frame_count = 0;
 
         // 68000 boot: read SSP from 0x000000, PC from 0x000004
@@ -706,5 +733,15 @@ mod tests {
         // Z80 bus request: bit 0 = 0 means bus granted to 68K
         let val = core.read_byte(0xA11100);
         assert_eq!(val & 0x01, 0x00, "bit 0 should be 0 (bus granted)");
+    }
+
+    #[test]
+    fn power_cycle_resets_z80() {
+        let mut core = GenesisCore::new();
+        core.z80.pc = 0x1234;
+        core.z80_ram[0] = 0xFF;
+        core.execute(Command::PowerCycle);
+        assert_eq!(core.z80.pc, 0);
+        assert_eq!(core.z80_ram[0], 0);
     }
 }
