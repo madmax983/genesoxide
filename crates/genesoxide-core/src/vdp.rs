@@ -328,6 +328,27 @@ impl Vdp {
         status
     }
 
+    /// Returns the current HV counter value.
+    /// High byte = V counter (scanline number).
+    /// Low byte = H counter (horizontal position, approximated).
+    #[must_use]
+    pub fn read_hv_counter(&self) -> u16 {
+        // V counter for NTSC: 0x00-0xEA for lines 0-234, then jumps to 0xE5-0xFF
+        let v = if self.scanline <= 0xEA {
+            self.scanline as u8
+        } else {
+            // NTSC V counter wraps: after 0xEA it jumps to 0xE5
+            (self.scanline.wrapping_sub(6)) as u8
+        };
+
+        // H counter: approximate based on hblank state
+        // During H-blank (start of scanline processing), counter is near end of line
+        // During active display, it's early/mid line
+        let h: u8 = if self.in_hblank { 0xE4 } else { 0x08 };
+
+        (u16::from(v) << 8) | u16::from(h)
+    }
+
     /// Converts a 9-bit Genesis color (0BBB0GGG0RRR) to RGBA.
     #[must_use]
     fn color_to_rgba(color: u16) -> [u8; 4] {
@@ -1719,5 +1740,24 @@ mod tests {
         vdp.begin_scanline(0);
         vdp.begin_scanline(1); // would fire if enabled
         assert!(!vdp.h_interrupt_pending());
+    }
+
+    // ---- HV counter tests ----
+
+    #[test]
+    fn hv_counter_reflects_scanline() {
+        let mut vdp = Vdp::new();
+        vdp.begin_scanline(42);
+        let hv = vdp.read_hv_counter();
+        assert_eq!((hv >> 8) as u8, 42, "V counter should be scanline number");
+    }
+
+    #[test]
+    fn hv_counter_v_wrap_ntsc() {
+        let mut vdp = Vdp::new();
+        // Scanline 0xEB (235) should wrap: 235 - 6 = 229 = 0xE5
+        vdp.scanline = 0xEB;
+        let hv = vdp.read_hv_counter();
+        assert_eq!((hv >> 8) as u8, 0xE5);
     }
 }
