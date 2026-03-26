@@ -7,6 +7,7 @@
 //! Each test case specifies initial CPU state + RAM, and the expected
 //! final state after executing one instruction.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use genesoxide_core::z80::{Z80, execute::Bus, execute_instruction};
@@ -63,6 +64,11 @@ pub struct TestState {
     pub ram: Vec<[u16; 2]>,
 }
 
+/// A port I/O entry from the jsmoo test vector: [address, value, direction].
+/// Direction is "r" for read, "w" for write.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortEntry(pub u16, pub u8, pub String);
+
 /// A single test case from the jsmoo Z80 test suite.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TestCase {
@@ -76,6 +82,9 @@ pub struct TestCase {
     /// Bus cycle log (not used for state comparison).
     #[serde(default)]
     pub cycles: Vec<serde_json::Value>,
+    /// Port I/O entries — reads provide data, writes are verified.
+    #[serde(default)]
+    pub ports: Vec<PortEntry>,
 }
 
 /// Result of running one test case.
@@ -95,17 +104,24 @@ pub struct Mismatch {
 
 // ── Test bus ────────────────────────────────────────────────────────────
 
-/// A flat 64KB memory space + 256 I/O ports for running isolated Z80 tests.
+/// A flat 64KB memory space with port I/O support for running isolated Z80 tests.
+///
+/// Port reads return pre-loaded values by 16-bit address.
+/// Port writes are recorded for later comparison.
 pub struct TestBus {
     mem: [u8; 65536],
-    ports: [u8; 256],
+    /// Pre-loaded port read values, keyed by 16-bit port address.
+    port_reads: HashMap<u16, u8>,
+    /// Recorded port writes as (address, value) pairs.
+    port_writes: Vec<(u16, u8)>,
 }
 
 impl TestBus {
     pub fn new() -> Self {
         Self {
             mem: [0u8; 65536],
-            ports: [0u8; 256],
+            port_reads: HashMap::new(),
+            port_writes: Vec::new(),
         }
     }
 
@@ -118,9 +134,23 @@ impl TestBus {
         }
     }
 
+    /// Pre-loads port read values from test vector port entries.
+    pub fn load_ports(&mut self, ports: &[PortEntry]) {
+        for entry in ports {
+            if entry.2 == "r" {
+                self.port_reads.insert(entry.0, entry.1);
+            }
+        }
+    }
+
     /// Reads a byte from memory (for comparison).
     pub fn peek(&self, addr: u16) -> u8 {
         self.mem[addr as usize]
+    }
+
+    /// Returns recorded port writes for comparison.
+    pub fn port_writes(&self) -> &[(u16, u8)] {
+        &self.port_writes
     }
 }
 
@@ -134,11 +164,11 @@ impl Bus for TestBus {
     }
 
     fn read_port(&mut self, port: u16) -> u8 {
-        self.ports[(port & 0xFF) as usize]
+        self.port_reads.get(&port).copied().unwrap_or(0xFF)
     }
 
     fn write_port(&mut self, port: u16, val: u8) {
-        self.ports[(port & 0xFF) as usize] = val;
+        self.port_writes.push((port, val));
     }
 }
 
@@ -184,7 +214,12 @@ pub fn load_cpu_state(cpu: &mut Z80, state: &TestState) {
 // ── State comparison ───────────────────────────────────────────────────
 
 /// Compares actual Z80 state against expected, returning any mismatches.
-pub fn compare_state(cpu: &Z80, bus: &TestBus, expected: &TestState) -> Vec<Mismatch> {
+pub fn compare_state(
+    cpu: &Z80,
+    bus: &TestBus,
+    expected: &TestState,
+    expected_ports: &[PortEntry],
+) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
 
     macro_rules! check_u8 {
@@ -290,6 +325,28 @@ pub fn compare_state(cpu: &Z80, bus: &TestBus, expected: &TestState) -> Vec<Mism
         }
     }
 
+    // Port writes — check expected write operations match.
+    let expected_writes: Vec<_> = expected_ports.iter().filter(|e| e.2 == "w").collect();
+    let actual_writes = bus.port_writes();
+
+    for (i, exp) in expected_writes.iter().enumerate() {
+        if let Some(actual) = actual_writes.get(i) {
+            if exp.0 != actual.0 || exp.1 != actual.1 {
+                mismatches.push(Mismatch {
+                    field: format!("PORT_WRITE[{i}]"),
+                    expected: format!("({:#06X}, {:#04X})", exp.0, exp.1),
+                    actual: format!("({:#06X}, {:#04X})", actual.0, actual.1),
+                });
+            }
+        } else {
+            mismatches.push(Mismatch {
+                field: format!("PORT_WRITE[{i}]"),
+                expected: format!("({:#06X}, {:#04X})", exp.0, exp.1),
+                actual: "MISSING".into(),
+            });
+        }
+    }
+
     mismatches
 }
 
@@ -313,12 +370,13 @@ pub fn run_test(test: &TestCase) -> Option<TestFailure> {
     // Load initial state
     load_cpu_state(&mut cpu, &test.initial);
     bus.load_ram(&test.initial.ram);
+    bus.load_ports(&test.ports);
 
     // Execute one instruction
     let _cycles = execute_instruction(&mut cpu, &mut bus);
 
     // Compare against expected
-    let mismatches = compare_state(&cpu, &bus, &test.expected);
+    let mismatches = compare_state(&cpu, &bus, &test.expected, &test.ports);
 
     if mismatches.is_empty() {
         None

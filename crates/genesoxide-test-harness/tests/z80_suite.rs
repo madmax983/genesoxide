@@ -57,6 +57,128 @@ fn nop() {
     run_opcode_tests("00.json");
 }
 
+// ── 16-bit loads ──────────────────────────────────────────────────────
+
+#[test]
+fn ld_bc_nn() {
+    run_opcode_tests("01.json");
+}
+
+// ── 8-bit immediate loads ─────────────────────────────────────────────
+
+#[test]
+fn ld_b_n() {
+    run_opcode_tests("06.json");
+}
+
+#[test]
+fn ld_a_n() {
+    run_opcode_tests("3e.json");
+}
+
+// ── ADD HL,rr ─────────────────────────────────────────────────────────
+
+#[test]
+fn add_hl_bc() {
+    run_opcode_tests("09.json");
+}
+
+// ── 8-bit register loads ──────────────────────────────────────────────
+
+#[test]
+fn ld_b_c() {
+    run_opcode_tests("41.json");
+}
+
+// ── HALT ──────────────────────────────────────────────────────────────
+
+#[test]
+fn halt() {
+    run_opcode_tests("76.json");
+}
+
+// ── ALU operations ────────────────────────────────────────────────────
+
+#[test]
+fn add_a_b() {
+    run_opcode_tests("80.json");
+}
+
+#[test]
+fn sub_b() {
+    run_opcode_tests("90.json");
+}
+
+#[test]
+fn and_b() {
+    run_opcode_tests("a0.json");
+}
+
+#[test]
+fn xor_b() {
+    run_opcode_tests("a8.json");
+}
+
+#[test]
+fn or_b() {
+    run_opcode_tests("b0.json");
+}
+
+#[test]
+fn cp_b() {
+    run_opcode_tests("b8.json");
+}
+
+// ── Jumps ─────────────────────────────────────────────────────────────
+
+#[test]
+fn jp_nn() {
+    run_opcode_tests("c3.json");
+}
+
+#[test]
+fn jr_e() {
+    run_opcode_tests("18.json");
+}
+
+// ── DJNZ ──────────────────────────────────────────────────────────────
+
+#[test]
+fn djnz() {
+    run_opcode_tests("10.json");
+}
+
+// ── Calls & Returns ───────────────────────────────────────────────────
+
+#[test]
+fn call_nn() {
+    run_opcode_tests("cd.json");
+}
+
+#[test]
+fn ret() {
+    run_opcode_tests("c9.json");
+}
+
+// ── Stack ─────────────────────────────────────────────────────────────
+
+#[test]
+fn push_bc() {
+    run_opcode_tests("c5.json");
+}
+
+#[test]
+fn pop_bc() {
+    run_opcode_tests("c1.json");
+}
+
+// ── DAA ───────────────────────────────────────────────────────────────
+
+#[test]
+fn daa() {
+    run_opcode_tests("27.json");
+}
+
 // ── Full suite runner ───────────────────────────────────────────────────
 
 /// Runs every .json file in the test directory and reports a summary.
@@ -66,18 +188,17 @@ fn nop() {
 fn full_suite() {
     let dir = test_data_dir();
     if !dir.exists() {
-        eprintln!("Skipping Z80 full suite: directory not found at {}", dir.display());
+        eprintln!(
+            "Skipping Z80 full suite: directory not found at {}",
+            dir.display()
+        );
         return;
     }
 
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("Cannot read {}: {e}", dir.display()))
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -121,5 +242,8 @@ fn full_suite() {
     }
     eprintln!("════════════════════════════════════════════");
 
-    assert_eq!(total_failed, 0, "{total_failed} tests failed across the full suite");
+    assert_eq!(
+        total_failed, 0,
+        "{total_failed} tests failed across the full suite"
+    );
 }
