@@ -285,6 +285,21 @@ impl GenesisCore {
             // Run CPU for this scanline
             self.step_scanline();
 
+            // Check for H-interrupt (level 4)
+            if self.vdp.h_interrupt_pending() {
+                self.vdp.clear_h_interrupt();
+                let mut bus = CoreBus {
+                    rom: &self.rom,
+                    work_ram: &mut self.work_ram,
+                    vdp: &mut self.vdp,
+                    port1: &mut self.port1,
+                    port2: &mut self.port2,
+                };
+                let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 4);
+                self.cpu.cycles += u64::from(cycles);
+                self.scheduler.advance_cpu(u64::from(cycles));
+            }
+
             // Render visible scanlines
             if scanline < ACTIVE_SCANLINES {
                 self.vdp.render_scanline(scanline);
