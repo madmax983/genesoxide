@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 genesoxide-core = { path = "../genesoxide-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 proptest = "1"

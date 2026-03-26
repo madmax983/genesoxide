@@ -629,6 +629,8 @@ version = "0.1.0"
 dependencies = [
  "genesoxide-core",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
