@@ -687,7 +687,7 @@ impl Vdp {
     /// For each of the visible pixels:
     /// 1. Fill with background color
     /// 2. Render Scroll B plane (lowest priority)
-    /// 3. Render Scroll A plane
+    /// 3. Render Scroll A / Window plane (window replaces Scroll A in active region)
     /// 4. Render sprites
     /// 5. Handle priority: high-priority tiles/sprites draw over low-priority
     pub fn render_scanline(&mut self, line: u16) {
@@ -755,6 +755,8 @@ impl Vdp {
         let (win_left, win_right) = self.window_h_range(width);
         let (win_top, win_bottom) = self.window_v_range();
         let window_active_on_line = line >= win_top && line < win_bottom;
+        let nt_win = self.window_nametable_addr();
+        let win_nt_width = self.window_nametable_width();
 
         for x in 0..width {
             let xi = x as usize;
@@ -762,8 +764,6 @@ impl Vdp {
 
             if in_window {
                 // Window plane: does NOT scroll, coordinates are screen-relative
-                let nt_win = self.window_nametable_addr();
-                let win_nt_width = self.window_nametable_width();
 
                 let tile_col = x / 8;
                 let tile_row = line / 8;
