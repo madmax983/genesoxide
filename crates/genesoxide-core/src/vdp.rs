@@ -895,6 +895,10 @@ impl Vdp {
     ) {
         let sat_base = self.sprite_table_addr();
         let mut sprites_on_line: usize = 0;
+        // Track which pixels already have a sprite — earlier sprites in the
+        // link list have higher visual priority and should not be overwritten
+        // by later sprites at the same priority level.
+        let mut pixel_has_sprite = [false; 320];
 
         // Walk the sprite link list
         let mut sprite_index: u8 = 0;
@@ -970,11 +974,19 @@ impl Vdp {
                         let xi = screen_x as usize;
                         let pri_level = if priority { 2 } else { 1 };
 
-                        // Sprites with higher priority level overwrite.
-                        // Among same priority, earlier sprites in link list win (already drawn).
-                        if pri_level >= pixel_priority[xi] {
+                        // Sprite compositing rules:
+                        // - Sprites overwrite plane pixels at same or higher priority (>=)
+                        // - Earlier sprites in link list win over later sprites at
+                        //   same priority (only strictly higher priority can overwrite)
+                        let can_draw = if pixel_has_sprite[xi] {
+                            pri_level > pixel_priority[xi]
+                        } else {
+                            pri_level >= pixel_priority[xi]
+                        };
+                        if can_draw {
                             pixel_color[xi] = self.resolve_color(palette, color_index);
                             pixel_priority[xi] = pri_level;
+                            pixel_has_sprite[xi] = true;
                         }
                     }
                 }
