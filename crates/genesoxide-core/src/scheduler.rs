@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 pub const MASTER_PER_CPU: u64 = 7;
 /// Master clock ticks per VDP cycle.
 pub const MASTER_PER_VDP: u64 = 4;
+/// Master clock ticks per Z80 cycle.
+pub const MASTER_PER_Z80: u64 = 15;
 
 /// Serializable scheduler snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

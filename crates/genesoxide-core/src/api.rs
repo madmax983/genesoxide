@@ -8,9 +8,11 @@ use crate::bus;
 use crate::cpu::execute::Bus;
 use crate::cpu::{self, Cpu};
 use crate::io::ControllerPort;
+use crate::psg;
 use crate::rom::{self, RomHeader};
 use crate::scheduler::Scheduler;
 use crate::vdp::Vdp;
+use crate::ym2612;
 use crate::z80;
 
 /// Genesis visible frame width in pixels (H40 mode).
@@ -107,6 +109,14 @@ pub struct GenesisCore {
     z80_bus_requested: bool,
     /// Z80 in reset state.
     z80_reset: bool,
+    /// SN76489 PSG sound chip.
+    psg: psg::Psg,
+    /// YM2612 FM synthesis chip.
+    ym2612: ym2612::Ym2612,
+    /// Accumulated audio samples for the current frame (stereo interleaved f32).
+    audio_buffer: Vec<f32>,
+    /// Fractional audio sample accumulator for sub-scanline sample timing.
+    audio_sample_phase: f64,
     /// Frame counter.
     frame_count: u64,
     /// Emulation speed in permille.
@@ -133,6 +143,10 @@ impl GenesisCore {
             z80_bank: 0,
             z80_bus_requested: false,
             z80_reset: true, // Z80 starts in reset
+            psg: psg::Psg::new(),
+            ym2612: ym2612::Ym2612::new(),
+            audio_buffer: Vec::with_capacity(1600),
+            audio_sample_phase: 0.0,
             frame_count: 0,
             speed_permille: 1000,
             paused: false,
@@ -237,6 +251,10 @@ impl GenesisCore {
         self.z80_bank = 0;
         self.z80_bus_requested = false;
         self.z80_reset = true;
+        self.psg = psg::Psg::new();
+        self.ym2612 = ym2612::Ym2612::new();
+        self.audio_buffer.clear();
+        self.audio_sample_phase = 0.0;
         self.frame_count = 0;
 
         // 68000 boot: read SSP from 0x000000, PC from 0x000004
@@ -273,6 +291,11 @@ impl GenesisCore {
             vdp: &mut self.vdp,
             port1: &mut self.port1,
             port2: &mut self.port2,
+            z80_ram: &mut self.z80_ram,
+            z80_bus_requested: &mut self.z80_bus_requested,
+            z80_reset: &mut self.z80_reset,
+            ym2612: &mut self.ym2612,
+            psg: &mut self.psg,
         };
 
         let cycles = cpu::execute_instruction(&mut self.cpu, opcode, &mut bus);
@@ -302,6 +325,9 @@ impl GenesisCore {
             return;
         }
 
+        // Clear audio buffer at frame start
+        self.audio_buffer.clear();
+
         // Clear V-blank at frame start
         self.vdp.set_vblank(false);
 
@@ -312,6 +338,11 @@ impl GenesisCore {
             // Run CPU for this scanline
             self.step_scanline();
 
+            // Step Z80 for this scanline (if bus not held by 68K and not in reset)
+            if !self.z80_bus_requested && !self.z80_reset {
+                self.step_z80_scanline();
+            }
+
             // Check for H-interrupt (level 4)
             if self.vdp.h_interrupt_pending() {
                 self.vdp.clear_h_interrupt();
@@ -321,6 +352,11 @@ impl GenesisCore {
                     vdp: &mut self.vdp,
                     port1: &mut self.port1,
                     port2: &mut self.port2,
+                    z80_ram: &mut self.z80_ram,
+                    z80_bus_requested: &mut self.z80_bus_requested,
+                    z80_reset: &mut self.z80_reset,
+                    ym2612: &mut self.ym2612,
+                    psg: &mut self.psg,
                 };
                 let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 4);
                 self.cpu.cycles += u64::from(cycles);
@@ -345,18 +381,89 @@ impl GenesisCore {
                         vdp: &mut self.vdp,
                         port1: &mut self.port1,
                         port2: &mut self.port2,
+                        z80_ram: &mut self.z80_ram,
+                        z80_bus_requested: &mut self.z80_bus_requested,
+                        z80_reset: &mut self.z80_reset,
+                        ym2612: &mut self.ym2612,
+                        psg: &mut self.psg,
                     };
                     let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
                     self.cpu.cycles += u64::from(cycles);
                     self.scheduler.advance_cpu(u64::from(cycles));
                 }
             }
+
+            // Collect audio samples for this scanline
+            self.collect_audio_samples();
         }
 
         self.vdp.end_frame();
         self.port1.reset_th_counter();
         self.port2.reset_th_counter();
         self.frame_count += 1;
+    }
+
+    /// Returns the current frame's audio samples (stereo interleaved f32).
+    #[must_use]
+    pub fn audio_samples(&self) -> &[f32] {
+        &self.audio_buffer
+    }
+
+    /// Clears the audio buffer (call after pushing to ring buffer).
+    pub fn clear_audio_buffer(&mut self) {
+        self.audio_buffer.clear();
+    }
+
+    /// Steps the Z80 for one scanline (~228 T-states).
+    fn step_z80_scanline(&mut self) {
+        // Z80 @ master/15 = ~3.58 MHz. Per scanline = 3416 master clocks / 15 ~ 228 T-states
+        let target = self.z80.cycles + 228;
+        while self.z80.cycles < target {
+            if self.z80.halted {
+                self.z80.cycles = target;
+                break;
+            }
+            let mut bus = Z80Bus {
+                z80_ram: &mut self.z80_ram,
+                rom: &self.rom,
+                z80_bank: &mut self.z80_bank,
+                ym2612: &mut self.ym2612,
+                psg: &mut self.psg,
+            };
+            let cycles = z80::execute_instruction(&mut self.z80, &mut bus);
+            self.z80.cycles += u64::from(cycles);
+        }
+    }
+
+    /// Collects audio samples for one scanline.
+    ///
+    /// Called at the end of each scanline in `step_frame`. Generates
+    /// approximately 2.81 stereo sample pairs per scanline, yielding
+    /// ~736 pairs per frame at 44100 Hz.
+    fn collect_audio_samples(&mut self) {
+        // 44100 Hz / (262 lines * 59.92 fps) ~ 2.81 samples per scanline
+        self.audio_sample_phase += 44100.0 / (262.0 * 59.92);
+
+        while self.audio_sample_phase >= 1.0 {
+            self.audio_sample_phase -= 1.0;
+
+            // Clock PSG (~76 ticks per output sample at 44.1kHz from 3.35MHz)
+            for _ in 0..76 {
+                self.psg.clock_tick();
+            }
+
+            // Get YM2612 output (also advances timers internally)
+            let (ym_l, ym_r) = self.ym2612.output_sample();
+
+            // Get PSG output
+            let psg_out = self.psg.sample();
+
+            // Mix: YM2612 stereo + PSG mono (into both channels)
+            let left = (ym_l + psg_out * 0.5).clamp(-1.0, 1.0);
+            let right = (ym_r + psg_out * 0.5).clamp(-1.0, 1.0);
+            self.audio_buffer.push(left);
+            self.audio_buffer.push(right);
+        }
     }
 
     /// Executes a pending VDP DMA transfer by providing a bus read callback.
@@ -516,6 +623,11 @@ struct CoreBus<'a> {
     vdp: &'a mut Vdp,
     port1: &'a mut ControllerPort,
     port2: &'a mut ControllerPort,
+    z80_ram: &'a mut Box<[u8; 0x2000]>,
+    z80_bus_requested: &'a mut bool,
+    z80_reset: &'a mut bool,
+    ym2612: &'a mut ym2612::Ym2612,
+    psg: &'a mut psg::Psg,
 }
 
 impl Bus for CoreBus<'_> {
@@ -540,9 +652,26 @@ impl Bus for CoreBus<'_> {
                     _ => 0,
                 }
             }
+            bus::BusRegion::Z80Area => {
+                let z80_addr = addr & 0xFFFF;
+                match z80_addr {
+                    0x0000..=0x1FFF => self.z80_ram[z80_addr as usize],
+                    0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize],
+                    0x4000..=0x4003 => self.ym2612.read_status(),
+                    _ => 0xFF,
+                }
+            }
             bus::BusRegion::ControlRegisters => {
                 // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
-                0x00
+                let offset = addr & 0x01FF;
+                match offset {
+                    0x0000..=0x0001 => {
+                        // Return bus status: if bus was requested and Z80 is idle,
+                        // bit 0 = 0 means bus granted
+                        if *self.z80_bus_requested { 0x00 } else { 0x01 }
+                    }
+                    _ => 0x00,
+                }
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -588,9 +717,38 @@ impl Bus for CoreBus<'_> {
                 };
                 u16::from(val)
             }
+            bus::BusRegion::Z80Area => {
+                let z80_addr = addr & 0xFFFF;
+                match z80_addr {
+                    0x0000..=0x1FFF => {
+                        let offset = z80_addr as usize;
+                        let hi = u16::from(self.z80_ram[offset]);
+                        let lo = u16::from(self.z80_ram[(offset + 1) & 0x1FFF]);
+                        (hi << 8) | lo
+                    }
+                    0x2000..=0x3FFF => {
+                        let offset = (z80_addr & 0x1FFF) as usize;
+                        let hi = u16::from(self.z80_ram[offset]);
+                        let lo = u16::from(self.z80_ram[(offset + 1) & 0x1FFF]);
+                        (hi << 8) | lo
+                    }
+                    0x4000..=0x4003 => u16::from(self.ym2612.read_status()),
+                    _ => 0xFFFF,
+                }
+            }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
-                0x0000
+                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted
+                let offset = addr & 0x01FF;
+                match offset {
+                    0x0000..=0x0001 => {
+                        if *self.z80_bus_requested {
+                            0x0000
+                        } else {
+                            0x0100
+                        }
+                    }
+                    _ => 0x0000,
+                }
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
@@ -621,8 +779,40 @@ impl Bus for CoreBus<'_> {
                     _ => {}
                 }
             }
+            bus::BusRegion::Z80Area => {
+                let z80_addr = addr & 0xFFFF;
+                match z80_addr {
+                    0x0000..=0x1FFF => self.z80_ram[z80_addr as usize] = val,
+                    0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize] = val,
+                    0x4000 => self.ym2612.write_address(0, val),
+                    0x4001 => self.ym2612.write_data(0, val),
+                    0x4002 => self.ym2612.write_address(1, val),
+                    0x4003 => self.ym2612.write_data(1, val),
+                    _ => {}
+                }
+            }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request/reset — absorbed (Z80 not emulated)
+                let offset = addr & 0x01FF;
+                match offset {
+                    0x0000..=0x0001 => {
+                        // Z80 bus request: bit 0 of written value
+                        *self.z80_bus_requested = val & 0x01 != 0;
+                    }
+                    0x0100..=0x0101 => {
+                        // Z80 reset: bit 0 = 0 means assert reset
+                        *self.z80_reset = val & 0x01 == 0;
+                    }
+                    _ => {}
+                }
+            }
+            bus::BusRegion::Vdp => {
+                let vdp_addr = addr & 0x1F;
+                match vdp_addr {
+                    0x11 | 0x13 | 0x15 | 0x17 => {
+                        self.psg.write(val);
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -640,6 +830,10 @@ impl Bus for CoreBus<'_> {
                 match vdp_addr {
                     0x00 | 0x02 => self.vdp.write_data(val),
                     0x04 | 0x06 => self.vdp.write_control(val),
+                    0x10 | 0x12 | 0x14 | 0x16 => {
+                        // PSG port (write low byte)
+                        self.psg.write(val as u8);
+                    }
                     _ => {}
                 }
             }
@@ -654,12 +848,100 @@ impl Bus for CoreBus<'_> {
                     _ => {}
                 }
             }
+            bus::BusRegion::Z80Area => {
+                let z80_addr = addr & 0xFFFF;
+                let hi = (val >> 8) as u8;
+                let lo = val as u8;
+                match z80_addr {
+                    0x0000..=0x1FFF => {
+                        self.z80_ram[z80_addr as usize] = hi;
+                        self.z80_ram[((z80_addr + 1) & 0x1FFF) as usize] = lo;
+                    }
+                    0x2000..=0x3FFF => {
+                        let off = (z80_addr & 0x1FFF) as usize;
+                        self.z80_ram[off] = hi;
+                        self.z80_ram[(off + 1) & 0x1FFF] = lo;
+                    }
+                    0x4000 => {
+                        self.ym2612.write_address(0, hi);
+                        self.ym2612.write_data(0, lo);
+                    }
+                    0x4002 => {
+                        self.ym2612.write_address(1, hi);
+                        self.ym2612.write_data(1, lo);
+                    }
+                    _ => {}
+                }
+            }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request/reset — absorbed (Z80 not emulated)
+                let offset = addr & 0x01FF;
+                match offset {
+                    0x0000..=0x0001 => {
+                        // Z80 bus request: bit 8 of word (high byte bit 0)
+                        *self.z80_bus_requested = (val >> 8) & 0x01 != 0;
+                    }
+                    0x0100..=0x0101 => {
+                        // Z80 reset: bit 8 = 0 means assert reset
+                        *self.z80_reset = (val >> 8) & 0x01 == 0;
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
     }
+}
+
+/// Bus wrapper for Z80 access to the Genesis sound subsystem.
+///
+/// Used in [`GenesisCore::step_z80_scanline`] to give the Z80 access
+/// to its RAM, banked 68K ROM, YM2612, and PSG.
+struct Z80Bus<'a> {
+    z80_ram: &'a mut Box<[u8; 0x2000]>,
+    rom: &'a [u8],
+    z80_bank: &'a mut u32,
+    ym2612: &'a mut ym2612::Ym2612,
+    psg: &'a mut psg::Psg,
+}
+
+impl z80::execute::Bus for Z80Bus<'_> {
+    fn read_byte(&mut self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x1FFF => self.z80_ram[addr as usize],
+            0x2000..=0x3FFF => self.z80_ram[(addr & 0x1FFF) as usize],
+            0x4000..=0x4003 => self.ym2612.read_status(),
+            0x8000..=0xFFFF => {
+                // Banked 68K ROM window
+                let offset = *self.z80_bank + u32::from(addr & 0x7FFF);
+                self.rom.get(offset as usize).copied().unwrap_or(0)
+            }
+            _ => 0xFF,
+        }
+    }
+
+    fn write_byte(&mut self, addr: u16, val: u8) {
+        match addr {
+            0x0000..=0x1FFF => self.z80_ram[addr as usize] = val,
+            0x2000..=0x3FFF => self.z80_ram[(addr & 0x1FFF) as usize] = val,
+            0x4000 => self.ym2612.write_address(0, val),
+            0x4001 => self.ym2612.write_data(0, val),
+            0x4002 => self.ym2612.write_address(1, val),
+            0x4003 => self.ym2612.write_data(1, val),
+            0x6000..=0x60FF => {
+                // Bank register: shift in one bit at a time (bit 0 of val),
+                // 9 bits forming bits 15-23 of the ROM address.
+                *self.z80_bank = ((*self.z80_bank >> 1) | ((u32::from(val) & 1) << 23)) & 0xFF8000;
+            }
+            0x7F00..=0x7FFF => self.psg.write(val),
+            _ => {}
+        }
+    }
+
+    fn read_port(&mut self, _port: u16) -> u8 {
+        0xFF
+    }
+
+    fn write_port(&mut self, _port: u16, _val: u8) {}
 }
 
 impl Default for GenesisCore {
