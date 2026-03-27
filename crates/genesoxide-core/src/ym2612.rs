@@ -10,38 +10,20 @@
 //! control channels 1-3 and 4-6 respectively.
 
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
 // ── Lookup Tables ────────────────────────────────────────────────────────
 
 /// Quarter-wave log-sin table. Maps a 10-bit phase index to a 12-bit
 /// logarithmic magnitude: `sin_table[i] = -log2(sin(i * pi / 1024)) * 256`.
 /// The full sine wave is reconstructed via symmetry in the synthesis loop.
-static SIN_TABLE: LazyLock<[u16; 1024]> = LazyLock::new(|| {
-    let mut table = [0u16; 1024];
-    for (i, entry) in table.iter_mut().enumerate() {
-        let phase = (i as f64 + 0.5) * std::f64::consts::PI / 1024.0;
-        let sin_val = phase.sin();
-        if sin_val > 0.0 {
-            let log_sin = -sin_val.log2() * 256.0;
-            *entry = (log_sin.round() as u16).min(0xFFF);
-        } else {
-            *entry = 0xFFF;
-        }
-    }
-    table
-});
+///
+/// Pre-computed at build time and included as a static array to avoid
+/// `LazyLock` overhead in the hot synthesis loop.
+static SIN_TABLE: [u16; 1024] = include!("ym2612_sin_table.inc");
 
 /// Exponential table. Maps an 8-bit mantissa to a linear power-of-2 value:
 /// `exp_table[i] = 2^(1 - i/256) * 1024`.
-static EXP_TABLE: LazyLock<[u16; 256]> = LazyLock::new(|| {
-    let mut table = [0u16; 256];
-    for (i, entry) in table.iter_mut().enumerate() {
-        let val = 2.0_f64.powf(1.0 - (i as f64) / 256.0) * 1024.0;
-        *entry = (val.round() as u16) & 0x7FF;
-    }
-    table
-});
+static EXP_TABLE: [u16; 256] = include!("ym2612_exp_table.inc");
 
 /// Frequency multiplier table. MUL=0 means 0.5x (halved frequency).
 /// Values are doubled so we can use integer arithmetic and divide by 2.
