@@ -959,7 +959,7 @@ fn exec_adda(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
     let dst = cpu.read_a(reg);
     cpu.write_a(reg, dst.wrapping_add(src));
     // ADDA does not affect flags
-    if size == InstructionSize::Long { 8 } else { 8 }
+    8
 }
 
 fn exec_addi(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bus) -> u32 {
@@ -1921,7 +1921,7 @@ fn exec_shift_mem(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             cpu.sr.set_flag(StatusRegister::X, carry);
             cpu.sr.set_flag(StatusRegister::V, false);
         }
-        3 | _ => {
+        _ => {
             // ROd
             if direction == 1 {
                 carry = result & msb != 0;

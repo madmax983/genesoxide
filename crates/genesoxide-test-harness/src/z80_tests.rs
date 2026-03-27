@@ -116,6 +116,12 @@ pub struct TestBus {
     port_writes: Vec<(u16, u8)>,
 }
 
+impl Default for TestBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestBus {
     pub fn new() -> Self {
         Self {

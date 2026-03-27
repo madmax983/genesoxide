@@ -308,8 +308,7 @@ mod tests {
         // Collect LFSR state snapshots after falling edges.
         // We need to clock until counter expires and we get a falling edge.
         // Rate 0 -> period 0x10 = 16 ticks per half-cycle.
-        let mut lfsr_states: Vec<u16> = Vec::new();
-        lfsr_states.push(psg.noise_shift);
+        let mut lfsr_states: Vec<u16> = vec![psg.noise_shift];
 
         // Clock enough to capture several LFSR shifts.
         // Each shift happens on a falling edge (polarity: true -> false),

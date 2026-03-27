@@ -336,6 +336,10 @@ impl Vdp {
         if self.in_hblank {
             status |= 0x0004;
         }
+        // Bit 1: DMA busy
+        if self.dma_pending {
+            status |= 0x0002;
+        }
         status
     }
 
@@ -1179,7 +1183,7 @@ mod tests {
         assert_eq!(vdp.framebuffer[3], 0xFF); // A
 
         // Check another pixel mid-screen
-        let offset = (0 * 320 + 160) * 4;
+        let offset = 160 * 4;
         assert_eq!(vdp.framebuffer[offset], expected[0]);
         assert_eq!(vdp.framebuffer[offset + 1], expected[1]);
     }
@@ -1236,12 +1240,8 @@ mod tests {
         // Tile 1: left half red, right half blue
         let mut pattern = [[0u8; 8]; 8];
         for row in &mut pattern {
-            for col in 0..4 {
-                row[col] = 1; // red
-            }
-            for col in 4..8 {
-                row[col] = 2; // blue
-            }
+            row[..4].fill(1); // red
+            row[4..8].fill(2); // blue
         }
         write_tile_pattern(&mut vdp, 1, &pattern);
 
