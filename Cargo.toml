@@ -9,3 +9,9 @@ members = [
 
 [profile.dev.package.genesoxide-core]
 opt-level = 2
+
+# Optimize audio-critical dependencies in debug builds
+[profile.dev.package.ringbuf]
+opt-level = 2
+[profile.dev.package.cpal]
+opt-level = 2
