@@ -255,6 +255,12 @@ pub struct TestBus {
     mem: HashMap<u32, u8>,
 }
 
+impl Default for TestBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestBus {
     pub fn new() -> Self {
         Self {

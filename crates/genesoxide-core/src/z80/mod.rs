@@ -154,26 +154,12 @@ impl Z80 {
     /// Clears PC, I, R, interrupt flip-flops, and sets interrupt mode to 0.
     /// The cycle counter is preserved. General-purpose registers are technically
     /// undefined after reset on real hardware, but we zero them for determinism.
+    /// Hardware reset: only PC, I, R, IM, and interrupt flip-flops are
+    /// affected.  All data registers (A/F, BC, DE, HL, IX, IY, SP, shadows)
+    /// retain their previous values — the SMPS sound driver relies on HL
+    /// surviving reset so that `JP (HL)` at address 0 can re-enter the idle
+    /// loop.
     pub fn reset(&mut self) {
-        self.a = 0;
-        self.f = 0;
-        self.b = 0;
-        self.c = 0;
-        self.d = 0;
-        self.e = 0;
-        self.h = 0;
-        self.l = 0;
-        self.a_prime = 0;
-        self.f_prime = 0;
-        self.b_prime = 0;
-        self.c_prime = 0;
-        self.d_prime = 0;
-        self.e_prime = 0;
-        self.h_prime = 0;
-        self.l_prime = 0;
-        self.ix = 0;
-        self.iy = 0;
-        self.sp = 0;
         self.pc = 0;
         self.i = 0;
         self.r = 0;
@@ -182,7 +168,6 @@ impl Z80 {
         self.im = 0;
         self.halted = false;
         self.ei_pending = false;
-        self.wz = 0;
         // cycles intentionally preserved
     }
 

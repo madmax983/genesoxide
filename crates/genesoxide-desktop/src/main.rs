@@ -10,7 +10,7 @@
 mod audio;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_run(rom_name: &str, scale: u32, config_path: &PathBuf) -> Result<()> {
+fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
     let config = GenesisConfig::load(config_path).unwrap_or_default();
     let rom_path = config.resolve_rom(rom_name);
     let rom_data = fs::read(&rom_path)
@@ -146,7 +146,8 @@ impl ApplicationHandler for App {
         // SAFETY: pixels lifetime is tied to self.window which we keep alive
         // for the duration of the App. Window is never moved or dropped while
         // pixels exists.
-        self.pixels = Some(unsafe { std::mem::transmute(pixels) });
+        self.pixels =
+            Some(unsafe { std::mem::transmute::<pixels::Pixels<'_>, pixels::Pixels<'_>>(pixels) });
     }
 
     fn window_event(
@@ -192,7 +193,6 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Step one frame
                 self.core.execute(Command::StepFrame);
 
                 // Push audio samples to output

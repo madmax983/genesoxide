@@ -113,6 +113,10 @@ pub struct GenesisCore {
     z80_reset: bool,
     /// Set when Z80 reset transitions true→false, cleared after Z80.reset() is called.
     z80_reset_pending: bool,
+    /// True if the 68K released the Z80 bus at any point during this scanline.
+    /// Used to give the Z80 cycles even when the bus is re-requested by scanline end
+    /// (common during tight bus polling loops in the SMPS sound driver handshake).
+    z80_bus_released_this_scanline: bool,
     /// SN76489 PSG sound chip.
     psg: psg::Psg,
     /// YM2612 FM synthesis chip.
@@ -150,6 +154,7 @@ impl GenesisCore {
             z80_bus_requested: false,
             z80_reset: true, // Z80 starts in reset
             z80_reset_pending: false,
+            z80_bus_released_this_scanline: false,
             psg: psg::Psg::new(),
             ym2612: ym2612::Ym2612::new(),
             audio_buffer: Vec::with_capacity(1600),
@@ -222,6 +227,36 @@ impl GenesisCore {
         self.cpu.ssp
     }
 
+    /// Returns true if the 68K CPU is stopped (STOP instruction).
+    #[must_use]
+    pub fn cpu_stopped(&self) -> bool {
+        self.cpu.stopped
+    }
+
+    /// Returns true if the 68K CPU is halted (double bus fault).
+    #[must_use]
+    pub fn cpu_halted(&self) -> bool {
+        self.cpu.halted
+    }
+
+    /// Returns the 68K status register value (debug).
+    #[must_use]
+    pub fn cpu_sr(&self) -> u16 {
+        self.cpu.sr.0
+    }
+
+    /// Returns the 68K interrupt priority mask (0-7, from SR bits 8-10).
+    #[must_use]
+    pub fn cpu_interrupt_mask(&self) -> u8 {
+        self.cpu.sr.interrupt_mask()
+    }
+
+    /// Returns VDP register value (debug).
+    #[must_use]
+    pub fn vdp_register(&self, reg: u8) -> u8 {
+        self.vdp.read_register(reg as usize)
+    }
+
     /// Z80 debug accessors.
     #[must_use]
     pub fn z80_pc(&self) -> u16 {
@@ -252,6 +287,12 @@ impl GenesisCore {
         self.z80.snapshot()
     }
 
+    /// Returns the Z80 RAM (8KB) for debugging.
+    #[must_use]
+    pub fn z80_ram(&self) -> &[u8] {
+        &*self.z80_ram
+    }
+
     // --- Internal ---
 
     fn controller_port_mut(&mut self, port: u8) -> &mut ControllerPort {
@@ -279,6 +320,7 @@ impl GenesisCore {
         self.z80_bus_requested = false;
         self.z80_reset = true;
         self.z80_reset_pending = false;
+        self.z80_bus_released_this_scanline = false;
         self.psg = psg::Psg::new();
         self.ym2612 = ym2612::Ym2612::new();
         self.audio_buffer.clear();
@@ -323,6 +365,7 @@ impl GenesisCore {
             z80_bus_requested: &mut self.z80_bus_requested,
             z80_reset: &mut self.z80_reset,
             z80_reset_pending: &mut self.z80_reset_pending,
+            z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
             ym2612: &mut self.ym2612,
             psg: &mut self.psg,
         };
@@ -364,6 +407,9 @@ impl GenesisCore {
             // Begin scanline timing
             self.vdp.begin_scanline(scanline);
 
+            // Reset per-scanline bus tracking before the 68K runs.
+            self.z80_bus_released_this_scanline = false;
+
             // Run CPU for this scanline
             self.step_scanline();
 
@@ -373,8 +419,15 @@ impl GenesisCore {
                 self.z80_reset_pending = false;
             }
 
-            // Step Z80 for this scanline (if bus not held by 68K and not in reset)
-            if !self.z80_bus_requested && !self.z80_reset {
+            // Step Z80 for this scanline if it's not in reset and got bus access.
+            // The Z80 runs when the bus is currently free, OR when the 68K released
+            // the bus at any point during this scanline (even if re-requested by now).
+            // This handles tight bus polling loops where the 68K requests/releases
+            // the bus multiple times per scanline — the Z80 must get cycles in the
+            // brief release windows or the SMPS sound driver handshake deadlocks.
+            let z80_gets_cycles =
+                !self.z80_reset && (!self.z80_bus_requested || self.z80_bus_released_this_scanline);
+            if z80_gets_cycles {
                 self.step_z80_scanline();
             }
 
@@ -391,6 +444,7 @@ impl GenesisCore {
                     z80_bus_requested: &mut self.z80_bus_requested,
                     z80_reset: &mut self.z80_reset,
                     z80_reset_pending: &mut self.z80_reset_pending,
+                    z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                     ym2612: &mut self.ym2612,
                     psg: &mut self.psg,
                 };
@@ -421,6 +475,7 @@ impl GenesisCore {
                         z80_bus_requested: &mut self.z80_bus_requested,
                         z80_reset: &mut self.z80_reset,
                         z80_reset_pending: &mut self.z80_reset_pending,
+                        z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                         ym2612: &mut self.ym2612,
                         psg: &mut self.psg,
                     };
@@ -665,6 +720,7 @@ struct CoreBus<'a> {
     z80_bus_requested: &'a mut bool,
     z80_reset: &'a mut bool,
     z80_reset_pending: &'a mut bool,
+    z80_bus_released_this_scanline: &'a mut bool,
     ym2612: &'a mut ym2612::Ym2612,
     psg: &'a mut psg::Psg,
 }
@@ -835,7 +891,11 @@ impl Bus for CoreBus<'_> {
                 let reg = addr & 0xFFFF;
                 match reg {
                     0x1100..=0x1101 => {
-                        *self.z80_bus_requested = val & 0x01 != 0;
+                        let new_req = val & 0x01 != 0;
+                        if *self.z80_bus_requested && !new_req {
+                            *self.z80_bus_released_this_scanline = true;
+                        }
+                        *self.z80_bus_requested = new_req;
                     }
                     0x1200..=0x1201 => {
                         let new_reset = val & 0x01 == 0;
@@ -920,7 +980,11 @@ impl Bus for CoreBus<'_> {
                 let reg = addr & 0xFFFF;
                 match reg {
                     0x1100..=0x1101 => {
-                        *self.z80_bus_requested = (val >> 8) & 0x01 != 0;
+                        let new_req = (val >> 8) & 0x01 != 0;
+                        if *self.z80_bus_requested && !new_req {
+                            *self.z80_bus_released_this_scanline = true;
+                        }
+                        *self.z80_bus_requested = new_req;
                     }
                     0x1200..=0x1201 => {
                         let new_reset = (val >> 8) & 0x01 == 0;

@@ -163,6 +163,97 @@ fn sonic_produces_audio() {
     );
 }
 
+/// Diagnostic: run 600 frames and trace Z80/68K state to find hang point.
+#[test]
+fn sonic_hang_diagnostic() {
+    let rom_data = match load_sonic() {
+        Some(r) => r,
+        None => {
+            eprintln!("Sonic ROM not found, skipping");
+            return;
+        }
+    };
+
+    let mut core = GenesisCore::new();
+    core.execute(Command::LoadRom(rom_data.clone()));
+
+    let mut prev_68k_pc = 0u32;
+    let mut stuck_count = 0u32;
+
+    for frame in 0..600 {
+        let z80_cycles_before = core.z80_cycles();
+        core.execute(Command::StepFrame);
+        let z80_cycles_after = core.z80_cycles();
+        let z80_ran = z80_cycles_after - z80_cycles_before;
+
+        let pc_68k = core.cpu_pc();
+        let pc_z80 = core.z80_pc();
+        let bus_req = core.z80_bus_requested();
+        let z80_reset = core.z80_in_reset();
+        let stopped = core.cpu_stopped();
+        let halted = core.cpu_halted();
+        let ipm = core.cpu_interrupt_mask();
+        let vint_en = core.vdp_register(1) & 0x20 != 0;
+        let ram = core.z80_ram();
+        let ram_1ffd = ram[0x1FFD];
+        let ram_1fff = ram[0x1FFF];
+        let ram_0000 = ram[0x0000];
+
+        // Detect 68K stuck (but ignore checksum loop by requiring 60+ frames)
+        if pc_68k == prev_68k_pc {
+            stuck_count += 1;
+        } else {
+            if stuck_count > 5 {
+                eprintln!(
+                    "  (68K was at 0x{prev_68k_pc:06X} for {stuck_count} frames, now moved to 0x{pc_68k:06X})"
+                );
+            }
+            stuck_count = 0;
+        }
+        prev_68k_pc = pc_68k;
+
+        // Log periodically, at transitions, and near known problem area
+        let should_log = frame < 3
+            || frame % 100 == 0
+            || stuck_count == 1
+            || stuck_count == 40
+            || stopped
+            || halted
+            || (frame >= 530 && frame <= 560);
+
+        if should_log {
+            eprintln!(
+                "F{frame:3}: 68K=0x{pc_68k:06X} IPM={ipm} VINT={vint_en} stopped={stopped} Z80=0x{pc_z80:04X} z80_ran={z80_ran:5} bus_req={bus_req} reset={z80_reset} RAM[0]={ram_0000:02X} [1FFD]={ram_1ffd:02X} [1FFF]={ram_1fff:02X}"
+            );
+        }
+
+        // When stuck for exactly 100 frames, dump detailed info once
+        if stuck_count == 100 || stopped || halted {
+            eprintln!(
+                "=== 68K at 0x{pc_68k:06X} for {stuck_count} frames (stopped={stopped} halted={halted}) ==="
+            );
+            eprintln!("SR=0x{:04X} IPM={ipm} VINT={vint_en}", core.cpu_sr());
+            eprintln!(
+                "Z80 PC=0x{pc_z80:04X} cycles={z80_cycles_after} bus_req={bus_req} reset={z80_reset}"
+            );
+            eprintln!("Z80 RAM[0]={ram_0000:02X} [1FFD]={ram_1ffd:02X} [1FFF]={ram_1fff:02X}");
+
+            let addr = pc_68k as usize;
+            if addr + 16 <= rom_data.len() {
+                let bytes: Vec<String> = rom_data[addr..addr + 16]
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect();
+                eprintln!("ROM[0x{addr:06X}..]: {}", bytes.join(" "));
+            }
+
+            if stopped || halted {
+                break;
+            }
+        }
+    }
+}
+
 /// Debug: dump VDP state during zone title card to diagnose z-ordering.
 #[test]
 #[ignore]
