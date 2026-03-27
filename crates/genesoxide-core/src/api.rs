@@ -58,6 +58,8 @@ pub enum Command {
     ReleaseButton { port: u8, button: Button },
     /// Set emulation speed in permille (1000 = normal).
     SetSpeed(u16),
+    /// Set audio output sample rate in Hz (e.g. 44100, 48000).
+    SetAudioSampleRate(u32),
     /// Pause emulation.
     Pause,
     /// Resume emulation.
@@ -119,6 +121,8 @@ pub struct GenesisCore {
     audio_buffer: Vec<f32>,
     /// Fractional audio sample accumulator for sub-scanline sample timing.
     audio_sample_phase: f64,
+    /// Output audio sample rate in Hz (default 44100).
+    audio_sample_rate: f64,
     /// Frame counter.
     frame_count: u64,
     /// Emulation speed in permille.
@@ -150,6 +154,7 @@ impl GenesisCore {
             ym2612: ym2612::Ym2612::new(),
             audio_buffer: Vec::with_capacity(1600),
             audio_sample_phase: 0.0,
+            audio_sample_rate: 44100.0,
             frame_count: 0,
             speed_permille: 1000,
             paused: false,
@@ -175,6 +180,7 @@ impl GenesisCore {
                 self.controller_port_mut(port).release(button);
             }
             Command::SetSpeed(s) => self.speed_permille = s,
+            Command::SetAudioSampleRate(rate) => self.audio_sample_rate = f64::from(rate),
             Command::Pause => self.paused = true,
             Command::Resume => self.paused = false,
         }
@@ -472,14 +478,15 @@ impl GenesisCore {
     /// approximately 2.81 stereo sample pairs per scanline, yielding
     /// ~736 pairs per frame at 44100 Hz.
     fn collect_audio_samples(&mut self) {
-        // 44100 Hz / (262 lines * 59.92 fps) ~ 2.81 samples per scanline
-        self.audio_sample_phase += 44100.0 / (262.0 * 59.92);
+        // samples_per_scanline = sample_rate / (262 lines * 59.92 fps)
+        self.audio_sample_phase += self.audio_sample_rate / (262.0 * 59.92);
 
         while self.audio_sample_phase >= 1.0 {
             self.audio_sample_phase -= 1.0;
 
-            // Clock PSG (~76 ticks per output sample at 44.1kHz from 3.35MHz)
-            for _ in 0..76 {
+            // Clock PSG: 3_579_545 Hz / sample_rate ticks per output sample
+            let psg_ticks = (3_579_545.0 / self.audio_sample_rate).round() as u32;
+            for _ in 0..psg_ticks {
                 self.psg.clock_tick();
             }
 
