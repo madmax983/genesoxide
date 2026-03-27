@@ -18,6 +18,8 @@ pub struct AudioOutput {
     _stream: cpal::Stream,
     /// Producer half of the ring buffer fed to the cpal callback.
     producer: ringbuf::HeapProd<f32>,
+    /// Device sample rate in Hz.
+    sample_rate: u32,
 }
 
 impl AudioOutput {
@@ -27,37 +29,99 @@ impl AudioOutput {
     /// to start (e.g. no audio hardware).
     pub fn open() -> Option<Self> {
         let host = cpal::default_host();
-        let device = host.default_output_device()?;
+        eprintln!("Audio: using host {:?}", host.id());
+
+        let device = match host.default_output_device() {
+            Some(d) => {
+                eprintln!("Audio: default device: {:?}", d.name().unwrap_or_default());
+                d
+            }
+            None => {
+                // Try enumerating all output devices as fallback
+                eprintln!("Audio: no default output device, enumerating...");
+                match host.output_devices() {
+                    Ok(mut devices) => match devices.next() {
+                        Some(d) => {
+                            eprintln!(
+                                "Audio: using fallback device: {:?}",
+                                d.name().unwrap_or_default()
+                            );
+                            d
+                        }
+                        None => {
+                            eprintln!("Audio: no output devices found at all");
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Audio: failed to enumerate devices: {e}");
+                        return None;
+                    }
+                }
+            }
+        };
+
+        // Query device's preferred config and use its sample rate
+        let default_config = match device.default_output_config() {
+            Ok(c) => {
+                eprintln!(
+                    "Audio: device default config: {} ch, {} Hz, {:?}",
+                    c.channels(),
+                    c.sample_rate().0,
+                    c.sample_format()
+                );
+                c
+            }
+            Err(e) => {
+                eprintln!("Audio: failed to get default config: {e}");
+                return None;
+            }
+        };
 
         let config = cpal::StreamConfig {
             channels: 2,
-            sample_rate: cpal::SampleRate(44100),
+            sample_rate: default_config.sample_rate(),
             buffer_size: cpal::BufferSize::Default,
         };
+        eprintln!("Audio: opening stream at {} Hz", config.sample_rate.0);
 
         // Ring buffer: ~4 frames worth of stereo samples.
         let ring = HeapRb::<f32>::new(8192);
         let (producer, mut consumer) = ring.split();
 
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    for sample in data.iter_mut() {
-                        *sample = consumer.try_pop().unwrap_or(0.0);
-                    }
-                },
-                |err| eprintln!("Audio error: {err}"),
-                None,
-            )
-            .ok()?;
+        let stream = match device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for sample in data.iter_mut() {
+                    *sample = consumer.try_pop().unwrap_or(0.0);
+                }
+            },
+            |err| eprintln!("Audio stream error: {err}"),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Audio: failed to build stream: {e}");
+                return None;
+            }
+        };
 
-        stream.play().ok()?;
+        if let Err(e) = stream.play() {
+            eprintln!("Audio: failed to start playback: {e}");
+            return None;
+        }
 
         Some(Self {
             _stream: stream,
             producer,
+            sample_rate: config.sample_rate.0,
         })
+    }
+
+    /// Returns the actual sample rate of the audio device.
+    #[must_use]
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Pushes stereo interleaved f32 samples into the ring buffer.

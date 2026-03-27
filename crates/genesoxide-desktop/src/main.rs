@@ -85,7 +85,9 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &PathBuf) -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let audio = audio::AudioOutput::open();
-    if audio.is_none() {
+    if let Some(ref a) = audio {
+        core.execute(Command::SetAudioSampleRate(a.sample_rate()));
+    } else {
         eprintln!("Warning: no audio output device available");
     }
 
