@@ -149,6 +149,43 @@ impl Z80 {
         }
     }
 
+    /// Reset the Z80 to its power-on state, as if the /RESET pin was asserted.
+    ///
+    /// Clears PC, I, R, interrupt flip-flops, and sets interrupt mode to 0.
+    /// The cycle counter is preserved. General-purpose registers are technically
+    /// undefined after reset on real hardware, but we zero them for determinism.
+    pub fn reset(&mut self) {
+        self.a = 0;
+        self.f = 0;
+        self.b = 0;
+        self.c = 0;
+        self.d = 0;
+        self.e = 0;
+        self.h = 0;
+        self.l = 0;
+        self.a_prime = 0;
+        self.f_prime = 0;
+        self.b_prime = 0;
+        self.c_prime = 0;
+        self.d_prime = 0;
+        self.e_prime = 0;
+        self.h_prime = 0;
+        self.l_prime = 0;
+        self.ix = 0;
+        self.iy = 0;
+        self.sp = 0;
+        self.pc = 0;
+        self.i = 0;
+        self.r = 0;
+        self.iff1 = false;
+        self.iff2 = false;
+        self.im = 0;
+        self.halted = false;
+        self.ei_pending = false;
+        self.wz = 0;
+        // cycles intentionally preserved
+    }
+
     // ── Register pair accessors ─────────────────────────────────────
 
     /// Returns the AF register pair (A = high, F = low).
