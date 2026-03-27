@@ -109,6 +109,8 @@ pub struct GenesisCore {
     z80_bus_requested: bool,
     /// Z80 in reset state.
     z80_reset: bool,
+    /// Set when Z80 reset transitions true→false, cleared after Z80.reset() is called.
+    z80_reset_pending: bool,
     /// SN76489 PSG sound chip.
     psg: psg::Psg,
     /// YM2612 FM synthesis chip.
@@ -143,6 +145,7 @@ impl GenesisCore {
             z80_bank: 0,
             z80_bus_requested: false,
             z80_reset: true, // Z80 starts in reset
+            z80_reset_pending: false,
             psg: psg::Psg::new(),
             ym2612: ym2612::Ym2612::new(),
             audio_buffer: Vec::with_capacity(1600),
@@ -215,13 +218,21 @@ impl GenesisCore {
 
     /// Z80 debug accessors.
     #[must_use]
-    pub fn z80_pc(&self) -> u16 { self.z80.pc }
+    pub fn z80_pc(&self) -> u16 {
+        self.z80.pc
+    }
     #[must_use]
-    pub fn z80_cycles(&self) -> u64 { self.z80.cycles }
+    pub fn z80_cycles(&self) -> u64 {
+        self.z80.cycles
+    }
     #[must_use]
-    pub fn z80_bus_requested(&self) -> bool { self.z80_bus_requested }
+    pub fn z80_bus_requested(&self) -> bool {
+        self.z80_bus_requested
+    }
     #[must_use]
-    pub fn z80_in_reset(&self) -> bool { self.z80_reset }
+    pub fn z80_in_reset(&self) -> bool {
+        self.z80_reset
+    }
 
     /// Returns a VDP snapshot for debugging.
     #[must_use]
@@ -261,6 +272,7 @@ impl GenesisCore {
         self.z80_bank = 0;
         self.z80_bus_requested = false;
         self.z80_reset = true;
+        self.z80_reset_pending = false;
         self.psg = psg::Psg::new();
         self.ym2612 = ym2612::Ym2612::new();
         self.audio_buffer.clear();
@@ -304,6 +316,7 @@ impl GenesisCore {
             z80_ram: &mut self.z80_ram,
             z80_bus_requested: &mut self.z80_bus_requested,
             z80_reset: &mut self.z80_reset,
+            z80_reset_pending: &mut self.z80_reset_pending,
             ym2612: &mut self.ym2612,
             psg: &mut self.psg,
         };
@@ -348,6 +361,12 @@ impl GenesisCore {
             // Run CPU for this scanline
             self.step_scanline();
 
+            // Handle Z80 reset: when reset is de-asserted, restart Z80 from PC=0
+            if self.z80_reset_pending {
+                self.z80.reset();
+                self.z80_reset_pending = false;
+            }
+
             // Step Z80 for this scanline (if bus not held by 68K and not in reset)
             if !self.z80_bus_requested && !self.z80_reset {
                 self.step_z80_scanline();
@@ -365,6 +384,7 @@ impl GenesisCore {
                     z80_ram: &mut self.z80_ram,
                     z80_bus_requested: &mut self.z80_bus_requested,
                     z80_reset: &mut self.z80_reset,
+                    z80_reset_pending: &mut self.z80_reset_pending,
                     ym2612: &mut self.ym2612,
                     psg: &mut self.psg,
                 };
@@ -394,6 +414,7 @@ impl GenesisCore {
                         z80_ram: &mut self.z80_ram,
                         z80_bus_requested: &mut self.z80_bus_requested,
                         z80_reset: &mut self.z80_reset,
+                        z80_reset_pending: &mut self.z80_reset_pending,
                         ym2612: &mut self.ym2612,
                         psg: &mut self.psg,
                     };
@@ -636,6 +657,7 @@ struct CoreBus<'a> {
     z80_ram: &'a mut Box<[u8; 0x2000]>,
     z80_bus_requested: &'a mut bool,
     z80_reset: &'a mut bool,
+    z80_reset_pending: &'a mut bool,
     ym2612: &'a mut ym2612::Ym2612,
     psg: &'a mut psg::Psg,
 }
@@ -809,7 +831,11 @@ impl Bus for CoreBus<'_> {
                         *self.z80_bus_requested = val & 0x01 != 0;
                     }
                     0x1200..=0x1201 => {
-                        *self.z80_reset = val & 0x01 == 0;
+                        let new_reset = val & 0x01 == 0;
+                        if *self.z80_reset && !new_reset {
+                            *self.z80_reset_pending = true;
+                        }
+                        *self.z80_reset = new_reset;
                     }
                     _ => {}
                 }
@@ -890,7 +916,11 @@ impl Bus for CoreBus<'_> {
                         *self.z80_bus_requested = (val >> 8) & 0x01 != 0;
                     }
                     0x1200..=0x1201 => {
-                        *self.z80_reset = (val >> 8) & 0x01 == 0;
+                        let new_reset = (val >> 8) & 0x01 == 0;
+                        if *self.z80_reset && !new_reset {
+                            *self.z80_reset_pending = true;
+                        }
+                        *self.z80_reset = new_reset;
                     }
                     _ => {}
                 }

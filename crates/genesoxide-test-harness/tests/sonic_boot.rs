@@ -145,16 +145,9 @@ fn sonic_produces_audio() {
     let mut core = GenesisCore::new();
     core.execute(Command::LoadRom(rom));
 
-    // Run frames and trace Z80 state
-    for frame in 0..300 {
+    // Run 300 frames (~5 seconds): SEGA splash + title screen music
+    for _ in 0..300 {
         core.execute(Command::StepFrame);
-        if frame < 5 || frame % 50 == 0 {
-            eprintln!(
-                "F{frame:3}: Z80 pc=0x{:04X} cycles={} bus_req={} reset={}",
-                core.z80_pc(), core.z80_cycles(),
-                core.z80_bus_requested(), core.z80_in_reset()
-            );
-        }
     }
 
     let samples = core.audio_samples();
@@ -163,14 +156,11 @@ fn sonic_produces_audio() {
 
     eprintln!("Audio: {non_silent}/{total} non-silent samples");
 
-    // The last frame's samples should have some content
+    assert!(total > 0, "Should have audio samples in the buffer");
     assert!(
-        total > 0,
-        "Should have audio samples in the buffer"
+        non_silent > total / 4,
+        "At least 25% of samples should be non-silent ({non_silent}/{total})"
     );
-    // We only check the last frame's samples — at least some should be non-zero
-    // if the sound driver is producing output
-    eprintln!("(Note: only last frame's samples in buffer — {total} samples)");
 }
 
 /// Debug: dump VDP state during zone title card to diagnose z-ordering.
