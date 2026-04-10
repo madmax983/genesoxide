@@ -301,6 +301,55 @@ fn alu_dec(cpu: &mut Z80, val: u8) -> u8 {
     result
 }
 
+// ── Interrupt handling ──────────────────────────────────────────────────
+
+/// Checks and services a pending maskable interrupt, if conditions are met.
+///
+/// On the Genesis, the Z80 INT line is connected to VDP V-blank (level-
+/// triggered). This function should be called before each instruction
+/// in `step_z80_scanline`. Returns the T-states consumed by the interrupt
+/// acknowledge (13 for IM 0/1, 19 for IM 2), or 0 if no interrupt was taken.
+///
+/// Conditions for accepting:
+/// 1. `int_line` is asserted (true)
+/// 2. IFF1 is enabled (interrupts are unmasked)
+/// 3. `ei_pending` is false (EI delays by one instruction)
+pub fn accept_interrupt(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
+    if !cpu.int_line || !cpu.iff1 || cpu.ei_pending {
+        return 0;
+    }
+
+    // Acknowledge: disable interrupts and un-halt
+    cpu.iff1 = false;
+    cpu.iff2 = false;
+    cpu.halted = false;
+
+    match cpu.im {
+        0 | 1 => {
+            // IM 0: execute RST 38h (Genesis data bus floats → 0xFF → RST 38h)
+            // IM 1: always jump to 0x0038
+            // Both behave identically on the Genesis.
+            push(cpu, bus, cpu.pc);
+            cpu.pc = 0x0038;
+            cpu.wz = 0x0038;
+            13 // RST takes 13 T-states total (acknowledge + push + jump)
+        }
+        2 => {
+            // IM 2: vectored interrupt. Vector address = (I << 8) | data_bus.
+            // Genesis data bus floats to 0xFF, so vector = I*256 + 0xFF.
+            // In practice, Genesis software never uses IM 2.
+            let vector_addr = (u16::from(cpu.i) << 8) | 0xFF;
+            let lo = bus.read_byte(vector_addr);
+            let hi = bus.read_byte(vector_addr.wrapping_add(1));
+            push(cpu, bus, cpu.pc);
+            cpu.pc = u16::from_le_bytes([lo, hi]);
+            cpu.wz = cpu.pc;
+            19 // IM 2 takes 19 T-states
+        }
+        _ => 0,
+    }
+}
+
 // ── Executor ────────────────────────────────────────────────────────────
 
 /// Fetches and executes one Z80 instruction, returning T-states consumed.

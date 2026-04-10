@@ -1,0 +1,28 @@
+{
+  "references": [
+    {
+      "filename": "sonic_ghz.flac",
+      "enabled": true,
+      "mono_weight": 1.0,
+      "side_weight": 1.0,
+      "source": "primary hardware capture",
+      "notes": "Primary reference; keep full mono and side trust."
+    },
+    {
+      "filename": "sonic_ghz_16bap.flac",
+      "enabled": true,
+      "mono_weight": 0.95,
+      "side_weight": 0.0,
+      "source": "16bap hardware capture",
+      "notes": "Useful broad tonal reference, but disable stereo authority because side sections disagree with the primary capture."
+    },
+    {
+      "filename": "sonic_ghz_16bap_remaster_cd.flac",
+      "enabled": true,
+      "mono_weight": 0.85,
+      "side_weight": 0.0,
+      "source": "16bap remaster/CD capture",
+      "notes": "Tertiary tonal reference only; disable stereo authority entirely."
+    }
+  ]
+}

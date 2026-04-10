@@ -2,3 +2,18 @@
 *.swp
 *.swo
 *~
+
+# Reference audio files for golden comparison tests
+crates/genesoxide-test-harness/tests/reference_audio/
+
+# Generated audio comparison dumps
+crates/genesoxide-test-harness/tests/vgm_output/
+
+# Local scratch / downloaded reference archives
+tmp_sonic_remaster_cd.zip
+tmp_sonic_remaster_cd_real.zip
+tmp_sonic_remaster_cd_real/
+third_party/*.zip
+
+# Local work-in-progress scratch
+*.wip
