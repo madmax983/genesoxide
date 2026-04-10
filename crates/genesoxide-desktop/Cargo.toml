@@ -17,3 +17,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 ringbuf = "0.4"
+hound = "3.5"

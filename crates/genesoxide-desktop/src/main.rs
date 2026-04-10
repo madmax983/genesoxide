@@ -55,6 +55,23 @@ enum CliCommand {
         /// Path to ROM file.
         rom: PathBuf,
     },
+    /// Run headless and dump audio output to a WAV file.
+    DumpAudio {
+        /// Path to ROM file.
+        rom: PathBuf,
+        /// Output WAV file path.
+        #[arg(short, long, default_value = "output.wav")]
+        output: PathBuf,
+        /// Number of frames to run.
+        #[arg(short, long, default_value = "600")]
+        frames: u32,
+        /// Sample rate in Hz.
+        #[arg(long, default_value = "44100")]
+        sample_rate: u32,
+        /// Skip N frames before recording (lets the game boot first).
+        #[arg(long, default_value = "0")]
+        skip: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -64,6 +81,13 @@ fn main() -> Result<()> {
         CliCommand::Run { rom, scale, config } => cmd_run(&rom, scale, &config),
         CliCommand::Info { rom } => cmd_info(&rom),
         CliCommand::Verify { rom } => cmd_verify(&rom),
+        CliCommand::DumpAudio {
+            rom,
+            output,
+            frames,
+            sample_rate,
+            skip,
+        } => cmd_dump_audio(&rom, &output, frames, sample_rate, skip),
     }
 }
 
@@ -269,4 +293,72 @@ fn cmd_verify(rom_path: &PathBuf) -> Result<()> {
     } else {
         bail!("FAIL: checksum mismatch")
     }
+}
+
+fn cmd_dump_audio(
+    rom_path: &Path,
+    output_path: &Path,
+    frames: u32,
+    sample_rate: u32,
+    skip: u32,
+) -> Result<()> {
+    let rom_data = fs::read(rom_path)
+        .with_context(|| format!("Failed to read ROM: {}", rom_path.display()))?;
+
+    let mut core = GenesisCore::new();
+    core.execute(Command::LoadRom(rom_data));
+    core.execute(Command::SetAudioSampleRate(sample_rate));
+
+    if let Some(header) = core.rom_header() {
+        eprintln!("Loaded: {}", header.title_overseas);
+    }
+
+    // Skip frames (game boot, etc.) — discard audio
+    if skip > 0 {
+        eprintln!("Skipping {skip} frames...");
+        for _ in 0..skip {
+            core.execute(Command::StepFrame);
+        }
+        core.clear_audio_buffer();
+    }
+
+    // Collect audio for the requested number of frames
+    eprintln!("Recording {frames} frames at {sample_rate} Hz...");
+    let mut all_samples: Vec<f32> = Vec::new();
+    for frame in 0..frames {
+        core.execute(Command::StepFrame);
+        all_samples.extend_from_slice(core.audio_samples());
+        core.clear_audio_buffer();
+
+        if (frame + 1) % 100 == 0 {
+            eprintln!("  frame {}/{frames}", frame + 1);
+        }
+    }
+
+    let duration_secs = all_samples.len() as f64 / (2.0 * f64::from(sample_rate));
+    eprintln!(
+        "Captured {} samples ({:.1}s stereo)",
+        all_samples.len(),
+        duration_secs
+    );
+
+    // Write WAV
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(output_path, spec)
+        .with_context(|| format!("Failed to create WAV: {}", output_path.display()))?;
+
+    for &sample in &all_samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let i16_val = (clamped * 32767.0) as i16;
+        writer.write_sample(i16_val)?;
+    }
+    writer.finalize()?;
+
+    eprintln!("Wrote {}", output_path.display());
+    Ok(())
 }

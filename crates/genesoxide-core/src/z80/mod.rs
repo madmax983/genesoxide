@@ -110,6 +110,10 @@ pub struct Z80 {
     pub ei_pending: bool,
     /// Internal WZ/MEMPTR register (used for undocumented flag behavior).
     pub wz: u16,
+    /// Level-triggered maskable interrupt line (directly connected to VDP
+    /// V-blank on the Genesis). When asserted (`true`) and IFF1 is set,
+    /// the Z80 will service the interrupt before the next instruction.
+    pub int_line: bool,
 }
 
 impl Z80 {
@@ -146,6 +150,7 @@ impl Z80 {
             cycles: 0,
             ei_pending: false,
             wz: 0,
+            int_line: false,
         }
     }
 
@@ -168,6 +173,7 @@ impl Z80 {
         self.im = 0;
         self.halted = false;
         self.ei_pending = false;
+        self.int_line = false;
         // cycles intentionally preserved
     }
 
@@ -273,6 +279,7 @@ impl Z80 {
             cycles: self.cycles,
             ei_pending: self.ei_pending,
             wz: self.wz,
+            int_line: self.int_line,
         }
     }
 }
@@ -317,6 +324,7 @@ pub struct Z80Snapshot {
     pub cycles: u64,
     pub ei_pending: bool,
     pub wz: u16,
+    pub int_line: bool,
 }
 
 #[cfg(test)]

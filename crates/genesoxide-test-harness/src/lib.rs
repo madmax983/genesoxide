@@ -7,6 +7,8 @@
 //! against MAME-generated test vectors.
 
 pub mod m68k_tests;
+pub mod vgm;
+pub mod ymfm_reference;
 pub mod z80_tests;
 
 use genesoxide_core::{Command, FRAME_RGBA_BYTES, GenesisCore};

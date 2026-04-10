@@ -10,7 +10,7 @@ use crate::cpu::{self, Cpu};
 use crate::io::ControllerPort;
 use crate::psg;
 use crate::rom::{self, RomHeader};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Scheduler};
 use crate::vdp::Vdp;
 use crate::ym2612;
 use crate::z80;
@@ -31,9 +31,922 @@ pub const FRAME_PERIOD_NS: u64 = 16_688_155;
 pub const SCANLINES_PER_FRAME: u16 = 262;
 /// Active (visible) scanlines.
 pub const ACTIVE_SCANLINES: u16 = 224;
+/// NTSC Genesis master-clock ticks per scanline in H40 timing.
+const MASTER_TICKS_PER_SCANLINE: u64 = 3420;
+/// YM2612 audio clock period in master-clock ticks.
+const YM_AUDIO_TICKS: u64 = 1008;
+/// PSG audio clock period in master-clock ticks.
+const PSG_AUDIO_TICKS: u64 = 240;
+/// Model 1 VA0-VA2 style 3.39 kHz first-order low-pass, applied at YM native rate.
+const YM_LPF_B0: f32 = 0.168_498_34;
+const YM_LPF_B1: f32 = 0.168_498_34;
+const YM_LPF_A1: f32 = -0.663_003_3;
+/// Same 3.39 kHz first-order low-pass, but designed for PSG native rate.
+const PSG_LPF_B0: f32 = 0.045_473_456;
+const PSG_LPF_B1: f32 = 0.045_473_456;
+const PSG_LPF_A1: f32 = -0.909_053_1;
+const LEGACY_YM_CUTOFF_HZ: f32 = 14_000.0;
+const DEFAULT_PSG_MIX: f32 = 0.22;
+const MAX_POST_DELAY_SAMPLES: usize = 4;
 
 /// Genesis controller button (re-exported from io module).
 pub use crate::io::Button;
+
+/// Post-mix analog/capture profile applied after raw YM2612/PSG synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOutputProfile {
+    /// Legacy genesoxide path: 14 kHz YM Butterworth, PSG unfiltered.
+    Legacy,
+    /// Model 1 VA0-VA2 style low-pass on both YM and PSG paths.
+    Model1Va2,
+}
+
+/// Kind of post-mix EQ stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioEqKind {
+    /// Low-shelf biquad.
+    LowShelf,
+    /// Peaking / bell biquad.
+    Peaking,
+    /// High-shelf biquad.
+    HighShelf,
+}
+
+/// A single post-mix EQ stage shared by the live core and replay renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioEqStage {
+    /// Filter topology.
+    pub kind: AudioEqKind,
+    /// Center/corner frequency in Hz.
+    pub frequency_hz: f32,
+    /// Positive boosts, negative cuts.
+    pub gain_db: f32,
+    /// Q for peaking filters, slope for shelf filters.
+    pub q: f32,
+}
+
+impl AudioEqStage {
+    /// Create a low-shelf EQ stage.
+    #[must_use]
+    pub const fn low_shelf(frequency_hz: f32, gain_db: f32) -> Self {
+        Self {
+            kind: AudioEqKind::LowShelf,
+            frequency_hz,
+            gain_db,
+            q: 1.0,
+        }
+    }
+
+    /// Create a peaking EQ stage.
+    #[must_use]
+    pub const fn peaking(frequency_hz: f32, q: f32, gain_db: f32) -> Self {
+        Self {
+            kind: AudioEqKind::Peaking,
+            frequency_hz,
+            gain_db,
+            q,
+        }
+    }
+
+    /// Create a high-shelf EQ stage.
+    #[must_use]
+    pub const fn high_shelf(frequency_hz: f32, gain_db: f32) -> Self {
+        Self {
+            kind: AudioEqKind::HighShelf,
+            frequency_hz,
+            gain_db,
+            q: 1.0,
+        }
+    }
+}
+
+/// Shared audio output settings for the live core and timed replay renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioOutputConfig {
+    /// Analog/output profile selection.
+    pub profile: AudioOutputProfile,
+    /// Post-mix master gain applied before final clamp.
+    pub master_gain: f32,
+    /// YM path gain applied after YM filtering, before final mix.
+    pub ym_gain: f32,
+    /// PSG path gain applied after PSG filtering and baseline PSG mix.
+    pub psg_gain: f32,
+    /// Per-YM-channel delayed side-memory amount applied before the YM sum.
+    pub ym_channel_side_memory_amounts: [f32; 6],
+    /// Per-YM-channel blend between raw side feed and side-change feed.
+    /// `0.0` keeps the old sustained-side feed; `1.0` only feeds side changes.
+    pub ym_channel_side_transient_mixes: [f32; 6],
+    /// Per-YM-channel blend between raw delayed polarity and current-polarity side lift.
+    /// `0.0` replays the delayed sample as-is; `1.0` keeps only its magnitude and follows
+    /// the current side polarity.
+    pub ym_channel_side_sign_align_mixes: [f32; 6],
+    /// Per-YM-channel side-memory decay time in milliseconds at YM native rate.
+    pub ym_channel_side_decay_ms: [f32; 6],
+    /// Per-YM-channel delay applied to YM key-on/key-off writes.
+    pub ym_channel_key_delay_ms: [f32; 6],
+    /// Per-YM-channel pan-edge persistence impulse applied on YM pan changes.
+    pub ym_channel_pan_edge_amounts: [f32; 6],
+    /// Per-YM-channel pan-edge persistence decay time in milliseconds.
+    pub ym_channel_pan_edge_decay_ms: [f32; 6],
+    /// Stereo crossfeed amount after post-mix shaping, before master gain.
+    pub stereo_crossfeed: f32,
+    /// Mid channel gain after left/right shaping and crossfeed.
+    pub mid_gain: f32,
+    /// Side channel gain after left/right shaping and crossfeed.
+    pub side_gain: f32,
+    /// Optional post-mix high-pass stage in Hz.
+    pub post_high_pass_hz: Option<f32>,
+    /// Optional post-mix low-pass stage in Hz.
+    pub post_low_pass_hz: Option<f32>,
+    /// Optional first post-mix EQ stage.
+    pub post_eq_1: Option<AudioEqStage>,
+    /// Optional second post-mix EQ stage.
+    pub post_eq_2: Option<AudioEqStage>,
+    /// Optional third post-mix EQ stage.
+    pub post_eq_3: Option<AudioEqStage>,
+    /// Optional fourth post-mix EQ stage.
+    pub post_eq_4: Option<AudioEqStage>,
+    /// Optional fifth post-mix EQ stage.
+    pub post_eq_5: Option<AudioEqStage>,
+    /// Optional first post-mix EQ stage applied only to the side channel.
+    pub post_side_eq_1: Option<AudioEqStage>,
+    /// Optional second post-mix EQ stage applied only to the side channel.
+    pub post_side_eq_2: Option<AudioEqStage>,
+    /// Optional short post-mix FIR stage shared by both channels.
+    pub post_fir_taps: Option<[f32; 5]>,
+    /// Optional post-mix sample delay applied to the left channel.
+    pub post_left_delay_samples: u8,
+    /// Optional post-mix sample delay applied to the right channel.
+    pub post_right_delay_samples: u8,
+}
+
+impl AudioOutputConfig {
+    /// Creates an audio output config.
+    #[must_use]
+    pub const fn new(profile: AudioOutputProfile, master_gain: f32) -> Self {
+        Self {
+            profile,
+            master_gain,
+            ym_gain: 1.0,
+            psg_gain: 1.0,
+            ym_channel_side_memory_amounts: [0.0; 6],
+            ym_channel_side_transient_mixes: [0.0; 6],
+            ym_channel_side_sign_align_mixes: [0.0; 6],
+            ym_channel_side_decay_ms: [0.0; 6],
+            ym_channel_key_delay_ms: [0.0; 6],
+            ym_channel_pan_edge_amounts: [0.0; 6],
+            ym_channel_pan_edge_decay_ms: [0.0; 6],
+            stereo_crossfeed: 0.0,
+            mid_gain: 1.0,
+            side_gain: 1.0,
+            post_high_pass_hz: None,
+            post_low_pass_hz: None,
+            post_eq_1: None,
+            post_eq_2: None,
+            post_eq_3: None,
+            post_eq_4: None,
+            post_eq_5: None,
+            post_side_eq_1: None,
+            post_side_eq_2: None,
+            post_fir_taps: None,
+            post_left_delay_samples: 0,
+            post_right_delay_samples: 0,
+        }
+    }
+
+    /// Legacy YM-filtered / PSG-flat output profile.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self::new(AudioOutputProfile::Legacy, 1.0)
+    }
+
+    /// Model 1 VA0-VA2 style output profile.
+    #[must_use]
+    pub const fn model1_va2() -> Self {
+        Self::new(AudioOutputProfile::Model1Va2, 1.0)
+    }
+
+    /// Returns this profile with a different post-mix gain.
+    #[must_use]
+    pub const fn with_gain(self, master_gain: f32) -> Self {
+        Self {
+            master_gain,
+            ..self
+        }
+    }
+
+    /// Returns this config with a different YM path gain.
+    #[must_use]
+    pub const fn with_ym_gain(self, ym_gain: f32) -> Self {
+        Self { ym_gain, ..self }
+    }
+
+    /// Returns this config with a different PSG path gain.
+    #[must_use]
+    pub const fn with_psg_gain(self, psg_gain: f32) -> Self {
+        Self { psg_gain, ..self }
+    }
+
+    /// Returns this config with per-channel YM delayed side-memory amounts.
+    #[must_use]
+    pub const fn with_ym_channel_side_memory_amounts(
+        self,
+        ym_channel_side_memory_amounts: [f32; 6],
+    ) -> Self {
+        Self {
+            ym_channel_side_memory_amounts,
+            ..self
+        }
+    }
+
+    /// Returns this config with per-channel YM side-memory transient blends.
+    #[must_use]
+    pub const fn with_ym_channel_side_transient_mixes(
+        self,
+        ym_channel_side_transient_mixes: [f32; 6],
+    ) -> Self {
+        Self {
+            ym_channel_side_transient_mixes,
+            ..self
+        }
+    }
+
+    /// Returns this config with per-channel YM side-memory sign-alignment blends.
+    #[must_use]
+    pub const fn with_ym_channel_side_sign_align_mixes(
+        self,
+        ym_channel_side_sign_align_mixes: [f32; 6],
+    ) -> Self {
+        Self {
+            ym_channel_side_sign_align_mixes,
+            ..self
+        }
+    }
+
+    /// Returns this config with per-channel YM side-memory decay times.
+    #[must_use]
+    pub const fn with_ym_channel_side_decay_ms(self, ym_channel_side_decay_ms: [f32; 6]) -> Self {
+        Self {
+            ym_channel_side_decay_ms,
+            ..self
+        }
+    }
+
+    /// Returns this config with per-channel YM key-write delays in milliseconds.
+    #[must_use]
+    pub const fn with_ym_channel_key_delay_ms(self, ym_channel_key_delay_ms: [f32; 6]) -> Self {
+        Self {
+            ym_channel_key_delay_ms,
+            ..self
+        }
+    }
+
+    /// Returns this config with per-channel YM pan-edge persistence impulse amounts.
+    #[must_use]
+    pub const fn with_ym_channel_pan_edge_amounts(
+        self,
+        ym_channel_pan_edge_amounts: [f32; 6],
+    ) -> Self {
+        Self {
+            ym_channel_pan_edge_amounts,
+            ..self
+        }
+    }
+
+    /// Returns this config with per-channel YM pan-edge persistence decay times.
+    #[must_use]
+    pub const fn with_ym_channel_pan_edge_decay_ms(
+        self,
+        ym_channel_pan_edge_decay_ms: [f32; 6],
+    ) -> Self {
+        Self {
+            ym_channel_pan_edge_decay_ms,
+            ..self
+        }
+    }
+
+    /// Returns this config with a different stereo crossfeed amount.
+    #[must_use]
+    pub const fn with_stereo_crossfeed(self, stereo_crossfeed: f32) -> Self {
+        Self {
+            stereo_crossfeed,
+            ..self
+        }
+    }
+
+    /// Returns this config with a different mid gain.
+    #[must_use]
+    pub const fn with_mid_gain(self, mid_gain: f32) -> Self {
+        Self { mid_gain, ..self }
+    }
+
+    /// Returns this config with a different side gain.
+    #[must_use]
+    pub const fn with_side_gain(self, side_gain: f32) -> Self {
+        Self { side_gain, ..self }
+    }
+
+    /// Returns this config with an optional post-mix high-pass stage.
+    #[must_use]
+    pub const fn with_post_high_pass_hz(self, post_high_pass_hz: f32) -> Self {
+        Self {
+            post_high_pass_hz: Some(post_high_pass_hz),
+            ..self
+        }
+    }
+
+    /// Returns this config with an optional post-mix low-pass stage.
+    #[must_use]
+    pub const fn with_post_low_pass_hz(self, post_low_pass_hz: f32) -> Self {
+        Self {
+            post_low_pass_hz: Some(post_low_pass_hz),
+            ..self
+        }
+    }
+
+    /// Returns this config with a first post-mix EQ stage.
+    #[must_use]
+    pub const fn with_post_eq_1(self, post_eq_1: AudioEqStage) -> Self {
+        Self {
+            post_eq_1: Some(post_eq_1),
+            ..self
+        }
+    }
+
+    /// Returns this config with a second post-mix EQ stage.
+    #[must_use]
+    pub const fn with_post_eq_2(self, post_eq_2: AudioEqStage) -> Self {
+        Self {
+            post_eq_2: Some(post_eq_2),
+            ..self
+        }
+    }
+
+    /// Returns this config with a third post-mix EQ stage.
+    #[must_use]
+    pub const fn with_post_eq_3(self, post_eq_3: AudioEqStage) -> Self {
+        Self {
+            post_eq_3: Some(post_eq_3),
+            ..self
+        }
+    }
+
+    /// Returns this config with a fourth post-mix EQ stage.
+    #[must_use]
+    pub const fn with_post_eq_4(self, post_eq_4: AudioEqStage) -> Self {
+        Self {
+            post_eq_4: Some(post_eq_4),
+            ..self
+        }
+    }
+
+    /// Returns this config with a fifth post-mix EQ stage.
+    #[must_use]
+    pub const fn with_post_eq_5(self, post_eq_5: AudioEqStage) -> Self {
+        Self {
+            post_eq_5: Some(post_eq_5),
+            ..self
+        }
+    }
+
+    /// Returns this config with a first side-channel EQ stage.
+    #[must_use]
+    pub const fn with_post_side_eq_1(self, post_side_eq_1: AudioEqStage) -> Self {
+        Self {
+            post_side_eq_1: Some(post_side_eq_1),
+            ..self
+        }
+    }
+
+    /// Returns this config with a second side-channel EQ stage.
+    #[must_use]
+    pub const fn with_post_side_eq_2(self, post_side_eq_2: AudioEqStage) -> Self {
+        Self {
+            post_side_eq_2: Some(post_side_eq_2),
+            ..self
+        }
+    }
+
+    /// Returns this config with an optional short post-mix FIR stage.
+    #[must_use]
+    pub const fn with_post_fir_taps(self, post_fir_taps: [f32; 5]) -> Self {
+        Self {
+            post_fir_taps: Some(post_fir_taps),
+            ..self
+        }
+    }
+
+    /// Returns this config with a post-mix sample delay on the left channel.
+    #[must_use]
+    pub const fn with_post_left_delay_samples(self, post_left_delay_samples: u8) -> Self {
+        Self {
+            post_left_delay_samples,
+            ..self
+        }
+    }
+
+    /// Returns this config with a post-mix sample delay on the right channel.
+    #[must_use]
+    pub const fn with_post_right_delay_samples(self, post_right_delay_samples: u8) -> Self {
+        Self {
+            post_right_delay_samples,
+            ..self
+        }
+    }
+
+    /// Describes the concrete filter/mix path for this config.
+    #[must_use]
+    pub fn spec_for_rates(self, ym_native_rate_hz: f32, output_rate_hz: f32) -> AudioOutputSpec {
+        let mut spec = match self.profile {
+            AudioOutputProfile::Legacy => AudioOutputSpec {
+                ym_filter: biquad_low_pass_filter_spec(LEGACY_YM_CUTOFF_HZ, ym_native_rate_hz),
+                psg_filter: AudioFilterSpec::Flat,
+                psg_mix: DEFAULT_PSG_MIX,
+                master_gain: self.master_gain,
+                ym_gain: self.ym_gain,
+                psg_gain: self.psg_gain,
+                ym_channel_side_memory_amounts: self.ym_channel_side_memory_amounts,
+                ym_channel_side_transient_mixes: self.ym_channel_side_transient_mixes,
+                ym_channel_side_sign_align_mixes: self.ym_channel_side_sign_align_mixes,
+                ym_channel_side_decay_factors: std::array::from_fn(|idx| {
+                    side_memory_decay_factor(self.ym_channel_side_decay_ms[idx], ym_native_rate_hz)
+                }),
+                ym_channel_key_delay_ticks: std::array::from_fn(|idx| {
+                    key_delay_ticks(self.ym_channel_key_delay_ms[idx])
+                }),
+                ym_channel_pan_edge_amounts: self.ym_channel_pan_edge_amounts,
+                ym_channel_pan_edge_decay_factors: std::array::from_fn(|idx| {
+                    pan_edge_decay_factor(self.ym_channel_pan_edge_decay_ms[idx], ym_native_rate_hz)
+                }),
+                stereo_crossfeed: self.stereo_crossfeed,
+                mid_gain: self.mid_gain,
+                side_gain: self.side_gain,
+                post_high_pass: AudioFilterSpec::Flat,
+                post_low_pass: AudioFilterSpec::Flat,
+                post_eq_1: AudioFilterSpec::Flat,
+                post_eq_2: AudioFilterSpec::Flat,
+                post_eq_3: AudioFilterSpec::Flat,
+                post_eq_4: AudioFilterSpec::Flat,
+                post_eq_5: AudioFilterSpec::Flat,
+                post_side_eq_1: AudioFilterSpec::Flat,
+                post_side_eq_2: AudioFilterSpec::Flat,
+                post_fir: AudioFilterSpec::Flat,
+                post_left_delay_samples: self
+                    .post_left_delay_samples
+                    .min(MAX_POST_DELAY_SAMPLES as u8),
+                post_right_delay_samples: self
+                    .post_right_delay_samples
+                    .min(MAX_POST_DELAY_SAMPLES as u8),
+            },
+            AudioOutputProfile::Model1Va2 => AudioOutputSpec {
+                ym_filter: AudioFilterSpec::FirstOrder {
+                    b0: YM_LPF_B0,
+                    b1: YM_LPF_B1,
+                    a1: YM_LPF_A1,
+                },
+                psg_filter: AudioFilterSpec::FirstOrder {
+                    b0: PSG_LPF_B0,
+                    b1: PSG_LPF_B1,
+                    a1: PSG_LPF_A1,
+                },
+                psg_mix: DEFAULT_PSG_MIX,
+                master_gain: self.master_gain,
+                ym_gain: self.ym_gain,
+                psg_gain: self.psg_gain,
+                ym_channel_side_memory_amounts: self.ym_channel_side_memory_amounts,
+                ym_channel_side_transient_mixes: self.ym_channel_side_transient_mixes,
+                ym_channel_side_sign_align_mixes: self.ym_channel_side_sign_align_mixes,
+                ym_channel_side_decay_factors: std::array::from_fn(|idx| {
+                    side_memory_decay_factor(self.ym_channel_side_decay_ms[idx], ym_native_rate_hz)
+                }),
+                ym_channel_key_delay_ticks: std::array::from_fn(|idx| {
+                    key_delay_ticks(self.ym_channel_key_delay_ms[idx])
+                }),
+                ym_channel_pan_edge_amounts: self.ym_channel_pan_edge_amounts,
+                ym_channel_pan_edge_decay_factors: std::array::from_fn(|idx| {
+                    pan_edge_decay_factor(self.ym_channel_pan_edge_decay_ms[idx], ym_native_rate_hz)
+                }),
+                stereo_crossfeed: self.stereo_crossfeed,
+                mid_gain: self.mid_gain,
+                side_gain: self.side_gain,
+                post_high_pass: AudioFilterSpec::Flat,
+                post_low_pass: AudioFilterSpec::Flat,
+                post_eq_1: AudioFilterSpec::Flat,
+                post_eq_2: AudioFilterSpec::Flat,
+                post_eq_3: AudioFilterSpec::Flat,
+                post_eq_4: AudioFilterSpec::Flat,
+                post_eq_5: AudioFilterSpec::Flat,
+                post_side_eq_1: AudioFilterSpec::Flat,
+                post_side_eq_2: AudioFilterSpec::Flat,
+                post_fir: AudioFilterSpec::Flat,
+                post_left_delay_samples: self
+                    .post_left_delay_samples
+                    .min(MAX_POST_DELAY_SAMPLES as u8),
+                post_right_delay_samples: self
+                    .post_right_delay_samples
+                    .min(MAX_POST_DELAY_SAMPLES as u8),
+            },
+        };
+        if let Some(cutoff_hz) = self.post_high_pass_hz {
+            spec.post_high_pass = first_order_high_pass_filter_spec(cutoff_hz, output_rate_hz);
+        }
+        if let Some(cutoff_hz) = self.post_low_pass_hz {
+            spec.post_low_pass = first_order_low_pass_filter_spec(cutoff_hz, output_rate_hz);
+        }
+        if let Some(stage) = self.post_eq_1 {
+            spec.post_eq_1 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(stage) = self.post_eq_2 {
+            spec.post_eq_2 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(stage) = self.post_eq_3 {
+            spec.post_eq_3 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(stage) = self.post_eq_4 {
+            spec.post_eq_4 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(stage) = self.post_eq_5 {
+            spec.post_eq_5 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(stage) = self.post_side_eq_1 {
+            spec.post_side_eq_1 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(stage) = self.post_side_eq_2 {
+            spec.post_side_eq_2 = biquad_eq_filter_spec(stage, output_rate_hz);
+        }
+        if let Some(taps) = self.post_fir_taps {
+            spec.post_fir = AudioFilterSpec::Fir { taps };
+        }
+        spec
+    }
+}
+
+impl Default for AudioOutputConfig {
+    fn default() -> Self {
+        Self::legacy()
+            .with_gain(2.2)
+            .with_ym_gain(1.1)
+            .with_psg_gain(0.65)
+            .with_ym_channel_side_memory_amounts([0.20, 0.0, 0.0, 0.60, 0.0, 0.0])
+            .with_ym_channel_side_decay_ms([0.01, 0.0, 0.0, 0.02, 0.02, 0.0])
+            .with_stereo_crossfeed(0.25)
+            .with_side_gain(1.05)
+            .with_post_low_pass_hz(12_000.0)
+            .with_post_eq_1(AudioEqStage::low_shelf(110.0, -6.0))
+            .with_post_eq_2(AudioEqStage::peaking(380.0, 0.65, 4.5))
+            .with_post_eq_3(AudioEqStage::high_shelf(2_600.0, -2.8))
+            .with_post_eq_4(AudioEqStage::peaking(190.0, 0.90, 3.2))
+            .with_post_eq_5(AudioEqStage::peaking(560.0, 1.20, -2.4))
+            .with_post_side_eq_1(AudioEqStage::peaking(450.0, 1.50, -4.0))
+            .with_post_side_eq_2(AudioEqStage::peaking(2_600.0, 0.90, 0.0))
+    }
+}
+
+/// Public filter description shared with the timed replay harness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AudioFilterSpec {
+    /// No filtering beyond sample hold / averaging.
+    Flat,
+    /// First-order IIR low-pass: `y[n] = b0*x[n] + b1*x[n-1] - a1*y[n-1]`.
+    FirstOrder { b0: f32, b1: f32, a1: f32 },
+    /// Biquad IIR filter in normalized direct form I.
+    Biquad {
+        b0: f32,
+        b1: f32,
+        b2: f32,
+        a1: f32,
+        a2: f32,
+    },
+    /// Five-tap FIR for short capture/phase shaping.
+    Fir { taps: [f32; 5] },
+}
+
+/// Concrete output path generated from [`AudioOutputConfig`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioOutputSpec {
+    pub ym_filter: AudioFilterSpec,
+    pub psg_filter: AudioFilterSpec,
+    pub psg_mix: f32,
+    pub master_gain: f32,
+    pub ym_gain: f32,
+    pub psg_gain: f32,
+    pub ym_channel_side_memory_amounts: [f32; 6],
+    pub ym_channel_side_transient_mixes: [f32; 6],
+    pub ym_channel_side_sign_align_mixes: [f32; 6],
+    pub ym_channel_side_decay_factors: [f32; 6],
+    pub ym_channel_key_delay_ticks: [u64; 6],
+    pub ym_channel_pan_edge_amounts: [f32; 6],
+    pub ym_channel_pan_edge_decay_factors: [f32; 6],
+    pub stereo_crossfeed: f32,
+    pub mid_gain: f32,
+    pub side_gain: f32,
+    pub post_high_pass: AudioFilterSpec,
+    pub post_low_pass: AudioFilterSpec,
+    pub post_eq_1: AudioFilterSpec,
+    pub post_eq_2: AudioFilterSpec,
+    pub post_eq_3: AudioFilterSpec,
+    pub post_eq_4: AudioFilterSpec,
+    pub post_eq_5: AudioFilterSpec,
+    pub post_side_eq_1: AudioFilterSpec,
+    pub post_side_eq_2: AudioFilterSpec,
+    pub post_fir: AudioFilterSpec,
+    pub post_left_delay_samples: u8,
+    pub post_right_delay_samples: u8,
+}
+
+fn first_order_low_pass_filter_spec(cutoff_hz: f32, sample_rate_hz: f32) -> AudioFilterSpec {
+    let k = (std::f32::consts::PI * cutoff_hz / sample_rate_hz).tan();
+    let b0 = k / (1.0 + k);
+    let b1 = b0;
+    let a1 = (k - 1.0) / (k + 1.0);
+    AudioFilterSpec::FirstOrder { b0, b1, a1 }
+}
+
+fn first_order_high_pass_filter_spec(cutoff_hz: f32, sample_rate_hz: f32) -> AudioFilterSpec {
+    let k = (std::f32::consts::PI * cutoff_hz / sample_rate_hz).tan();
+    let b0 = 1.0 / (1.0 + k);
+    let b1 = -b0;
+    let a1 = (k - 1.0) / (k + 1.0);
+    AudioFilterSpec::FirstOrder { b0, b1, a1 }
+}
+
+fn apply_stereo_crossfeed(left: f32, right: f32, amount: f32) -> (f32, f32) {
+    let amount = amount.clamp(0.0, 0.5);
+    let keep = 1.0 - amount;
+    (left * keep + right * amount, right * keep + left * amount)
+}
+
+fn encode_mid_side(left: f32, right: f32) -> (f32, f32) {
+    ((left + right) * 0.5, (left - right) * 0.5)
+}
+
+fn decode_mid_side(mid: f32, side: f32) -> (f32, f32) {
+    (mid + side, mid - side)
+}
+
+fn pan_edge_decay_factor(decay_ms: f32, ym_native_rate_hz: f32) -> f32 {
+    if decay_ms <= 0.0 {
+        return 0.0;
+    }
+
+    let decay_samples = (ym_native_rate_hz * decay_ms / 1000.0).max(1.0);
+    (-1.0 / decay_samples).exp()
+}
+
+fn side_memory_decay_factor(decay_ms: f32, ym_native_rate_hz: f32) -> f32 {
+    if decay_ms <= 0.0 {
+        return 0.0;
+    }
+
+    let decay_samples = (ym_native_rate_hz * decay_ms / 1000.0).max(1.0);
+    (-1.0 / decay_samples).exp()
+}
+
+fn side_memory_feed(side: f32, previous_side: f32, transient_mix: f32) -> f32 {
+    let transient_mix = transient_mix.clamp(0.0, 1.0);
+    let transient_side = side - previous_side;
+    side * (1.0 - transient_mix) + transient_side * transient_mix
+}
+
+fn align_side_polarity(side: f32, delayed_side: f32, sign_align_mix: f32) -> f32 {
+    let sign_align_mix = sign_align_mix.clamp(0.0, 1.0);
+    let aligned_delayed_side = if side == 0.0 {
+        0.0
+    } else {
+        side.signum() * delayed_side.abs()
+    };
+    delayed_side * (1.0 - sign_align_mix) + aligned_delayed_side * sign_align_mix
+}
+
+fn key_delay_ticks(delay_ms: f32) -> u64 {
+    if delay_ms <= 0.0 {
+        return 0;
+    }
+
+    ((delay_ms / 1000.0) * MASTER_CLOCK_NTSC as f32).round() as u64
+}
+
+fn ym_pan_channel_from_addr(port: u8, addr: u8) -> Option<usize> {
+    if !(0xB4..=0xB6).contains(&addr) || port > 1 {
+        return None;
+    }
+
+    let channel = usize::from(addr & 0x03) + usize::from(port) * 3;
+    (channel < 6).then_some(channel)
+}
+
+fn ym_key_channel_from_write(port: u8, addr: u8, value: u8) -> Option<usize> {
+    if port != 0 || addr != 0x28 {
+        return None;
+    }
+
+    match value & 0x07 {
+        0..=2 => Some((value & 0x07) as usize),
+        4..=6 => Some(((value & 0x07) - 4 + 3) as usize),
+        _ => None,
+    }
+}
+
+fn insert_timed_write_sorted(queue: &mut Vec<TimedYm2612Write>, write: TimedYm2612Write) {
+    let insert_at = queue.partition_point(|pending| pending.master_tick <= write.master_tick);
+    queue.insert(insert_at, write);
+}
+
+fn maybe_delay_ym_key_write(
+    queue: &mut Vec<TimedYm2612Write>,
+    key_delay_ticks: [u64; 6],
+    write: TimedYm2612Write,
+) -> bool {
+    let Some(channel) = ym_key_channel_from_write(write.port, write.addr, write.value) else {
+        return false;
+    };
+    let delay_ticks = key_delay_ticks[channel];
+    if delay_ticks == 0 {
+        return false;
+    }
+
+    insert_timed_write_sorted(
+        queue,
+        TimedYm2612Write {
+            master_tick: write.master_tick.saturating_add(delay_ticks),
+            ..write
+        },
+    );
+    true
+}
+
+fn trigger_ym_channel_pan_edge_persistence(
+    side_memory: &[f32; 6],
+    pan_edge_carry: &mut [f32; 6],
+    pan_masks: &mut [u8; 6],
+    amounts: [f32; 6],
+    port: u8,
+    addr: u8,
+    value: u8,
+) {
+    let Some(channel) = ym_pan_channel_from_addr(port, addr) else {
+        return;
+    };
+
+    let next_mask = value & 0xC0;
+    if next_mask != 0xC0 {
+        pan_edge_carry[channel] += side_memory[channel] * amounts[channel];
+    }
+    pan_masks[channel] = next_mask;
+}
+
+fn mix_ym_channel_outputs_with_side_memory(
+    channel_samples: [(f32, f32); 6],
+    side_memory: &mut [f32; 6],
+    amounts: [f32; 6],
+    transient_mixes: [f32; 6],
+    sign_align_mixes: [f32; 6],
+    side_decay_factors: [f32; 6],
+    previous_side: &mut [f32; 6],
+    pan_edge_carry: &mut [f32; 6],
+    pan_edge_decay_factors: [f32; 6],
+) -> (f32, f32) {
+    let mut left_sum = 0.0f32;
+    let mut right_sum = 0.0f32;
+
+    for (idx, &(left, right)) in channel_samples.iter().enumerate() {
+        let (mid, side) = encode_mid_side(left, right);
+        let persisted_side = side_memory[idx];
+        let shaped_memory = align_side_polarity(side, persisted_side, sign_align_mixes[idx]);
+        let shaped_side = side + shaped_memory * amounts[idx] + pan_edge_carry[idx];
+        pan_edge_carry[idx] *= pan_edge_decay_factors[idx];
+        side_memory[idx] = side_memory_feed(side, previous_side[idx], transient_mixes[idx])
+            + persisted_side * side_decay_factors[idx];
+        previous_side[idx] = side;
+        let (shaped_left, shaped_right) = decode_mid_side(mid, shaped_side);
+        left_sum += shaped_left;
+        right_sum += shaped_right;
+    }
+
+    (left_sum, right_sum)
+}
+
+fn biquad_eq_filter_spec(stage: AudioEqStage, sample_rate_hz: f32) -> AudioFilterSpec {
+    match stage.kind {
+        AudioEqKind::LowShelf => {
+            biquad_low_shelf_filter_spec(stage.frequency_hz, stage.gain_db, stage.q, sample_rate_hz)
+        }
+        AudioEqKind::Peaking => {
+            biquad_peaking_filter_spec(stage.frequency_hz, stage.gain_db, stage.q, sample_rate_hz)
+        }
+        AudioEqKind::HighShelf => biquad_high_shelf_filter_spec(
+            stage.frequency_hz,
+            stage.gain_db,
+            stage.q,
+            sample_rate_hz,
+        ),
+    }
+}
+
+fn biquad_low_pass_filter_spec(cutoff_hz: f32, sample_rate_hz: f32) -> AudioFilterSpec {
+    let omega = 2.0 * std::f32::consts::PI * cutoff_hz / sample_rate_hz;
+    let alpha = omega.sin() * std::f32::consts::FRAC_1_SQRT_2;
+    let cos_omega = omega.cos();
+    let b0 = (1.0 - cos_omega) * 0.5;
+    let b1 = 1.0 - cos_omega;
+    let b2 = b0;
+    let a0 = 1.0 + alpha;
+    let a1 = -2.0 * cos_omega;
+    let a2 = 1.0 - alpha;
+
+    AudioFilterSpec::Biquad {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
+
+fn biquad_peaking_filter_spec(
+    frequency_hz: f32,
+    gain_db: f32,
+    q: f32,
+    sample_rate_hz: f32,
+) -> AudioFilterSpec {
+    let frequency_hz = frequency_hz.clamp(10.0, sample_rate_hz * 0.5 - 10.0);
+    let q = q.max(0.05);
+    let a = 10.0f32.powf(gain_db / 40.0);
+    let omega = 2.0 * std::f32::consts::PI * frequency_hz / sample_rate_hz;
+    let alpha = omega.sin() / (2.0 * q);
+    let cos_omega = omega.cos();
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * cos_omega;
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * cos_omega;
+    let a2 = 1.0 - alpha / a;
+    AudioFilterSpec::Biquad {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
+
+fn biquad_low_shelf_filter_spec(
+    frequency_hz: f32,
+    gain_db: f32,
+    slope: f32,
+    sample_rate_hz: f32,
+) -> AudioFilterSpec {
+    let frequency_hz = frequency_hz.clamp(10.0, sample_rate_hz * 0.5 - 10.0);
+    let slope = slope.max(0.05);
+    let a = 10.0f32.powf(gain_db / 40.0);
+    let omega = 2.0 * std::f32::consts::PI * frequency_hz / sample_rate_hz;
+    let sin_omega = omega.sin();
+    let cos_omega = omega.cos();
+    let alpha = sin_omega * (((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0).sqrt()) * 0.5;
+    let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+    let b0 = a * ((a + 1.0) - (a - 1.0) * cos_omega + two_sqrt_a_alpha);
+    let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_omega);
+    let b2 = a * ((a + 1.0) - (a - 1.0) * cos_omega - two_sqrt_a_alpha);
+    let a0 = (a + 1.0) + (a - 1.0) * cos_omega + two_sqrt_a_alpha;
+    let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_omega);
+    let a2 = (a + 1.0) + (a - 1.0) * cos_omega - two_sqrt_a_alpha;
+    AudioFilterSpec::Biquad {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
+
+fn biquad_high_shelf_filter_spec(
+    frequency_hz: f32,
+    gain_db: f32,
+    slope: f32,
+    sample_rate_hz: f32,
+) -> AudioFilterSpec {
+    let frequency_hz = frequency_hz.clamp(10.0, sample_rate_hz * 0.5 - 10.0);
+    let slope = slope.max(0.05);
+    let a = 10.0f32.powf(gain_db / 40.0);
+    let omega = 2.0 * std::f32::consts::PI * frequency_hz / sample_rate_hz;
+    let sin_omega = omega.sin();
+    let cos_omega = omega.cos();
+    let alpha = sin_omega * (((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0).sqrt()) * 0.5;
+    let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+    let b0 = a * ((a + 1.0) + (a - 1.0) * cos_omega + two_sqrt_a_alpha);
+    let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_omega);
+    let b2 = a * ((a + 1.0) + (a - 1.0) * cos_omega - two_sqrt_a_alpha);
+    let a0 = (a + 1.0) - (a - 1.0) * cos_omega + two_sqrt_a_alpha;
+    let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_omega);
+    let a2 = (a + 1.0) - (a - 1.0) * cos_omega - two_sqrt_a_alpha;
+    AudioFilterSpec::Biquad {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
 
 /// Commands that frontends send to drive the emulator.
 #[derive(Debug, Clone)]
@@ -60,6 +973,8 @@ pub enum Command {
     SetSpeed(u16),
     /// Set audio output sample rate in Hz (e.g. 44100, 48000).
     SetAudioSampleRate(u32),
+    /// Set post-mix analog/output profile and master gain.
+    SetAudioOutputConfig(AudioOutputConfig),
     /// Pause emulation.
     Pause,
     /// Resume emulation.
@@ -81,6 +996,262 @@ pub enum CoreQuery {
     FpsMilli,
     /// Frame counter.
     FrameCounter,
+}
+
+/// A YM2612 register write observed on the live machine timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedYm2612Write {
+    /// Absolute NTSC master-clock tick when the write reached the YM bus.
+    pub master_tick: u64,
+    /// Frame index when the write occurred.
+    pub frame: u64,
+    /// Scanline within the frame when the write occurred.
+    pub scanline: u16,
+    /// YM2612 port number: 0 for channels 1-3/global, 1 for channels 4-6.
+    pub port: u8,
+    /// YM2612 register address latched for the write.
+    pub addr: u8,
+    /// Register value written on the data port.
+    pub value: u8,
+}
+
+/// A PSG register write observed on the live machine timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedPsgWrite {
+    /// Absolute NTSC master-clock tick when the write reached the PSG bus.
+    pub master_tick: u64,
+    /// Frame index when the write occurred.
+    pub frame: u64,
+    /// Scanline within the frame when the write occurred.
+    pub scanline: u16,
+    /// PSG data byte written.
+    pub value: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FirstOrderLowPassFilter {
+    b0: f32,
+    b1: f32,
+    a1: f32,
+    prev_sample: f32,
+    prev_output: f32,
+}
+
+impl FirstOrderLowPassFilter {
+    const fn new(b0: f32, b1: f32, a1: f32) -> Self {
+        Self {
+            b0,
+            b1,
+            a1,
+            prev_sample: 0.0,
+            prev_output: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.prev_sample = 0.0;
+        self.prev_output = 0.0;
+    }
+
+    fn filter(&mut self, sample: f32) -> f32 {
+        let output = self.b0 * sample + self.b1 * self.prev_sample - self.a1 * self.prev_output;
+        self.prev_sample = sample;
+        self.prev_output = output;
+        output
+    }
+
+    const fn last_output(&self) -> f32 {
+        self.prev_output
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BiquadFilter {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    prev_sample_1: f32,
+    prev_sample_2: f32,
+    prev_output_1: f32,
+    prev_output_2: f32,
+}
+
+impl BiquadFilter {
+    const fn new(b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> Self {
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            prev_sample_1: 0.0,
+            prev_sample_2: 0.0,
+            prev_output_1: 0.0,
+            prev_output_2: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.prev_sample_1 = 0.0;
+        self.prev_sample_2 = 0.0;
+        self.prev_output_1 = 0.0;
+        self.prev_output_2 = 0.0;
+    }
+
+    fn filter(&mut self, sample: f32) -> f32 {
+        let output = self.b0 * sample + self.b1 * self.prev_sample_1 + self.b2 * self.prev_sample_2
+            - self.a1 * self.prev_output_1
+            - self.a2 * self.prev_output_2;
+        self.prev_sample_2 = self.prev_sample_1;
+        self.prev_sample_1 = sample;
+        self.prev_output_2 = self.prev_output_1;
+        self.prev_output_1 = output;
+        output
+    }
+
+    const fn last_output(&self) -> f32 {
+        self.prev_output_1
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FirFilter {
+    taps: [f32; 5],
+    history: [f32; 5],
+    last_output: f32,
+}
+
+impl FirFilter {
+    const fn new(taps: [f32; 5]) -> Self {
+        Self {
+            taps,
+            history: [0.0; 5],
+            last_output: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.history = [0.0; 5];
+        self.last_output = 0.0;
+    }
+
+    fn filter(&mut self, sample: f32) -> f32 {
+        self.history.copy_within(0..4, 1);
+        self.history[0] = sample;
+        let output = self
+            .taps
+            .iter()
+            .zip(self.history.iter())
+            .map(|(tap, sample)| tap * sample)
+            .sum();
+        self.last_output = output;
+        output
+    }
+
+    const fn last_output(&self) -> f32 {
+        self.last_output
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SampleDelay {
+    delay_samples: usize,
+    history: [f32; MAX_POST_DELAY_SAMPLES],
+    last_output: f32,
+}
+
+impl SampleDelay {
+    const fn new(delay_samples: u8) -> Self {
+        let delay_samples = if (delay_samples as usize) > MAX_POST_DELAY_SAMPLES {
+            MAX_POST_DELAY_SAMPLES
+        } else {
+            delay_samples as usize
+        };
+        Self {
+            delay_samples,
+            history: [0.0; MAX_POST_DELAY_SAMPLES],
+            last_output: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.history = [0.0; MAX_POST_DELAY_SAMPLES];
+        self.last_output = 0.0;
+    }
+
+    fn filter(&mut self, sample: f32) -> f32 {
+        if self.delay_samples == 0 {
+            self.last_output = sample;
+            return sample;
+        }
+
+        let output = self.history[self.delay_samples - 1];
+        if self.delay_samples > 1 {
+            self.history.copy_within(0..self.delay_samples - 1, 1);
+        }
+        self.history[0] = sample;
+        self.last_output = output;
+        output
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AudioFilterState {
+    Flat { last_output: f32 },
+    FirstOrder(FirstOrderLowPassFilter),
+    Biquad(BiquadFilter),
+    Fir(FirFilter),
+}
+
+impl AudioFilterState {
+    const fn flat() -> Self {
+        Self::Flat { last_output: 0.0 }
+    }
+
+    fn from_spec(spec: AudioFilterSpec) -> Self {
+        match spec {
+            AudioFilterSpec::Flat => Self::flat(),
+            AudioFilterSpec::FirstOrder { b0, b1, a1 } => {
+                Self::FirstOrder(FirstOrderLowPassFilter::new(b0, b1, a1))
+            }
+            AudioFilterSpec::Biquad { b0, b1, b2, a1, a2 } => {
+                Self::Biquad(BiquadFilter::new(b0, b1, b2, a1, a2))
+            }
+            AudioFilterSpec::Fir { taps } => Self::Fir(FirFilter::new(taps)),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Flat { last_output } => *last_output = 0.0,
+            Self::FirstOrder(filter) => filter.reset(),
+            Self::Biquad(filter) => filter.reset(),
+            Self::Fir(filter) => filter.reset(),
+        }
+    }
+
+    fn filter(&mut self, sample: f32) -> f32 {
+        match self {
+            Self::Flat { last_output } => {
+                *last_output = sample;
+                sample
+            }
+            Self::FirstOrder(filter) => filter.filter(sample),
+            Self::Biquad(filter) => filter.filter(sample),
+            Self::Fir(filter) => filter.filter(sample),
+        }
+    }
+
+    const fn last_output(&self) -> f32 {
+        match self {
+            Self::Flat { last_output } => *last_output,
+            Self::FirstOrder(filter) => filter.last_output(),
+            Self::Biquad(filter) => filter.last_output(),
+            Self::Fir(filter) => filter.last_output(),
+        }
+    }
 }
 
 /// The Genesis emulator core.
@@ -121,12 +1292,127 @@ pub struct GenesisCore {
     psg: psg::Psg,
     /// YM2612 FM synthesis chip.
     ym2612: ym2612::Ym2612,
+    /// Audio-path PSG state used for timed replay across scanlines.
+    audio_psg: psg::Psg,
+    /// Audio-path YM2612 state used for timed replay across scanlines.
+    audio_ym2612: ym2612::Ym2612,
     /// Accumulated audio samples for the current frame (stereo interleaved f32).
     audio_buffer: Vec<f32>,
     /// Fractional audio sample accumulator for sub-scanline sample timing.
     audio_sample_phase: f64,
     /// Output audio sample rate in Hz (default 44100).
     audio_sample_rate: f64,
+    /// YM2612 native sample phase accumulator for proper FM clocking.
+    ym_sample_phase: f64,
+    /// PSG native sample phase accumulator for proper PSG clocking.
+    psg_sample_phase: f64,
+    /// Post-mix analog/output settings shared with the timed replay harness.
+    audio_output_config: AudioOutputConfig,
+    /// YM output filters at the YM native rate.
+    ym_filter_left: AudioFilterState,
+    ym_filter_right: AudioFilterState,
+    /// PSG output filter at the PSG native rate.
+    psg_filter: AudioFilterState,
+    /// Optional post-mix high-pass stage for left channel.
+    post_high_pass_left: AudioFilterState,
+    /// Optional post-mix high-pass stage for right channel.
+    post_high_pass_right: AudioFilterState,
+    /// Optional post-mix low-pass stage for left channel.
+    post_low_pass_left: AudioFilterState,
+    /// Optional post-mix low-pass stage for right channel.
+    post_low_pass_right: AudioFilterState,
+    /// Optional first post-mix EQ stage for left channel.
+    post_eq_1_left: AudioFilterState,
+    /// Optional first post-mix EQ stage for right channel.
+    post_eq_1_right: AudioFilterState,
+    /// Optional second post-mix EQ stage for left channel.
+    post_eq_2_left: AudioFilterState,
+    /// Optional second post-mix EQ stage for right channel.
+    post_eq_2_right: AudioFilterState,
+    /// Optional third post-mix EQ stage for left channel.
+    post_eq_3_left: AudioFilterState,
+    /// Optional third post-mix EQ stage for right channel.
+    post_eq_3_right: AudioFilterState,
+    /// Optional fourth post-mix EQ stage for left channel.
+    post_eq_4_left: AudioFilterState,
+    /// Optional fourth post-mix EQ stage for right channel.
+    post_eq_4_right: AudioFilterState,
+    /// Optional fifth post-mix EQ stage for left channel.
+    post_eq_5_left: AudioFilterState,
+    /// Optional fifth post-mix EQ stage for right channel.
+    post_eq_5_right: AudioFilterState,
+    /// Optional first side-only EQ stage in mid/side space.
+    post_side_eq_1: AudioFilterState,
+    /// Optional second side-only EQ stage in mid/side space.
+    post_side_eq_2: AudioFilterState,
+    /// Optional short post-mix FIR stage for left channel.
+    post_fir_left: AudioFilterState,
+    /// Optional short post-mix FIR stage for right channel.
+    post_fir_right: AudioFilterState,
+    /// Optional post-mix sample delay for the left channel.
+    post_delay_left: SampleDelay,
+    /// Optional post-mix sample delay for the right channel.
+    post_delay_right: SampleDelay,
+    /// PSG mono mix contribution relative to YM.
+    audio_psg_mix: f32,
+    /// YM path gain applied after YM filtering, before final mix.
+    audio_ym_gain: f32,
+    /// PSG path gain applied after PSG filtering and baseline PSG mix.
+    audio_psg_gain: f32,
+    /// Per-YM-channel delayed side-memory amount applied before YM summing.
+    audio_ym_channel_side_memory_amounts: [f32; 6],
+    /// Per-YM-channel blend between sustained-side and transient-side memory feed.
+    audio_ym_channel_side_transient_mixes: [f32; 6],
+    /// Per-YM-channel blend between delayed polarity replay and current-polarity side lift.
+    audio_ym_channel_side_sign_align_mixes: [f32; 6],
+    /// Per-YM-channel side-memory decay coefficient at YM native rate.
+    audio_ym_channel_side_decay_factors: [f32; 6],
+    /// Per-YM-channel delay applied to YM key writes on the audio path.
+    audio_ym_channel_key_delay_ticks: [u64; 6],
+    /// Per-YM-channel pan-edge persistence impulse.
+    audio_ym_channel_pan_edge_amounts: [f32; 6],
+    /// Per-YM-channel pan-edge persistence decay coefficient at YM native rate.
+    audio_ym_channel_pan_edge_decay_factors: [f32; 6],
+    /// Stereo crossfeed amount after post-mix shaping, before master gain.
+    audio_stereo_crossfeed: f32,
+    /// Mid gain after crossfeed.
+    audio_mid_gain: f32,
+    /// Side gain after crossfeed.
+    audio_side_gain: f32,
+    /// Post-mix master gain before clamping.
+    audio_master_gain: f32,
+    /// Global wall-clock tick that audio has been synthesized through.
+    audio_master_tick: u64,
+    /// Total output samples emitted since the audio pipeline was reset.
+    audio_output_sample_count: u64,
+    /// Next output-sample boundary in master-clock ticks.
+    next_audio_output_tick: u64,
+    /// Next YM2612 native sample tick in master-clock ticks.
+    next_ym_tick: u64,
+    /// Next PSG native sample tick in master-clock ticks.
+    next_psg_tick: u64,
+    /// Partial YM accumulation for the current output-sample window.
+    ym_window_left_acc: f64,
+    ym_window_right_acc: f64,
+    ym_window_count: u32,
+    ym_channel_side_memory: [f32; 6],
+    ym_channel_previous_side: [f32; 6],
+    ym_channel_pan_edge_carry: [f32; 6],
+    ym_channel_pan_masks: [u8; 6],
+    audio_pending_ym_key_writes: Vec<TimedYm2612Write>,
+    /// Partial PSG accumulation for the current output-sample window.
+    psg_window_acc: f64,
+    psg_window_count: u32,
+    /// Debug: trace 68K writes to Z80 sound command byte (RAM[$1FFF]).
+    z80_cmd_trace: Vec<(u64, u8)>,
+    /// Debug: count 68K writes to Z80 driver area (RAM[0x0000-0x00FF]).
+    z80_driver_write_count: u32,
+    /// Debug: last frame a 68K write touched the Z80 driver area.
+    z80_driver_last_write_frame: u64,
+    /// Debug: YM2612 writes with absolute master-clock timestamps.
+    ym2612_timed_write_trace: Vec<TimedYm2612Write>,
+    /// Debug: PSG writes with absolute master-clock timestamps.
+    psg_timed_write_trace: Vec<TimedPsgWrite>,
     /// Frame counter.
     frame_count: u64,
     /// Emulation speed in permille.
@@ -136,10 +1422,108 @@ pub struct GenesisCore {
 }
 
 impl GenesisCore {
+    fn output_tick_for_sample(&self, sample_index: u64) -> u64 {
+        let rate = self.audio_sample_rate.round().max(1.0) as u64;
+        ((u128::from(sample_index) * u128::from(MASTER_CLOCK_NTSC) + u128::from(rate / 2))
+            / u128::from(rate)) as u64
+    }
+
+    fn rebuild_audio_output_pipeline(&mut self) {
+        let ym_native_rate_hz = MASTER_CLOCK_NTSC as f32 / YM_AUDIO_TICKS as f32;
+        let spec = self
+            .audio_output_config
+            .spec_for_rates(ym_native_rate_hz, self.audio_sample_rate as f32);
+        self.ym_filter_left = AudioFilterState::from_spec(spec.ym_filter);
+        self.ym_filter_right = AudioFilterState::from_spec(spec.ym_filter);
+        self.psg_filter = AudioFilterState::from_spec(spec.psg_filter);
+        self.post_high_pass_left = AudioFilterState::from_spec(spec.post_high_pass);
+        self.post_high_pass_right = AudioFilterState::from_spec(spec.post_high_pass);
+        self.post_low_pass_left = AudioFilterState::from_spec(spec.post_low_pass);
+        self.post_low_pass_right = AudioFilterState::from_spec(spec.post_low_pass);
+        self.post_eq_1_left = AudioFilterState::from_spec(spec.post_eq_1);
+        self.post_eq_1_right = AudioFilterState::from_spec(spec.post_eq_1);
+        self.post_eq_2_left = AudioFilterState::from_spec(spec.post_eq_2);
+        self.post_eq_2_right = AudioFilterState::from_spec(spec.post_eq_2);
+        self.post_eq_3_left = AudioFilterState::from_spec(spec.post_eq_3);
+        self.post_eq_3_right = AudioFilterState::from_spec(spec.post_eq_3);
+        self.post_eq_4_left = AudioFilterState::from_spec(spec.post_eq_4);
+        self.post_eq_4_right = AudioFilterState::from_spec(spec.post_eq_4);
+        self.post_eq_5_left = AudioFilterState::from_spec(spec.post_eq_5);
+        self.post_eq_5_right = AudioFilterState::from_spec(spec.post_eq_5);
+        self.post_side_eq_1 = AudioFilterState::from_spec(spec.post_side_eq_1);
+        self.post_side_eq_2 = AudioFilterState::from_spec(spec.post_side_eq_2);
+        self.post_fir_left = AudioFilterState::from_spec(spec.post_fir);
+        self.post_fir_right = AudioFilterState::from_spec(spec.post_fir);
+        self.post_delay_left = SampleDelay::new(spec.post_left_delay_samples);
+        self.post_delay_right = SampleDelay::new(spec.post_right_delay_samples);
+        self.audio_psg_mix = spec.psg_mix;
+        self.audio_ym_gain = spec.ym_gain;
+        self.audio_psg_gain = spec.psg_gain;
+        self.audio_ym_channel_side_memory_amounts = spec.ym_channel_side_memory_amounts;
+        self.audio_ym_channel_side_transient_mixes = spec.ym_channel_side_transient_mixes;
+        self.audio_ym_channel_side_sign_align_mixes = spec.ym_channel_side_sign_align_mixes;
+        self.audio_ym_channel_side_decay_factors = spec.ym_channel_side_decay_factors;
+        self.audio_ym_channel_key_delay_ticks = spec.ym_channel_key_delay_ticks;
+        self.audio_ym_channel_pan_edge_amounts = spec.ym_channel_pan_edge_amounts;
+        self.audio_ym_channel_pan_edge_decay_factors = spec.ym_channel_pan_edge_decay_factors;
+        self.audio_stereo_crossfeed = spec.stereo_crossfeed;
+        self.audio_mid_gain = spec.mid_gain;
+        self.audio_side_gain = spec.side_gain;
+        self.audio_master_gain = spec.master_gain;
+    }
+
+    fn reset_audio_resampler_state(&mut self) {
+        self.audio_buffer.clear();
+        self.audio_sample_phase = 0.0;
+        self.ym_sample_phase = 0.0;
+        self.psg_sample_phase = 0.0;
+        self.rebuild_audio_output_pipeline();
+        self.ym_filter_left.reset();
+        self.ym_filter_right.reset();
+        self.psg_filter.reset();
+        self.post_high_pass_left.reset();
+        self.post_high_pass_right.reset();
+        self.post_low_pass_left.reset();
+        self.post_low_pass_right.reset();
+        self.post_eq_1_left.reset();
+        self.post_eq_1_right.reset();
+        self.post_eq_2_left.reset();
+        self.post_eq_2_right.reset();
+        self.post_eq_3_left.reset();
+        self.post_eq_3_right.reset();
+        self.post_eq_4_left.reset();
+        self.post_eq_4_right.reset();
+        self.post_eq_5_left.reset();
+        self.post_eq_5_right.reset();
+        self.post_side_eq_1.reset();
+        self.post_side_eq_2.reset();
+        self.post_fir_left.reset();
+        self.post_fir_right.reset();
+        self.post_delay_left.reset();
+        self.post_delay_right.reset();
+        self.audio_master_tick = 0;
+        self.audio_output_sample_count = 0;
+        self.next_audio_output_tick = self.output_tick_for_sample(1);
+        self.next_ym_tick = YM_AUDIO_TICKS;
+        self.next_psg_tick = PSG_AUDIO_TICKS;
+        self.audio_ym2612 = self.ym2612.clone();
+        self.audio_psg = self.psg.clone();
+        self.ym_window_left_acc = 0.0;
+        self.ym_window_right_acc = 0.0;
+        self.ym_window_count = 0;
+        self.ym_channel_side_memory = [0.0; 6];
+        self.ym_channel_previous_side = [0.0; 6];
+        self.ym_channel_pan_edge_carry = [0.0; 6];
+        self.ym_channel_pan_masks = [0xC0; 6];
+        self.audio_pending_ym_key_writes.clear();
+        self.psg_window_acc = 0.0;
+        self.psg_window_count = 0;
+    }
+
     /// Creates a new Genesis core with no ROM loaded.
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        let mut core = Self {
             cpu: Cpu::new(),
             vdp: Vdp::new(),
             scheduler: Scheduler::new(),
@@ -155,15 +1539,79 @@ impl GenesisCore {
             z80_reset: true, // Z80 starts in reset
             z80_reset_pending: false,
             z80_bus_released_this_scanline: false,
+            z80_cmd_trace: Vec::new(),
+            z80_driver_write_count: 0,
+            z80_driver_last_write_frame: 0,
+            ym2612_timed_write_trace: Vec::new(),
+            psg_timed_write_trace: Vec::new(),
             psg: psg::Psg::new(),
             ym2612: ym2612::Ym2612::new(),
+            audio_psg: psg::Psg::new(),
+            audio_ym2612: ym2612::Ym2612::new(),
             audio_buffer: Vec::with_capacity(1600),
             audio_sample_phase: 0.0,
             audio_sample_rate: 44100.0,
+            ym_sample_phase: 0.0,
+            psg_sample_phase: 0.0,
+            audio_output_config: AudioOutputConfig::default(),
+            ym_filter_left: AudioFilterState::flat(),
+            ym_filter_right: AudioFilterState::flat(),
+            psg_filter: AudioFilterState::flat(),
+            post_high_pass_left: AudioFilterState::flat(),
+            post_high_pass_right: AudioFilterState::flat(),
+            post_low_pass_left: AudioFilterState::flat(),
+            post_low_pass_right: AudioFilterState::flat(),
+            post_eq_1_left: AudioFilterState::flat(),
+            post_eq_1_right: AudioFilterState::flat(),
+            post_eq_2_left: AudioFilterState::flat(),
+            post_eq_2_right: AudioFilterState::flat(),
+            post_eq_3_left: AudioFilterState::flat(),
+            post_eq_3_right: AudioFilterState::flat(),
+            post_eq_4_left: AudioFilterState::flat(),
+            post_eq_4_right: AudioFilterState::flat(),
+            post_eq_5_left: AudioFilterState::flat(),
+            post_eq_5_right: AudioFilterState::flat(),
+            post_side_eq_1: AudioFilterState::flat(),
+            post_side_eq_2: AudioFilterState::flat(),
+            post_fir_left: AudioFilterState::flat(),
+            post_fir_right: AudioFilterState::flat(),
+            post_delay_left: SampleDelay::new(0),
+            post_delay_right: SampleDelay::new(0),
+            audio_psg_mix: DEFAULT_PSG_MIX,
+            audio_ym_gain: 1.0,
+            audio_psg_gain: 1.0,
+            audio_ym_channel_side_memory_amounts: [0.0; 6],
+            audio_ym_channel_side_transient_mixes: [0.0; 6],
+            audio_ym_channel_side_sign_align_mixes: [0.0; 6],
+            audio_ym_channel_side_decay_factors: [0.0; 6],
+            audio_ym_channel_key_delay_ticks: [0; 6],
+            audio_ym_channel_pan_edge_amounts: [0.0; 6],
+            audio_ym_channel_pan_edge_decay_factors: [0.0; 6],
+            audio_stereo_crossfeed: 0.0,
+            audio_mid_gain: 1.0,
+            audio_side_gain: 1.0,
+            audio_master_gain: 1.0,
+            audio_master_tick: 0,
+            audio_output_sample_count: 0,
+            next_audio_output_tick: 0,
+            next_ym_tick: YM_AUDIO_TICKS,
+            next_psg_tick: PSG_AUDIO_TICKS,
+            ym_window_left_acc: 0.0,
+            ym_window_right_acc: 0.0,
+            ym_window_count: 0,
+            ym_channel_side_memory: [0.0; 6],
+            ym_channel_previous_side: [0.0; 6],
+            ym_channel_pan_edge_carry: [0.0; 6],
+            ym_channel_pan_masks: [0xC0; 6],
+            audio_pending_ym_key_writes: Vec::new(),
+            psg_window_acc: 0.0,
+            psg_window_count: 0,
             frame_count: 0,
             speed_permille: 1000,
             paused: false,
-        }
+        };
+        core.reset_audio_resampler_state();
+        core
     }
 
     /// Executes a command.
@@ -185,7 +1633,14 @@ impl GenesisCore {
                 self.controller_port_mut(port).release(button);
             }
             Command::SetSpeed(s) => self.speed_permille = s,
-            Command::SetAudioSampleRate(rate) => self.audio_sample_rate = f64::from(rate),
+            Command::SetAudioSampleRate(rate) => {
+                self.audio_sample_rate = f64::from(rate);
+                self.reset_audio_resampler_state();
+            }
+            Command::SetAudioOutputConfig(config) => {
+                self.audio_output_config = config;
+                self.reset_audio_resampler_state();
+            }
             Command::Pause => self.paused = true,
             Command::Resume => self.paused = false,
         }
@@ -201,6 +1656,30 @@ impl GenesisCore {
     #[must_use]
     pub fn frame_count(&self) -> u64 {
         self.frame_count
+    }
+
+    /// Returns the current NTSC master-clock tick count.
+    #[must_use]
+    pub fn master_ticks(&self) -> u64 {
+        self.scheduler.master_ticks()
+    }
+
+    /// Returns the wall-clock tick that audio has been synthesized through.
+    #[must_use]
+    pub fn audio_master_ticks(&self) -> u64 {
+        self.audio_master_tick
+    }
+
+    /// Returns the total number of output samples emitted by the audio pipeline.
+    #[must_use]
+    pub fn audio_output_sample_count(&self) -> u64 {
+        self.audio_output_sample_count
+    }
+
+    /// Returns the current post-mix output profile/gain settings.
+    #[must_use]
+    pub fn audio_output_config(&self) -> AudioOutputConfig {
+        self.audio_output_config
     }
 
     /// Returns the parsed ROM header, if a ROM is loaded.
@@ -275,6 +1754,42 @@ impl GenesisCore {
         self.z80_reset
     }
 
+    /// Returns a YM2612 diagnostic snapshot for debugging.
+    #[must_use]
+    pub fn ym2612_diagnostic(&self) -> ym2612::Ym2612Diag {
+        self.ym2612.diagnostic()
+    }
+
+    /// Returns the total number of YM2612 register writes.
+    pub fn ym2612_write_count(&self) -> u32 {
+        self.ym2612.write_count()
+    }
+
+    /// Returns the first N captured YM2612 register writes.
+    pub fn ym2612_write_trace(&self) -> &[(u8, u8, u8)] {
+        self.ym2612.write_trace()
+    }
+
+    /// Returns timed YM2612 writes captured from the live bus.
+    pub fn ym2612_timed_write_trace(&self) -> &[TimedYm2612Write] {
+        &self.ym2612_timed_write_trace
+    }
+
+    /// Clears the timed YM2612 write trace.
+    pub fn clear_ym2612_timed_write_trace(&mut self) {
+        self.ym2612_timed_write_trace.clear();
+    }
+
+    /// Returns timed PSG writes captured from the live bus.
+    pub fn psg_timed_write_trace(&self) -> &[TimedPsgWrite] {
+        &self.psg_timed_write_trace
+    }
+
+    /// Clears the timed PSG write trace.
+    pub fn clear_psg_timed_write_trace(&mut self) {
+        self.psg_timed_write_trace.clear();
+    }
+
     /// Returns a VDP snapshot for debugging.
     #[must_use]
     pub fn vdp_snapshot(&self) -> crate::vdp::VdpSnapshot {
@@ -291,6 +1806,29 @@ impl GenesisCore {
     #[must_use]
     pub fn z80_ram(&self) -> &[u8] {
         &*self.z80_ram
+    }
+
+    /// Returns the Z80 bank register value (bits 15-23 of banked ROM offset).
+    pub fn z80_bank(&self) -> u32 {
+        self.z80_bank
+    }
+
+    /// Read a byte from the ROM at an absolute offset (for debugging).
+    pub fn rom_byte(&self, offset: usize) -> u8 {
+        self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    /// Returns 68K writes to Z80 RAM[$1FFF] (sound command byte): (frame, value).
+    pub fn z80_cmd_trace(&self) -> &[(u64, u8)] {
+        &self.z80_cmd_trace
+    }
+
+    /// Returns debug info: (total 68K writes to Z80 driver area, last frame written).
+    pub fn z80_driver_write_info(&self) -> (u32, u64) {
+        (
+            self.z80_driver_write_count,
+            self.z80_driver_last_write_frame,
+        )
     }
 
     // --- Internal ---
@@ -321,10 +1859,14 @@ impl GenesisCore {
         self.z80_reset = true;
         self.z80_reset_pending = false;
         self.z80_bus_released_this_scanline = false;
+        self.z80_cmd_trace.clear();
+        self.z80_driver_write_count = 0;
+        self.z80_driver_last_write_frame = 0;
+        self.ym2612_timed_write_trace.clear();
+        self.psg_timed_write_trace.clear();
         self.psg = psg::Psg::new();
         self.ym2612 = ym2612::Ym2612::new();
-        self.audio_buffer.clear();
-        self.audio_sample_phase = 0.0;
+        self.reset_audio_resampler_state();
         self.frame_count = 0;
 
         // 68000 boot: read SSP from 0x000000, PC from 0x000004
@@ -345,7 +1887,7 @@ impl GenesisCore {
         self.cpu.stopped = false;
     }
 
-    fn step_cpu(&mut self) {
+    fn step_cpu_at(&mut self, scanline: u16, master_tick: u64) {
         if self.cpu.halted || self.cpu.stopped {
             return;
         }
@@ -368,12 +1910,24 @@ impl GenesisCore {
             z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
             ym2612: &mut self.ym2612,
             psg: &mut self.psg,
+            z80_cmd_trace: &mut self.z80_cmd_trace,
+            z80_driver_write_count: &mut self.z80_driver_write_count,
+            z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
+            ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+            psg_timed_write_trace: &mut self.psg_timed_write_trace,
+            frame_count: self.frame_count,
+            scanline,
+            master_tick,
         };
 
         let cycles = cpu::execute_instruction(&mut self.cpu, opcode, &mut bus);
         let cycles_u64 = u64::from(cycles);
         self.cpu.cycles += cycles_u64;
         self.scheduler.advance_cpu(cycles_u64);
+    }
+
+    fn step_cpu(&mut self) {
+        self.step_cpu_at(self.vdp.scanline(), self.scheduler.master_ticks());
     }
 
     fn step_scanline(&mut self) {
@@ -392,6 +1946,23 @@ impl GenesisCore {
         }
     }
 
+    fn step_scanline_with_timing(&mut self, scanline: u16, scanline_start_tick: u64) -> u64 {
+        let target = self.cpu.cycles + 488;
+        let cpu_cycle_base = self.cpu.cycles;
+        while self.cpu.cycles < target {
+            let instruction_tick =
+                scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
+            self.step_cpu_at(scanline, instruction_tick);
+            if self.vdp.dma_pending() {
+                self.execute_vdp_dma();
+            }
+            if self.cpu.halted || self.cpu.stopped {
+                break;
+            }
+        }
+        cpu_cycle_base
+    }
+
     fn step_frame(&mut self) {
         if self.paused {
             return;
@@ -400,10 +1971,15 @@ impl GenesisCore {
         // Clear audio buffer at frame start
         self.audio_buffer.clear();
 
-        // Clear V-blank at frame start
+        // Clear V-blank at frame start and de-assert Z80 INT
         self.vdp.set_vblank(false);
+        self.z80.int_line = false;
 
         for scanline in 0..SCANLINES_PER_FRAME {
+            let scanline_start_tick = self.audio_master_tick;
+            let ym_trace_start = self.ym2612_timed_write_trace.len();
+            let psg_trace_start = self.psg_timed_write_trace.len();
+
             // Begin scanline timing
             self.vdp.begin_scanline(scanline);
 
@@ -411,7 +1987,7 @@ impl GenesisCore {
             self.z80_bus_released_this_scanline = false;
 
             // Run CPU for this scanline
-            self.step_scanline();
+            let cpu_cycle_base = self.step_scanline_with_timing(scanline, scanline_start_tick);
 
             // Handle Z80 reset: when reset is de-asserted, restart Z80 from PC=0
             if self.z80_reset_pending {
@@ -428,12 +2004,14 @@ impl GenesisCore {
             let z80_gets_cycles =
                 !self.z80_reset && (!self.z80_bus_requested || self.z80_bus_released_this_scanline);
             if z80_gets_cycles {
-                self.step_z80_scanline();
+                self.step_z80_scanline_with_timing(scanline, scanline_start_tick);
             }
 
             // Check for H-interrupt (level 4)
             if self.vdp.h_interrupt_pending() {
                 self.vdp.clear_h_interrupt();
+                let cpu_master_tick =
+                    scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                 let mut bus = CoreBus {
                     rom: &self.rom,
                     work_ram: &mut self.work_ram,
@@ -447,6 +2025,14 @@ impl GenesisCore {
                     z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                     ym2612: &mut self.ym2612,
                     psg: &mut self.psg,
+                    z80_cmd_trace: &mut self.z80_cmd_trace,
+                    z80_driver_write_count: &mut self.z80_driver_write_count,
+                    z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
+                    ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+                    psg_timed_write_trace: &mut self.psg_timed_write_trace,
+                    frame_count: self.frame_count,
+                    scanline,
+                    master_tick: cpu_master_tick,
                 };
                 let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 4);
                 self.cpu.cycles += u64::from(cycles);
@@ -461,10 +2047,16 @@ impl GenesisCore {
             // At scanline 224: enter V-blank and fire V-blank interrupt
             if scanline == ACTIVE_SCANLINES {
                 self.vdp.set_vblank(true);
+                // Assert Z80 INT — the Genesis directly connects this to V-blank.
+                // The Z80 will service it on its next stepping opportunity when
+                // IFF1 is enabled (the SMPS driver relies on this for music updates).
+                self.z80.int_line = true;
 
                 // Fire level 6 interrupt if V-interrupt is enabled (reg 1, bit 5)
                 let vint_enabled = self.vdp.read_register(1) & 0x20 != 0;
                 if vint_enabled {
+                    let cpu_master_tick =
+                        scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                     let mut bus = CoreBus {
                         rom: &self.rom,
                         work_ram: &mut self.work_ram,
@@ -478,6 +2070,14 @@ impl GenesisCore {
                         z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                         ym2612: &mut self.ym2612,
                         psg: &mut self.psg,
+                        z80_cmd_trace: &mut self.z80_cmd_trace,
+                        z80_driver_write_count: &mut self.z80_driver_write_count,
+                        z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
+                        ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+                        psg_timed_write_trace: &mut self.psg_timed_write_trace,
+                        frame_count: self.frame_count,
+                        scanline,
+                        master_tick: cpu_master_tick,
                     };
                     let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
                     self.cpu.cycles += u64::from(cycles);
@@ -485,8 +2085,14 @@ impl GenesisCore {
                 }
             }
 
-            // Collect audio samples for this scanline
-            self.collect_audio_samples();
+            let ym_writes = self.ym2612_timed_write_trace[ym_trace_start..].to_vec();
+            let psg_writes = self.psg_timed_write_trace[psg_trace_start..].to_vec();
+            self.synthesize_audio_interval(
+                &ym_writes,
+                &psg_writes,
+                scanline_start_tick,
+                scanline_start_tick + MASTER_TICKS_PER_SCANLINE,
+            );
         }
 
         self.vdp.end_frame();
@@ -506,57 +2112,278 @@ impl GenesisCore {
         self.audio_buffer.clear();
     }
 
-    /// Steps the Z80 for one scanline (~228 T-states).
-    fn step_z80_scanline(&mut self) {
-        // Z80 @ master/15 = ~3.58 MHz. Per scanline = 3416 master clocks / 15 ~ 228 T-states
+    fn step_z80_scanline_with_timing(&mut self, scanline: u16, scanline_start_tick: u64) {
         let target = self.z80.cycles + 228;
+        let z80_cycle_base = self.z80.cycles;
         while self.z80.cycles < target {
+            {
+                let mut bus = Z80Bus {
+                    z80_ram: &mut self.z80_ram,
+                    rom: &self.rom,
+                    z80_bank: &mut self.z80_bank,
+                    ym2612: &mut self.ym2612,
+                    psg: &mut self.psg,
+                    ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+                    psg_timed_write_trace: &mut self.psg_timed_write_trace,
+                    frame_count: self.frame_count,
+                    scanline,
+                    master_tick: scanline_start_tick
+                        + (self.z80.cycles - z80_cycle_base) * MASTER_PER_Z80,
+                };
+                let int_cycles = z80::execute::accept_interrupt(&mut self.z80, &mut bus);
+                if int_cycles > 0 {
+                    self.z80.cycles += u64::from(int_cycles);
+                    continue;
+                }
+            }
+
             if self.z80.halted {
                 self.z80.cycles = target;
                 break;
             }
+
             let mut bus = Z80Bus {
                 z80_ram: &mut self.z80_ram,
                 rom: &self.rom,
                 z80_bank: &mut self.z80_bank,
                 ym2612: &mut self.ym2612,
                 psg: &mut self.psg,
+                ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+                psg_timed_write_trace: &mut self.psg_timed_write_trace,
+                frame_count: self.frame_count,
+                scanline,
+                master_tick: scanline_start_tick
+                    + (self.z80.cycles - z80_cycle_base) * MASTER_PER_Z80,
             };
             let cycles = z80::execute_instruction(&mut self.z80, &mut bus);
             self.z80.cycles += u64::from(cycles);
         }
     }
 
-    /// Collects audio samples for one scanline.
-    ///
-    /// Called at the end of each scanline in `step_frame`. Generates
-    /// approximately 2.81 stereo sample pairs per scanline, yielding
-    /// ~736 pairs per frame at 44100 Hz.
-    fn collect_audio_samples(&mut self) {
-        // samples_per_scanline = sample_rate / (262 lines * 59.92 fps)
-        self.audio_sample_phase += self.audio_sample_rate / (262.0 * 59.92);
+    fn clock_ym_audio_sample(&mut self, ym: &mut ym2612::Ym2612) {
+        let channel_samples = ym.output_sample_per_channel();
+        let (left, right) = mix_ym_channel_outputs_with_side_memory(
+            channel_samples,
+            &mut self.ym_channel_side_memory,
+            self.audio_ym_channel_side_memory_amounts,
+            self.audio_ym_channel_side_transient_mixes,
+            self.audio_ym_channel_side_sign_align_mixes,
+            self.audio_ym_channel_side_decay_factors,
+            &mut self.ym_channel_previous_side,
+            &mut self.ym_channel_pan_edge_carry,
+            self.audio_ym_channel_pan_edge_decay_factors,
+        );
+        let filtered_left = self.ym_filter_left.filter(left);
+        let filtered_right = self.ym_filter_right.filter(right);
 
-        while self.audio_sample_phase >= 1.0 {
-            self.audio_sample_phase -= 1.0;
+        self.ym_window_left_acc += f64::from(filtered_left);
+        self.ym_window_right_acc += f64::from(filtered_right);
+        self.ym_window_count += 1;
+        self.next_ym_tick += YM_AUDIO_TICKS;
+    }
 
-            // Clock PSG: 3_579_545 Hz / sample_rate ticks per output sample
-            let psg_ticks = (3_579_545.0 / self.audio_sample_rate).round() as u32;
-            for _ in 0..psg_ticks {
-                self.psg.clock_tick();
+    fn clock_psg_audio_sample(&mut self, psg: &mut psg::Psg) {
+        psg.clock_tick();
+        self.psg_window_acc += f64::from(self.psg_filter.filter(psg.sample()));
+        self.psg_window_count += 1;
+        self.next_psg_tick += PSG_AUDIO_TICKS;
+    }
+
+    fn push_audio_output_sample(&mut self, _psg: &psg::Psg) {
+        let filtered_left = if self.ym_window_count > 0 {
+            (self.ym_window_left_acc / self.ym_window_count as f64) as f32
+        } else {
+            self.ym_filter_left.last_output()
+        };
+        let filtered_right = if self.ym_window_count > 0 {
+            (self.ym_window_right_acc / self.ym_window_count as f64) as f32
+        } else {
+            self.ym_filter_right.last_output()
+        };
+        let psg_out = if self.psg_window_count > 0 {
+            (self.psg_window_acc / self.psg_window_count as f64) as f32
+        } else {
+            self.psg_filter.last_output()
+        };
+
+        let ym_left = filtered_left * self.audio_ym_gain;
+        let ym_right = filtered_right * self.audio_ym_gain;
+        let psg_mixed = psg_out * self.audio_psg_mix * self.audio_psg_gain;
+        let mixed_left = ym_left + psg_mixed;
+        let mixed_right = ym_right + psg_mixed;
+        let shaped_left = self.post_eq_5_left.filter(
+            self.post_eq_4_left.filter(
+                self.post_eq_3_left.filter(
+                    self.post_eq_2_left.filter(
+                        self.post_eq_1_left.filter(
+                            self.post_low_pass_left
+                                .filter(self.post_high_pass_left.filter(mixed_left)),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        let shaped_right = self.post_eq_5_right.filter(
+            self.post_eq_4_right.filter(
+                self.post_eq_3_right.filter(
+                    self.post_eq_2_right.filter(
+                        self.post_eq_1_right.filter(
+                            self.post_low_pass_right
+                                .filter(self.post_high_pass_right.filter(mixed_right)),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        let (crossfed_left, crossfed_right) =
+            apply_stereo_crossfeed(shaped_left, shaped_right, self.audio_stereo_crossfeed);
+        let (mid, side) = encode_mid_side(crossfed_left, crossfed_right);
+        let shaped_mid = mid * self.audio_mid_gain;
+        let shaped_side = self
+            .post_side_eq_2
+            .filter(self.post_side_eq_1.filter(side * self.audio_side_gain));
+        let (ms_left, ms_right) = decode_mid_side(shaped_mid, shaped_side);
+        let fir_left = self.post_fir_left.filter(ms_left);
+        let fir_right = self.post_fir_right.filter(ms_right);
+        let delayed_left = self.post_delay_left.filter(fir_left);
+        let delayed_right = self.post_delay_right.filter(fir_right);
+        let left = delayed_left * self.audio_master_gain;
+        let right = delayed_right * self.audio_master_gain;
+        self.audio_buffer.push(left.clamp(-1.0, 1.0));
+        self.audio_buffer.push(right.clamp(-1.0, 1.0));
+
+        self.ym_window_left_acc = 0.0;
+        self.ym_window_right_acc = 0.0;
+        self.ym_window_count = 0;
+        self.psg_window_acc = 0.0;
+        self.psg_window_count = 0;
+        self.audio_output_sample_count += 1;
+        self.next_audio_output_tick =
+            self.output_tick_for_sample(self.audio_output_sample_count + 1);
+    }
+
+    fn synthesize_audio_interval(
+        &mut self,
+        ym_writes: &[TimedYm2612Write],
+        psg_writes: &[TimedPsgWrite],
+        start_tick: u64,
+        end_tick: u64,
+    ) {
+        debug_assert_eq!(self.audio_master_tick, start_tick);
+
+        let mut ym = self.audio_ym2612.clone();
+        let mut psg = self.audio_psg.clone();
+        let mut ym_idx = 0usize;
+        let mut psg_idx = 0usize;
+
+        loop {
+            let next_write_is_ym = match (ym_writes.get(ym_idx), psg_writes.get(psg_idx)) {
+                (Some(ym), Some(psg)) => ym.master_tick <= psg.master_tick,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => true,
+            };
+            let next_write_tick = if next_write_is_ym {
+                ym_writes.get(ym_idx).map(|write| write.master_tick)
+            } else {
+                psg_writes.get(psg_idx).map(|write| write.master_tick)
+            };
+            let next_delayed_key_tick = self
+                .audio_pending_ym_key_writes
+                .first()
+                .map(|write| write.master_tick);
+
+            if self.next_audio_output_tick <= end_tick
+                && next_write_tick.is_none_or(|tick| self.next_audio_output_tick <= tick)
+                && next_delayed_key_tick.is_none_or(|tick| self.next_audio_output_tick <= tick)
+                && self.next_audio_output_tick <= self.next_ym_tick
+                && self.next_audio_output_tick <= self.next_psg_tick
+            {
+                self.push_audio_output_sample(&psg);
+                continue;
             }
 
-            // Get YM2612 output (also advances timers internally)
-            let (ym_l, ym_r) = self.ym2612.output_sample();
+            if let Some(write_tick) = next_delayed_key_tick {
+                if write_tick < end_tick
+                    && write_tick < self.next_audio_output_tick
+                    && write_tick <= self.next_ym_tick
+                    && write_tick <= self.next_psg_tick
+                    && next_write_tick.is_none_or(|tick| write_tick <= tick)
+                {
+                    let write = self.audio_pending_ym_key_writes.remove(0);
+                    ym.write_address(write.port, write.addr);
+                    ym.write_data(write.port, write.value);
+                    continue;
+                }
+            }
 
-            // Get PSG output
-            let psg_out = self.psg.sample();
+            if let Some(write_tick) = next_write_tick {
+                if write_tick < end_tick
+                    && write_tick < self.next_audio_output_tick
+                    && write_tick <= self.next_ym_tick
+                    && write_tick <= self.next_psg_tick
+                {
+                    if next_write_is_ym {
+                        let write = ym_writes[ym_idx];
+                        if !maybe_delay_ym_key_write(
+                            &mut self.audio_pending_ym_key_writes,
+                            self.audio_ym_channel_key_delay_ticks,
+                            write,
+                        ) {
+                            ym.write_address(write.port, write.addr);
+                            trigger_ym_channel_pan_edge_persistence(
+                                &self.ym_channel_side_memory,
+                                &mut self.ym_channel_pan_edge_carry,
+                                &mut self.ym_channel_pan_masks,
+                                self.audio_ym_channel_pan_edge_amounts,
+                                write.port,
+                                write.addr,
+                                write.value,
+                            );
+                            ym.write_data(write.port, write.value);
+                        }
+                        ym_idx += 1;
+                    } else {
+                        psg.write(psg_writes[psg_idx].value);
+                        psg_idx += 1;
+                    }
+                    continue;
+                }
+            }
 
-            // Mix: YM2612 stereo + PSG mono (into both channels)
-            let left = (ym_l + psg_out * 0.5).clamp(-1.0, 1.0);
-            let right = (ym_r + psg_out * 0.5).clamp(-1.0, 1.0);
-            self.audio_buffer.push(left);
-            self.audio_buffer.push(right);
+            if self.next_ym_tick < end_tick
+                && self.next_ym_tick < self.next_audio_output_tick
+                && next_write_tick.is_none_or(|tick| self.next_ym_tick < tick)
+                && next_delayed_key_tick.is_none_or(|tick| self.next_ym_tick < tick)
+                && self.next_ym_tick <= self.next_psg_tick
+            {
+                self.clock_ym_audio_sample(&mut ym);
+                continue;
+            }
+
+            if self.next_psg_tick < end_tick
+                && self.next_psg_tick < self.next_audio_output_tick
+                && next_write_tick.is_none_or(|tick| self.next_psg_tick < tick)
+                && next_delayed_key_tick.is_none_or(|tick| self.next_psg_tick < tick)
+            {
+                self.clock_psg_audio_sample(&mut psg);
+                continue;
+            }
+
+            break;
         }
+
+        self.audio_ym2612 = ym;
+        self.audio_psg = psg;
+        self.audio_master_tick = end_tick;
+    }
+
+    /// Collects audio samples for one scanline.
+    #[cfg(test)]
+    fn collect_audio_samples(&mut self) {
+        let start_tick = self.audio_master_tick;
+        let end_tick = start_tick + MASTER_TICKS_PER_SCANLINE;
+        self.synthesize_audio_interval(&[], &[], start_tick, end_tick);
     }
 
     /// Executes a pending VDP DMA transfer by providing a bus read callback.
@@ -723,6 +2550,39 @@ struct CoreBus<'a> {
     z80_bus_released_this_scanline: &'a mut bool,
     ym2612: &'a mut ym2612::Ym2612,
     psg: &'a mut psg::Psg,
+    z80_cmd_trace: &'a mut Vec<(u64, u8)>,
+    z80_driver_write_count: &'a mut u32,
+    z80_driver_last_write_frame: &'a mut u64,
+    ym2612_timed_write_trace: &'a mut Vec<TimedYm2612Write>,
+    psg_timed_write_trace: &'a mut Vec<TimedPsgWrite>,
+    frame_count: u64,
+    scanline: u16,
+    master_tick: u64,
+}
+
+impl CoreBus<'_> {
+    fn write_ym2612_data(&mut self, port: u8, value: u8) {
+        let addr = self.ym2612.latched_address(port);
+        self.ym2612_timed_write_trace.push(TimedYm2612Write {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            port,
+            addr,
+            value,
+        });
+        self.ym2612.write_data(port, value);
+    }
+
+    fn write_psg(&mut self, value: u8) {
+        self.psg_timed_write_trace.push(TimedPsgWrite {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            value,
+        });
+        self.psg.write(value);
+    }
 }
 
 impl Bus for CoreBus<'_> {
@@ -877,12 +2737,21 @@ impl Bus for CoreBus<'_> {
             bus::BusRegion::Z80Area => {
                 let z80_addr = addr & 0xFFFF;
                 match z80_addr {
-                    0x0000..=0x1FFF => self.z80_ram[z80_addr as usize] = val,
+                    0x0000..=0x1FFF => {
+                        if z80_addr == 0x1FFF && self.z80_cmd_trace.len() < 100 {
+                            self.z80_cmd_trace.push((self.frame_count, val));
+                        }
+                        if z80_addr <= 0x00FF {
+                            *self.z80_driver_write_count += 1;
+                            *self.z80_driver_last_write_frame = self.frame_count;
+                        }
+                        self.z80_ram[z80_addr as usize] = val;
+                    }
                     0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize] = val,
                     0x4000 => self.ym2612.write_address(0, val),
-                    0x4001 => self.ym2612.write_data(0, val),
+                    0x4001 => self.write_ym2612_data(0, val),
                     0x4002 => self.ym2612.write_address(1, val),
-                    0x4003 => self.ym2612.write_data(1, val),
+                    0x4003 => self.write_ym2612_data(1, val),
                     _ => {}
                 }
             }
@@ -911,7 +2780,7 @@ impl Bus for CoreBus<'_> {
                 let vdp_addr = addr & 0x1F;
                 match vdp_addr {
                     0x11 | 0x13 | 0x15 | 0x17 => {
-                        self.psg.write(val);
+                        self.write_psg(val);
                     }
                     _ => {}
                 }
@@ -956,6 +2825,10 @@ impl Bus for CoreBus<'_> {
                 let lo = val as u8;
                 match z80_addr {
                     0x0000..=0x1FFF => {
+                        if z80_addr <= 0x00FF {
+                            *self.z80_driver_write_count += 2;
+                            *self.z80_driver_last_write_frame = self.frame_count;
+                        }
                         self.z80_ram[z80_addr as usize] = hi;
                         self.z80_ram[((z80_addr + 1) & 0x1FFF) as usize] = lo;
                     }
@@ -966,11 +2839,11 @@ impl Bus for CoreBus<'_> {
                     }
                     0x4000 => {
                         self.ym2612.write_address(0, hi);
-                        self.ym2612.write_data(0, lo);
+                        self.write_ym2612_data(0, lo);
                     }
                     0x4002 => {
                         self.ym2612.write_address(1, hi);
-                        self.ym2612.write_data(1, lo);
+                        self.write_ym2612_data(1, lo);
                     }
                     _ => {}
                 }
@@ -1011,6 +2884,36 @@ struct Z80Bus<'a> {
     z80_bank: &'a mut u32,
     ym2612: &'a mut ym2612::Ym2612,
     psg: &'a mut psg::Psg,
+    ym2612_timed_write_trace: &'a mut Vec<TimedYm2612Write>,
+    psg_timed_write_trace: &'a mut Vec<TimedPsgWrite>,
+    frame_count: u64,
+    scanline: u16,
+    master_tick: u64,
+}
+
+impl Z80Bus<'_> {
+    fn write_ym2612_data(&mut self, port: u8, value: u8) {
+        let addr = self.ym2612.latched_address(port);
+        self.ym2612_timed_write_trace.push(TimedYm2612Write {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            port,
+            addr,
+            value,
+        });
+        self.ym2612.write_data(port, value);
+    }
+
+    fn write_psg(&mut self, value: u8) {
+        self.psg_timed_write_trace.push(TimedPsgWrite {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            value,
+        });
+        self.psg.write(value);
+    }
 }
 
 impl z80::execute::Bus for Z80Bus<'_> {
@@ -1033,15 +2936,15 @@ impl z80::execute::Bus for Z80Bus<'_> {
             0x0000..=0x1FFF => self.z80_ram[addr as usize] = val,
             0x2000..=0x3FFF => self.z80_ram[(addr & 0x1FFF) as usize] = val,
             0x4000 => self.ym2612.write_address(0, val),
-            0x4001 => self.ym2612.write_data(0, val),
+            0x4001 => self.write_ym2612_data(0, val),
             0x4002 => self.ym2612.write_address(1, val),
-            0x4003 => self.ym2612.write_data(1, val),
+            0x4003 => self.write_ym2612_data(1, val),
             0x6000..=0x60FF => {
                 // Bank register: shift in one bit at a time (bit 0 of val),
                 // 9 bits forming bits 15-23 of the ROM address.
                 *self.z80_bank = ((*self.z80_bank >> 1) | ((u32::from(val) & 1) << 23)) & 0xFF8000;
             }
-            0x7F00..=0x7FFF => self.psg.write(val),
+            0x7F00..=0x7FFF => self.write_psg(val),
             _ => {}
         }
     }
@@ -1062,11 +2965,633 @@ impl Default for GenesisCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::z80::execute::Bus as _;
+
+    fn core_bus_with_master_tick<'a>(core: &'a mut GenesisCore, master_tick: u64) -> CoreBus<'a> {
+        let scanline = core.vdp.scanline();
+        CoreBus {
+            rom: &core.rom,
+            work_ram: &mut core.work_ram,
+            vdp: &mut core.vdp,
+            port1: &mut core.port1,
+            port2: &mut core.port2,
+            z80_ram: &mut core.z80_ram,
+            z80_bus_requested: &mut core.z80_bus_requested,
+            z80_reset: &mut core.z80_reset,
+            z80_reset_pending: &mut core.z80_reset_pending,
+            z80_bus_released_this_scanline: &mut core.z80_bus_released_this_scanline,
+            ym2612: &mut core.ym2612,
+            psg: &mut core.psg,
+            z80_cmd_trace: &mut core.z80_cmd_trace,
+            z80_driver_write_count: &mut core.z80_driver_write_count,
+            z80_driver_last_write_frame: &mut core.z80_driver_last_write_frame,
+            ym2612_timed_write_trace: &mut core.ym2612_timed_write_trace,
+            psg_timed_write_trace: &mut core.psg_timed_write_trace,
+            frame_count: core.frame_count,
+            scanline,
+            master_tick,
+        }
+    }
+
+    fn z80_bus_with_master_tick<'a>(core: &'a mut GenesisCore, master_tick: u64) -> Z80Bus<'a> {
+        Z80Bus {
+            z80_ram: &mut core.z80_ram,
+            rom: &core.rom,
+            z80_bank: &mut core.z80_bank,
+            ym2612: &mut core.ym2612,
+            psg: &mut core.psg,
+            ym2612_timed_write_trace: &mut core.ym2612_timed_write_trace,
+            psg_timed_write_trace: &mut core.psg_timed_write_trace,
+            frame_count: core.frame_count,
+            scanline: core.vdp.scanline(),
+            master_tick,
+        }
+    }
+
+    fn write_ym_reg(ym: &mut ym2612::Ym2612, bank: u8, addr: u8, val: u8) {
+        ym.write_address(bank, addr);
+        ym.write_data(bank, val);
+    }
+
+    fn configure_two_op_fm_tone(ym: &mut ym2612::Ym2612) {
+        // Match the test-harness two-op FM probe: algorithm 4, op1->op2 pair active.
+        write_ym_reg(ym, 0, 0xB0, 0x04);
+        write_ym_reg(ym, 0, 0xB4, 0xC0);
+
+        write_ym_reg(ym, 0, 0x40, 127);
+        write_ym_reg(ym, 0, 0x44, 127);
+        write_ym_reg(ym, 0, 0x48, 127);
+        write_ym_reg(ym, 0, 0x4C, 127);
+
+        write_ym_reg(ym, 0, 0x30, 0x01);
+        write_ym_reg(ym, 0, 0x40, 0x00);
+        write_ym_reg(ym, 0, 0x50, 31);
+        write_ym_reg(ym, 0, 0x60, 0x00);
+        write_ym_reg(ym, 0, 0x70, 0x00);
+        write_ym_reg(ym, 0, 0x80, 0x0F);
+
+        write_ym_reg(ym, 0, 0x38, 0x01);
+        write_ym_reg(ym, 0, 0x48, 0x00);
+        write_ym_reg(ym, 0, 0x58, 31);
+        write_ym_reg(ym, 0, 0x68, 0x00);
+        write_ym_reg(ym, 0, 0x78, 0x00);
+        write_ym_reg(ym, 0, 0x88, 0x0F);
+
+        write_ym_reg(ym, 0, 0xA4, (4 << 3) | ((653 >> 8) as u8 & 0x07));
+        write_ym_reg(ym, 0, 0xA0, (653 & 0xFF) as u8);
+        write_ym_reg(ym, 0, 0x28, 0x30);
+    }
+
+    fn cross_correlation(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        if n == 0 {
+            return 0.0;
+        }
+
+        let mean_a: f64 = a[..n].iter().map(|&x| f64::from(x)).sum::<f64>() / n as f64;
+        let mean_b: f64 = b[..n].iter().map(|&x| f64::from(x)).sum::<f64>() / n as f64;
+
+        let mut cov = 0.0f64;
+        let mut var_a = 0.0f64;
+        let mut var_b = 0.0f64;
+
+        for i in 0..n {
+            let da = f64::from(a[i]) - mean_a;
+            let db = f64::from(b[i]) - mean_b;
+            cov += da * db;
+            var_a += da * da;
+            var_b += db * db;
+        }
+
+        if var_a < 1e-12 || var_b < 1e-12 {
+            return 0.0;
+        }
+
+        (cov / (var_a * var_b).sqrt()) as f32
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+
+        let sum_sq: f64 = samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+        (sum_sq / samples.len() as f64).sqrt() as f32
+    }
+
+    fn render_reference_fm_audio(sample_count: usize) -> Vec<f32> {
+        const YM_NATIVE_RATE: f64 = 7_670_454.0 / 144.0;
+        const OUTPUT_RATE: f64 = 44_100.0;
+
+        let mut ym = ym2612::Ym2612::new();
+        configure_two_op_fm_tone(&mut ym);
+
+        let ym_ratio = YM_NATIVE_RATE / OUTPUT_RATE;
+        let mut ym_phase = 0.0f64;
+        let mut left_lpf = FirstOrderLowPassFilter::new(YM_LPF_B0, YM_LPF_B1, YM_LPF_A1);
+        let mut right_lpf = FirstOrderLowPassFilter::new(YM_LPF_B0, YM_LPF_B1, YM_LPF_A1);
+        let mut output = Vec::with_capacity(sample_count * 2);
+
+        for _ in 0..sample_count {
+            ym_phase += ym_ratio;
+            let mut left_acc = 0.0f64;
+            let mut right_acc = 0.0f64;
+            let mut ym_count = 0u32;
+
+            while ym_phase >= 1.0 {
+                ym_phase -= 1.0;
+                let (l, r) = ym.output_sample();
+                left_acc += f64::from(left_lpf.filter(l));
+                right_acc += f64::from(right_lpf.filter(r));
+                ym_count += 1;
+            }
+
+            let (left, right) = if ym_count > 0 {
+                (
+                    (left_acc / ym_count as f64) as f32,
+                    (right_acc / ym_count as f64) as f32,
+                )
+            } else {
+                (left_lpf.last_output(), right_lpf.last_output())
+            };
+
+            output.push(left);
+            output.push(right);
+        }
+
+        output
+    }
 
     #[test]
     fn new_core_is_not_paused() {
         let core = GenesisCore::new();
         assert!(!core.paused());
+    }
+
+    #[test]
+    fn set_audio_output_config_rebuilds_audio_pipeline() {
+        let mut core = GenesisCore::new();
+        core.audio_buffer.extend_from_slice(&[0.25, -0.25]);
+        core.audio_output_sample_count = 99;
+        core.ym_filter_left.filter(1.0);
+        core.psg_filter.filter(0.5);
+
+        let config = AudioOutputConfig::new(AudioOutputProfile::Legacy, 2.5)
+            .with_ym_gain(1.75)
+            .with_psg_gain(0.5)
+            .with_ym_channel_side_memory_amounts([0.20, 0.0, 0.0, 0.15, 0.0, 0.0])
+            .with_ym_channel_side_decay_ms([0.0, 0.0, 0.0, 12.0, 25.0, 0.0])
+            .with_ym_channel_key_delay_ms([5.0, 0.0, 0.0, 5.0, 5.0, 0.0])
+            .with_ym_channel_pan_edge_amounts([0.0, 0.0, 0.0, 0.08, 0.12, 0.0])
+            .with_ym_channel_pan_edge_decay_ms([0.0, 0.0, 0.0, 12.0, 25.0, 0.0])
+            .with_stereo_crossfeed(0.12)
+            .with_mid_gain(1.02)
+            .with_side_gain(0.96)
+            .with_post_high_pass_hz(60.0)
+            .with_post_low_pass_hz(12_000.0)
+            .with_post_eq_1(AudioEqStage::low_shelf(110.0, -8.0))
+            .with_post_eq_2(AudioEqStage::peaking(420.0, 0.75, 6.0))
+            .with_post_eq_3(AudioEqStage::high_shelf(2_600.0, -3.5))
+            .with_post_eq_4(AudioEqStage::peaking(190.0, 0.90, 3.0))
+            .with_post_eq_5(AudioEqStage::peaking(760.0, 1.10, 1.5))
+            .with_post_side_eq_1(AudioEqStage::peaking(420.0, 0.90, -1.5))
+            .with_post_side_eq_2(AudioEqStage::peaking(900.0, 1.00, 1.2))
+            .with_post_fir_taps([0.88, 0.10, 0.02, 0.0, 0.0])
+            .with_post_left_delay_samples(1)
+            .with_post_right_delay_samples(2);
+        core.execute(Command::SetAudioOutputConfig(config));
+
+        assert_eq!(core.audio_output_config(), config);
+        assert!(core.audio_buffer.is_empty());
+        assert_eq!(core.audio_output_sample_count(), 0);
+        assert_eq!(core.audio_master_ticks(), 0);
+        assert_eq!(core.audio_master_gain, 2.5);
+        assert_eq!(core.audio_ym_gain, 1.75);
+        assert_eq!(core.audio_psg_gain, 0.5);
+        assert_eq!(
+            core.audio_ym_channel_side_memory_amounts,
+            [0.20, 0.0, 0.0, 0.15, 0.0, 0.0]
+        );
+        assert_eq!(
+            core.audio_ym_channel_side_decay_factors,
+            [
+                0.0,
+                0.0,
+                0.0,
+                pan_edge_decay_factor(12.0, MASTER_CLOCK_NTSC as f32 / YM_AUDIO_TICKS as f32),
+                pan_edge_decay_factor(25.0, MASTER_CLOCK_NTSC as f32 / YM_AUDIO_TICKS as f32),
+                0.0,
+            ]
+        );
+        assert_eq!(
+            core.audio_ym_channel_key_delay_ticks,
+            [
+                ((5.0 / 1000.0) * MASTER_CLOCK_NTSC as f32).round() as u64,
+                0,
+                0,
+                ((5.0 / 1000.0) * MASTER_CLOCK_NTSC as f32).round() as u64,
+                ((5.0 / 1000.0) * MASTER_CLOCK_NTSC as f32).round() as u64,
+                0,
+            ]
+        );
+        assert_eq!(
+            core.audio_ym_channel_pan_edge_amounts,
+            [0.0, 0.0, 0.0, 0.08, 0.12, 0.0]
+        );
+        assert_eq!(
+            core.audio_ym_channel_pan_edge_decay_factors,
+            [
+                0.0,
+                0.0,
+                0.0,
+                pan_edge_decay_factor(12.0, MASTER_CLOCK_NTSC as f32 / YM_AUDIO_TICKS as f32),
+                pan_edge_decay_factor(25.0, MASTER_CLOCK_NTSC as f32 / YM_AUDIO_TICKS as f32),
+                0.0,
+            ]
+        );
+        assert_eq!(core.audio_stereo_crossfeed, 0.12);
+        assert_eq!(core.audio_mid_gain, 1.02);
+        assert_eq!(core.audio_side_gain, 0.96);
+        assert_eq!(core.audio_psg_mix, DEFAULT_PSG_MIX);
+        assert!(matches!(core.ym_filter_left, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.ym_filter_right, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.psg_filter, AudioFilterState::Flat { .. }));
+        assert!(matches!(
+            core.post_high_pass_left,
+            AudioFilterState::FirstOrder(_)
+        ));
+        assert!(matches!(
+            core.post_high_pass_right,
+            AudioFilterState::FirstOrder(_)
+        ));
+        assert!(matches!(
+            core.post_low_pass_left,
+            AudioFilterState::FirstOrder(_)
+        ));
+        assert!(matches!(
+            core.post_low_pass_right,
+            AudioFilterState::FirstOrder(_)
+        ));
+        assert!(matches!(core.post_eq_1_left, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_1_right, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_2_left, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_2_right, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_3_left, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_3_right, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_4_left, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_4_right, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_5_left, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_eq_5_right, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_side_eq_1, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_side_eq_2, AudioFilterState::Biquad(_)));
+        assert!(matches!(core.post_fir_left, AudioFilterState::Fir(_)));
+        assert!(matches!(core.post_fir_right, AudioFilterState::Fir(_)));
+        assert_eq!(core.post_delay_left.delay_samples, 1);
+        assert_eq!(core.post_delay_right.delay_samples, 2);
+    }
+
+    #[test]
+    fn stereo_crossfeed_blends_channels_symmetrically() {
+        let (left, right) = apply_stereo_crossfeed(1.0, 0.0, 0.25);
+        assert!((left - 0.75).abs() < 1e-6);
+        assert!((right - 0.25).abs() < 1e-6);
+
+        let (left, right) = apply_stereo_crossfeed(1.0, -1.0, 0.10);
+        assert!((left - 0.8).abs() < 1e-6);
+        assert!((right + 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ym_channel_side_memory_zero_amount_is_identity() {
+        let channel_samples = [
+            (0.5, -0.5),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.25, 0.25),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        ];
+        let mut side_memory = [0.0f32; 6];
+        let mut previous_side = [0.0f32; 6];
+        let mixed = mix_ym_channel_outputs_with_side_memory(
+            channel_samples,
+            &mut side_memory,
+            [0.0; 6],
+            [0.0; 6],
+            [0.0; 6],
+            [0.0; 6],
+            &mut previous_side,
+            &mut [0.0; 6],
+            [0.0; 6],
+        );
+        assert!((mixed.0 - 0.75).abs() < 1e-6);
+        assert!((mixed.1 + 0.25).abs() < 1e-6);
+        assert_eq!(side_memory, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn ym_channel_side_memory_adds_delayed_side_without_touching_centered_channel() {
+        let mut side_memory = [0.0f32; 6];
+        let mut previous_side = [0.0f32; 6];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let amounts = [0.20, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let transient_mixes = [0.0f32; 6];
+        let sign_align_mixes = [0.0f32; 6];
+        let side_decay = [0.0f32; 6];
+        let decay = [0.0f32; 6];
+
+        let first = mix_ym_channel_outputs_with_side_memory(
+            [
+                (0.5, -0.5),
+                (0.25, 0.25),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            decay,
+        );
+        let second = mix_ym_channel_outputs_with_side_memory(
+            [
+                (0.0, 0.0),
+                (0.25, 0.25),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            decay,
+        );
+
+        assert!((first.0 - 0.75).abs() < 1e-6);
+        assert!((first.1 + 0.25).abs() < 1e-6);
+        assert!(
+            (second.0 - 0.10 - 0.25).abs() < 1e-6,
+            "expected delayed side memory on left output, got {:?}",
+            second
+        );
+        assert!(
+            (second.1 + 0.10 - 0.25).abs() < 1e-6,
+            "expected delayed side memory on right output, got {:?}",
+            second
+        );
+    }
+
+    #[test]
+    fn ym_channel_side_memory_decay_extends_persistence_across_extra_sample() {
+        let mut side_memory = [0.0f32; 6];
+        let mut previous_side = [0.0f32; 6];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let amounts = [0.20, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let transient_mixes = [0.0f32; 6];
+        let sign_align_mixes = [0.0f32; 6];
+        let side_decay = [0.50f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let pan_decay = [0.0f32; 6];
+
+        let _ = mix_ym_channel_outputs_with_side_memory(
+            [
+                (0.5, -0.5),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            pan_decay,
+        );
+        let second = mix_ym_channel_outputs_with_side_memory(
+            [(0.0, 0.0); 6],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            pan_decay,
+        );
+        let third = mix_ym_channel_outputs_with_side_memory(
+            [(0.0, 0.0); 6],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            pan_decay,
+        );
+
+        assert!((second.0 - 0.10).abs() < 1e-6);
+        assert!((second.1 + 0.10).abs() < 1e-6);
+        assert!(
+            (third.0 - 0.05).abs() < 1e-6,
+            "expected decayed side memory to persist into third sample, got {third:?}"
+        );
+        assert!(
+            (third.1 + 0.05).abs() < 1e-6,
+            "expected decayed side memory to persist into third sample, got {third:?}"
+        );
+    }
+
+    #[test]
+    fn ym_channel_pan_edge_persistence_triggers_on_pan_change_and_decays_after_mix() {
+        let side_memory = [0.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let mut pan_masks = [0xC0u8; 6];
+        trigger_ym_channel_pan_edge_persistence(
+            &side_memory,
+            &mut pan_edge_carry,
+            &mut pan_masks,
+            [0.20, 0.0, 0.0, 0.0, 0.0, 0.0],
+            0,
+            0xB4,
+            0x80,
+        );
+
+        assert!((pan_edge_carry[0] - 0.10).abs() < 1e-6);
+        assert_eq!(pan_masks[0], 0x80);
+
+        let mixed = mix_ym_channel_outputs_with_side_memory(
+            [(0.0, 0.0); 6],
+            &mut [0.0; 6],
+            [0.0; 6],
+            [0.0; 6],
+            [0.0; 6],
+            [0.0; 6],
+            &mut [0.0; 6],
+            &mut pan_edge_carry,
+            [0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        assert!((mixed.0 - 0.10).abs() < 1e-6);
+        assert!((mixed.1 + 0.10).abs() < 1e-6);
+        assert!((pan_edge_carry[0] - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ym_channel_pan_edge_persistence_ignores_repeat_centered_pan_state() {
+        let side_memory = [0.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let mut pan_masks = [0xC0u8; 6];
+        trigger_ym_channel_pan_edge_persistence(
+            &side_memory,
+            &mut pan_edge_carry,
+            &mut pan_masks,
+            [0.20, 0.0, 0.0, 0.0, 0.0, 0.0],
+            0,
+            0xB4,
+            0xC0,
+        );
+
+        assert_eq!(pan_edge_carry, [0.0; 6]);
+        assert_eq!(pan_masks[0], 0xC0);
+    }
+
+    #[test]
+    fn ym_channel_pan_edge_persistence_refreshes_on_repeated_hard_pan_writes() {
+        let side_memory = [0.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let mut pan_masks = [0x80u8, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0];
+        trigger_ym_channel_pan_edge_persistence(
+            &side_memory,
+            &mut pan_edge_carry,
+            &mut pan_masks,
+            [0.20, 0.0, 0.0, 0.0, 0.0, 0.0],
+            0,
+            0xB4,
+            0x80,
+        );
+
+        assert!((pan_edge_carry[0] - 0.10).abs() < 1e-6);
+        assert_eq!(pan_masks[0], 0x80);
+    }
+
+    #[test]
+    fn ym_channel_side_transient_mix_limits_delayed_side_on_steady_tone() {
+        let mut side_memory = [0.0f32; 6];
+        let mut previous_side = [0.0f32; 6];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let amounts = [0.20, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let transient_mixes = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let sign_align_mixes = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let side_decay = [0.0f32; 6];
+        let pan_decay = [0.0f32; 6];
+
+        let first = mix_ym_channel_outputs_with_side_memory(
+            [
+                (0.5, -0.5),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            pan_decay,
+        );
+        let second = mix_ym_channel_outputs_with_side_memory(
+            [
+                (0.5, -0.5),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            pan_decay,
+        );
+        let third = mix_ym_channel_outputs_with_side_memory(
+            [
+                (0.5, -0.5),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            amounts,
+            transient_mixes,
+            sign_align_mixes,
+            side_decay,
+            &mut previous_side,
+            &mut pan_edge_carry,
+            pan_decay,
+        );
+
+        assert!((first.0 - 0.5).abs() < 1e-6);
+        assert!((first.1 + 0.5).abs() < 1e-6);
+        assert!((second.0 - 0.6).abs() < 1e-6);
+        assert!((second.1 + 0.6).abs() < 1e-6);
+        assert!(
+            (third.0 - 0.5).abs() < 1e-6 && (third.1 + 0.5).abs() < 1e-6,
+            "expected transient-fed side memory to stop reinforcing a steady tone, got {third:?}"
+        );
+    }
+
+    #[test]
+    fn ym_channel_side_sign_align_follows_current_polarity_instead_of_replaying_old_phase() {
+        let mut side_memory = [0.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut previous_side = [0.0f32; 6];
+        let mut pan_edge_carry = [0.0f32; 6];
+        let mixed = mix_ym_channel_outputs_with_side_memory(
+            [
+                (-0.5, 0.5),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+            ],
+            &mut side_memory,
+            [0.20, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0; 6],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0; 6],
+            &mut previous_side,
+            &mut pan_edge_carry,
+            [0.0; 6],
+        );
+
+        assert!(
+            (mixed.0 + 0.6).abs() < 1e-6 && (mixed.1 - 0.6).abs() < 1e-6,
+            "expected sign-aligned side memory to widen the current polarity instead of canceling it, got {mixed:?}"
+        );
     }
 
     #[test]
@@ -1134,5 +3659,236 @@ mod tests {
         core.execute(Command::PowerCycle);
         assert_eq!(core.z80.pc, 0);
         assert_eq!(core.z80_ram[0], 0);
+    }
+
+    #[test]
+    fn timed_ym2612_trace_records_68k_bus_writes() {
+        let mut core = GenesisCore::new();
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 1_234);
+            bus.write_byte(0xA04000, 0x28);
+            bus.write_byte(0xA04001, 0x30);
+            bus.write_byte(0xA04002, 0x2A);
+            bus.write_byte(0xA04003, 0x7F);
+        }
+
+        assert_eq!(
+            core.ym2612_timed_write_trace(),
+            &[
+                TimedYm2612Write {
+                    master_tick: 1_234,
+                    frame: 0,
+                    scanline: 0,
+                    port: 0,
+                    addr: 0x28,
+                    value: 0x30,
+                },
+                TimedYm2612Write {
+                    master_tick: 1_234,
+                    frame: 0,
+                    scanline: 0,
+                    port: 1,
+                    addr: 0x2A,
+                    value: 0x7F,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn timed_ym2612_trace_records_z80_bus_writes_and_can_clear() {
+        let mut core = GenesisCore::new();
+        {
+            let mut bus = z80_bus_with_master_tick(&mut core, 9_876);
+            bus.write_byte(0x4000, 0x2B);
+            bus.write_byte(0x4001, 0x80);
+        }
+
+        assert_eq!(
+            core.ym2612_timed_write_trace(),
+            &[TimedYm2612Write {
+                master_tick: 9_876,
+                frame: 0,
+                scanline: 0,
+                port: 0,
+                addr: 0x2B,
+                value: 0x80,
+            }]
+        );
+
+        core.clear_ym2612_timed_write_trace();
+        assert!(core.ym2612_timed_write_trace().is_empty());
+    }
+
+    #[test]
+    fn timed_psg_trace_records_68k_and_z80_writes() {
+        let mut core = GenesisCore::new();
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 2_468);
+            bus.write_byte(0xC00011, 0x9F);
+        }
+        {
+            let mut bus = z80_bus_with_master_tick(&mut core, 8_642);
+            bus.write_byte(0x7F11, 0xE4);
+        }
+
+        assert_eq!(
+            core.psg_timed_write_trace(),
+            &[
+                TimedPsgWrite {
+                    master_tick: 2_468,
+                    frame: 0,
+                    scanline: 0,
+                    value: 0x9F,
+                },
+                TimedPsgWrite {
+                    master_tick: 8_642,
+                    frame: 0,
+                    scanline: 0,
+                    value: 0xE4,
+                },
+            ]
+        );
+
+        core.clear_psg_timed_write_trace();
+        assert!(core.psg_timed_write_trace().is_empty());
+    }
+
+    #[test]
+    fn live_audio_resampler_matches_accumulated_reference() {
+        let mut core = GenesisCore::new();
+        core.audio_sample_rate = 44_100.0;
+        core.execute(Command::SetAudioOutputConfig(
+            AudioOutputConfig::model1_va2(),
+        ));
+        configure_two_op_fm_tone(&mut core.ym2612);
+        core.audio_ym2612 = core.ym2612.clone();
+
+        while core.audio_buffer.len() < 4096 * 2 {
+            core.collect_audio_samples();
+        }
+
+        let actual = core.audio_buffer[..4096 * 2].to_vec();
+        let expected = render_reference_fm_audio(4096);
+
+        let corr = cross_correlation(&actual, &expected);
+        let rms_ratio = rms(&actual) / rms(&expected).max(1e-9);
+
+        assert!(
+            corr > 0.995,
+            "live resampler correlation too low: {corr:.6}"
+        );
+        assert!(
+            (0.98..=1.02).contains(&rms_ratio),
+            "live resampler RMS ratio out of range: {rms_ratio:.6}"
+        );
+    }
+
+    #[test]
+    fn first_order_low_pass_heavily_attenuates_ultrasonic_input() {
+        let mut filter = FirstOrderLowPassFilter::new(PSG_LPF_B0, PSG_LPF_B1, PSG_LPF_A1);
+        let mut input = Vec::with_capacity(4096);
+        let mut output = Vec::with_capacity(4096);
+
+        for idx in 0..4096 {
+            let sample = if idx % 2 == 0 { 1.0 } else { -1.0 };
+            input.push(sample);
+            output.push(filter.filter(sample));
+        }
+
+        let input_rms = rms(&input[512..]);
+        let output_rms = rms(&output[512..]);
+
+        assert!(
+            output_rms < input_rms * 0.02,
+            "expected native low-pass to crush Nyquist-ish energy, got ratio {:.4}",
+            output_rms / input_rms.max(1e-9)
+        );
+    }
+
+    #[test]
+    fn fir_filter_matches_impulse_response() {
+        let mut filter = AudioFilterState::from_spec(AudioFilterSpec::Fir {
+            taps: [0.84, 0.12, 0.04, 0.0, 0.0],
+        });
+        let impulse = [1.0, 0.0, 0.0, 0.0, 0.0];
+        let output: Vec<f32> = impulse
+            .iter()
+            .map(|&sample| filter.filter(sample))
+            .collect();
+
+        assert!((output[0] - 0.84).abs() < 1e-6);
+        assert!((output[1] - 0.12).abs() < 1e-6);
+        assert!((output[2] - 0.04).abs() < 1e-6);
+        assert!(output[3].abs() < 1e-6);
+        assert!(output[4].abs() < 1e-6);
+    }
+
+    #[test]
+    fn sample_delay_outputs_prior_samples() {
+        let mut delay = SampleDelay::new(2);
+        let input = [1.0, 0.5, -0.25, 0.75];
+        let output: Vec<f32> = input.iter().map(|&sample| delay.filter(sample)).collect();
+
+        assert!(output[0].abs() < 1e-6);
+        assert!(output[1].abs() < 1e-6);
+        assert!((output[2] - 1.0).abs() < 1e-6);
+        assert!((output[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mid_side_gain_reduces_stereo_width() {
+        let (mid, side) = encode_mid_side(1.0, -1.0);
+        let (left, right) = decode_mid_side(mid, side * 0.5);
+
+        assert!((left - 0.5).abs() < 1e-6);
+        assert!((right + 0.5).abs() < 1e-6);
+    }
+
+    fn filtered_sine_rms(spec: AudioFilterSpec, frequency_hz: f32, sample_rate_hz: f32) -> f32 {
+        let mut filter = AudioFilterState::from_spec(spec);
+        let mut output = Vec::with_capacity(8192);
+        for idx in 0..8192 {
+            let phase = 2.0 * std::f32::consts::PI * frequency_hz * idx as f32 / sample_rate_hz;
+            output.push(filter.filter(phase.sin()));
+        }
+        rms(&output[2048..])
+    }
+
+    #[test]
+    fn eq_stages_shape_frequency_response() {
+        let sample_rate_hz = 44_100.0;
+
+        let low_shelf = biquad_eq_filter_spec(AudioEqStage::low_shelf(110.0, -8.0), sample_rate_hz);
+        let low_shelf_80 = filtered_sine_rms(low_shelf, 80.0, sample_rate_hz);
+        let low_shelf_500 = filtered_sine_rms(low_shelf, 500.0, sample_rate_hz);
+        assert!(
+            low_shelf_80 < low_shelf_500 * 0.7,
+            "expected low shelf to cut bass more than mids, got 80Hz {:.4} vs 500Hz {:.4}",
+            low_shelf_80,
+            low_shelf_500
+        );
+
+        let peaking =
+            biquad_eq_filter_spec(AudioEqStage::peaking(420.0, 0.75, 6.0), sample_rate_hz);
+        let peaking_420 = filtered_sine_rms(peaking, 420.0, sample_rate_hz);
+        let peaking_1400 = filtered_sine_rms(peaking, 1_400.0, sample_rate_hz);
+        assert!(
+            peaking_420 > peaking_1400 * 1.5,
+            "expected peaking EQ to favor center band, got 420Hz {:.4} vs 1400Hz {:.4}",
+            peaking_420,
+            peaking_1400
+        );
+
+        let high_shelf =
+            biquad_eq_filter_spec(AudioEqStage::high_shelf(2_600.0, -3.5), sample_rate_hz);
+        let high_shelf_700 = filtered_sine_rms(high_shelf, 700.0, sample_rate_hz);
+        let high_shelf_6000 = filtered_sine_rms(high_shelf, 6_000.0, sample_rate_hz);
+        assert!(
+            high_shelf_6000 < high_shelf_700 * 0.85,
+            "expected high shelf to cut treble more than mids, got 700Hz {:.4} vs 6kHz {:.4}",
+            high_shelf_700,
+            high_shelf_6000
+        );
     }
 }

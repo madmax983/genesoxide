@@ -3,6 +3,8 @@
 **Date**: 2026-03-26
 **Status**: Accepted
 
+See also: [`docs/genesis-audio-fidelity-log.md`](../genesis-audio-fidelity-log.md) for the chronological record of what actually happened during audio-fidelity bring-up, including bugs, false leads, harness fixes, oracle work, output-chain tuning, and carry-forward lessons.
+
 ## Overview
 
 Full audio implementation for genesoxide: Z80 CPU, YM2612 FM synthesis, SN76489 PSG, and threaded audio output via cpal. Audio generation runs on the main emulation thread; output is on a separate cpal callback thread connected by a lock-free SPSC ring buffer (same pattern as doom-rs).

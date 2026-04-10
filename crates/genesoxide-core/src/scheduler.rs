@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+/// NTSC Genesis master clock frequency in Hz.
+pub const MASTER_CLOCK_NTSC: u64 = 53_693_175;
 /// Master clock ticks per 68000 CPU cycle.
 pub const MASTER_PER_CPU: u64 = 7;
 /// Master clock ticks per VDP cycle.
