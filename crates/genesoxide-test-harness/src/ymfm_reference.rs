@@ -277,7 +277,7 @@ mod tests {
         );
 
         assert!(metrics.correlation_left > 0.95);
-        assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
+        assert!((0.90..=1.10).contains(&metrics.rms_ratio_left));
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         );
 
         assert!(metrics.correlation_left > 0.95);
-        assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
+        assert!((0.90..=1.10).contains(&metrics.rms_ratio_left));
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
         );
 
         assert!(metrics.correlation_left > 0.95);
-        assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
+        assert!((0.90..=1.10).contains(&metrics.rms_ratio_left));
     }
 
     /// Build a single-carrier tone driving the SSG-EG in a looping configuration:
@@ -418,7 +418,7 @@ mod tests {
                 m.correlation_left
             );
             assert!(
-                (0.8..=1.2).contains(&m.rms_ratio_left),
+                (0.90..=1.10).contains(&m.rms_ratio_left),
                 "algorithm {algo} level off vs ymfm: rms_ratio={:.4}",
                 m.rms_ratio_left
             );
@@ -470,7 +470,7 @@ mod tests {
                 min_corr
             );
             assert!(
-                (0.8..=1.2).contains(&m.rms_ratio_left),
+                (0.90..=1.10).contains(&m.rms_ratio_left),
                 "PM pms={pms} level off vs ymfm: rms_ratio={:.4}",
                 m.rms_ratio_left
             );
@@ -494,8 +494,11 @@ mod tests {
                 "SSG mode {mode:#04x} shape diverged: corr={:.4}",
                 m.correlation_left
             );
-            // The attack modes must no longer collapse to silence; every mode should
-            // land near the ~0.93x per-channel level ymfm produces.
+            // The attack modes must no longer collapse to silence. SSG-EG rms_ratio
+            // still varies by mode (envelope shape/timing differences, not output
+            // level — the FM output scale itself is now centered on ymfm at
+            // rms_ratio ~1.0, see `Ym2612::FM_SCALE`), so this only guards against a
+            // near-silent collapse rather than pinning a tight level window.
             assert!(
                 m.rms_ratio_left > 0.5,
                 "SSG mode {mode:#04x} too quiet vs ymfm: rms_ratio={:.4}",

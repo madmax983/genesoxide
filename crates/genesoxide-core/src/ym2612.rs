@@ -1417,11 +1417,10 @@ impl Ym2612 {
     /// is normalized to the range `[-1.0, 1.0]` using the same global scaling as
     /// the legacy stereo sum path.
     pub fn output_sample_per_channel(&mut self) -> [(f32, f32); 6] {
-        const SCALE: f32 = 1.0 / 1536.0;
         let raw = self.output_sample_raw_per_channel();
         std::array::from_fn(|idx| {
             let (left, right) = raw[idx];
-            (left as f32 * SCALE, right as f32 * SCALE)
+            (left as f32 * Self::FM_SCALE, right as f32 * Self::FM_SCALE)
         })
     }
 
@@ -1436,11 +1435,22 @@ impl Ym2612 {
         let left_sum: i32 = raw.iter().map(|&(left, _)| left).sum();
         let right_sum: i32 = raw.iter().map(|&(_, right)| right).sum();
 
-        // Scale to float. Each channel is clamped to ±256 (9-bit DAC).
-        // 6 channels → max sum = 1536. Dividing by 1536 keeps output in ±1.0.
-        const SCALE: f32 = 1.0 / 1536.0;
-        (left_sum as f32 * SCALE, right_sum as f32 * SCALE)
+        // Scale to float using the shared FM output scale (see `FM_SCALE`).
+        (left_sum as f32 * Self::FM_SCALE, right_sum as f32 * Self::FM_SCALE)
     }
+
+    /// Normalization applied to the raw summed FM output to reach `[-1.0, 1.0]`.
+    ///
+    /// Each channel is clamped to ±256 (9-bit multiplexed DAC), so with 6
+    /// channels the raw sum spans ±1536; the naive scale is therefore `1/1536`.
+    /// Measured against the ymfm reference (which normalizes its native 16-bit
+    /// output ÷32768), genesoxide's FM level sat at an average `rms_ratio` of
+    /// ~0.9937 across the clean carrier/algorithm/LFO-PM cases — i.e. ~0.6% low.
+    /// Dividing by `1536 * 0.9937` (≈1526.3) instead centers the FM `rms_ratio`
+    /// on 1.0 without altering the per-channel clamp behaviour. Both the live
+    /// per-channel path (`output_sample_per_channel`) and the VGM/ymfm harness
+    /// path (`output_sample`) must share this constant so they stay in lockstep.
+    const FM_SCALE: f32 = 1.0 / (1536.0 * 0.9937);
 }
 
 impl Default for Ym2612 {
