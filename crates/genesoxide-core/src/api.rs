@@ -2155,6 +2155,27 @@ impl GenesisCore {
                 self.z80_reset_pending = false;
             }
 
+            // Lower the Z80 /INT after one scanline of assertion.
+            //
+            // The VDP holds the Z80 interrupt line asserted for only ~one
+            // scanline per frame (~228 Z80 T-states). Because the line is
+            // level-triggered and `accept_interrupt` never clears it, holding
+            // it any longer lets a sound driver that re-enables interrupts
+            // (EI/RETI) re-take the VBlank interrupt over and over for the rest
+            // of the frame — the SMPS music tick then fires dozens of times per
+            // frame and the tempo runs wildly too fast.
+            //
+            // `int_line` is raised at the *end* of the VBlank scanline
+            // (ACTIVE_SCANLINES) body — i.e. after that scanline's Z80 step —
+            // so the Z80's single opportunity to take it is its step on the
+            // following scanline (ACTIVE_SCANLINES + 1). We therefore de-assert
+            // it here, just before the Z80 is stepped one scanline later, giving
+            // the Z80 exactly one asserted-line window. The frame-start clear
+            // above remains as a safety net.
+            if scanline == ACTIVE_SCANLINES + 2 {
+                self.z80.int_line = false;
+            }
+
             // Step Z80 for this scanline if it's not in reset and got bus access.
             // The Z80 runs when the bus is currently free, OR when the 68K released
             // the bus at any point during this scanline (even if re-requested by now).
@@ -3832,6 +3853,68 @@ mod tests {
         core.execute(Command::PowerCycle);
         assert_eq!(core.z80.pc, 0);
         assert_eq!(core.z80_ram[0], 0);
+    }
+
+    /// Regression test for the Z80 VBlank interrupt cadence.
+    ///
+    /// The VDP holds the Z80 /INT asserted for a single scanline per frame.
+    /// A previous bug held it for ~38 scanlines, so a sound driver that
+    /// re-enables interrupts inside its handler re-took the VBlank interrupt
+    /// dozens of times per frame (making music tempo run wildly too fast).
+    /// This drives a tiny Z80 program with a VInt handler that increments a
+    /// counter and asserts it runs EXACTLY ONCE per frame.
+    #[test]
+    fn z80_vblank_interrupt_fires_once_per_frame() {
+        // Inert 68000 ROM: reset vectors + a branch-to-self so the 68000 spins
+        // harmlessly and never touches Z80 control ports or Z80 RAM.
+        let mut rom = vec![0u8; 512];
+        rom[0..4].copy_from_slice(&0x00FF_0000u32.to_be_bytes()); // initial SSP
+        rom[4..8].copy_from_slice(&0x0000_0008u32.to_be_bytes()); // initial PC
+        rom[8] = 0x60; // BRA.S
+        rom[9] = 0xFE; // -2  → branch to self (infinite, no memory writes)
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+
+        // Z80 program in sound RAM:
+        //   0x0000: LD SP,0x1FF0   ; valid stack in Z80 RAM for INT push/RET
+        //   0x0003: EI
+        //   0x0004: HALT           ; wait for the VBlank interrupt
+        //   0x0005..0x0037: HALT   ; RET from the handler lands here → re-HALT
+        // Interrupt vector (IM 0/1 → 0x0038):
+        //   0x0038: LD HL,0x1F00   ; counter address
+        //   0x003B: INC (HL)       ; count this interrupt
+        //   0x003C: LD B,0x40
+        //   0x003E: DJNZ $         ; ~800 T-state delay so the handler spans
+        //                          ; more than one scanline (like a real driver)
+        //   0x0040: EI             ; re-enable interrupts before returning
+        //   0x0041: RET
+        core.z80_ram.fill(0x76); // HALT everywhere by default
+        let boot = [0x31u8, 0xF0, 0x1F, 0xFB, 0x76]; // LD SP,1FF0 ; EI ; HALT
+        core.z80_ram[..boot.len()].copy_from_slice(&boot);
+        let handler = [
+            0x21u8, 0x00, 0x1F, // LD HL,0x1F00
+            0x34, // INC (HL)
+            0x06, 0x40, // LD B,0x40
+            0x10, 0xFE, // DJNZ $-0
+            0xFB, // EI
+            0xC9, // RET
+        ];
+        core.z80_ram[0x0038..0x0038 + handler.len()].copy_from_slice(&handler);
+        core.z80_ram[0x1F00] = 0; // counter
+
+        // Bring the Z80 out of reset with the bus granted to it.
+        core.z80 = z80::Z80::new();
+        core.z80_reset = false;
+        core.z80_bus_requested = false;
+
+        core.execute(Command::StepFrame);
+
+        assert_eq!(
+            core.z80_ram[0x1F00], 1,
+            "VBlank handler must run exactly once per frame, got {} times",
+            core.z80_ram[0x1F00]
+        );
     }
 
     #[test]
