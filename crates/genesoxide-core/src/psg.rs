@@ -44,7 +44,7 @@ const NOISE_PERIOD_TABLE: [u16; 3] = [0x10, 0x20, 0x40];
 /// Call [`Psg::write`] to send a register byte and [`Psg::clock_tick`] each
 /// PSG clock cycle (master / 16, ~223 kHz). Read the current output with
 /// [`Psg::sample`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Psg {
     /// 10-bit period registers for tone channels 0-2.
     tone_period: [u16; 3],

@@ -37,7 +37,7 @@ pub enum Button {
 }
 
 /// State of a single controller port.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerPort {
     /// Raw button state — bit set = pressed.
     buttons: u16,
@@ -74,6 +74,12 @@ impl ControllerPort {
     /// Sets the full button state from a bitmask.
     pub fn set_buttons(&mut self, mask: u16) {
         self.buttons = mask;
+    }
+
+    /// Returns the current raw button state bitmask.
+    #[must_use]
+    pub fn buttons(&self) -> u16 {
+        self.buttons
     }
 
     /// Reads the data port value based on current TH state.

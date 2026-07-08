@@ -26,7 +26,7 @@ pub const VSRAM_ENTRIES: usize = 40;
 pub const VDP_REGISTER_COUNT: usize = 24;
 
 /// VDP access type set by the control port command words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessType {
     VramRead,
     VramWrite,
@@ -57,7 +57,12 @@ pub enum DmaMode {
 }
 
 /// Serializable VDP snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Captures the complete deterministic VDP state (everything except the RGBA
+/// framebuffer, which is re-derived by rendering). This is used both for save
+/// states and for time-travel rewind, so it must be complete enough that
+/// `Vdp::restore` reproduces bit-identical subsequent emulation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VdpSnapshot {
     pub vram: Vec<u8>,
     pub cram: Vec<u16>,
@@ -67,6 +72,16 @@ pub struct VdpSnapshot {
     pub address: u16,
     pub scanline: u16,
     pub dot: u16,
+    pub auto_increment: u16,
+    pub access_type: Option<AccessType>,
+    pub in_vblank: bool,
+    pub in_hblank: bool,
+    pub dma_pending: bool,
+    pub dma_fill_pending: bool,
+    pub h_interrupt_counter: i16,
+    pub h_interrupt_pending: bool,
+    pub control_code: u8,
+    pub odd_frame: bool,
 }
 
 /// Maximum sprites evaluated per frame (H40 mode).
@@ -1016,7 +1031,40 @@ impl Vdp {
             address: self.address,
             scanline: self.scanline,
             dot: self.dot,
+            auto_increment: self.auto_increment,
+            access_type: self.access_type,
+            in_vblank: self.in_vblank,
+            in_hblank: self.in_hblank,
+            dma_pending: self.dma_pending,
+            dma_fill_pending: self.dma_fill_pending,
+            h_interrupt_counter: self.h_interrupt_counter,
+            h_interrupt_pending: self.h_interrupt_pending,
+            control_code: self.control_code,
+            odd_frame: self.odd_frame,
         }
+    }
+
+    /// Restores VDP state from a snapshot. The framebuffer is left untouched
+    /// (it is re-derived when subsequent scanlines are rendered).
+    pub fn restore(&mut self, snap: &VdpSnapshot) {
+        self.vram.copy_from_slice(&snap.vram);
+        self.cram.copy_from_slice(&snap.cram);
+        self.vsram.copy_from_slice(&snap.vsram);
+        self.registers.copy_from_slice(&snap.registers);
+        self.control_state = snap.control_state;
+        self.address = snap.address;
+        self.scanline = snap.scanline;
+        self.dot = snap.dot;
+        self.auto_increment = snap.auto_increment;
+        self.access_type = snap.access_type;
+        self.in_vblank = snap.in_vblank;
+        self.in_hblank = snap.in_hblank;
+        self.dma_pending = snap.dma_pending;
+        self.dma_fill_pending = snap.dma_fill_pending;
+        self.h_interrupt_counter = snap.h_interrupt_counter;
+        self.h_interrupt_pending = snap.h_interrupt_pending;
+        self.control_code = snap.control_code;
+        self.odd_frame = snap.odd_frame;
     }
 }
 

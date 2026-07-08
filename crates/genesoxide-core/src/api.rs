@@ -14,6 +14,7 @@ use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Schedu
 use crate::vdp::Vdp;
 use crate::ym2612;
 use crate::z80;
+use serde::{Deserialize, Serialize};
 
 /// Genesis visible frame width in pixels (H40 mode).
 pub const FRAME_WIDTH: usize = 320;
@@ -998,6 +999,60 @@ pub enum CoreQuery {
     FrameCounter,
 }
 
+/// A complete, serializable snapshot of the deterministic emulation state.
+///
+/// This captures everything required to reproduce bit-identical subsequent
+/// emulation: the CPU/VDP/scheduler/Z80 register state, the large RAM/VRAM
+/// buffers, the sound-chip state, and the controller ports. It intentionally
+/// EXCLUDES:
+///
+/// * `rom` / `rom_header` — immutable for the lifetime of a loaded cartridge,
+///   so it lives only in the running core and is never touched by `restore`.
+/// * the RGBA framebuffer — re-derived by rendering subsequent scanlines.
+/// * the ~60 audio-DSP resampler/filter fields and debug trace buffers — these
+///   do not affect CPU/VDP/frame determinism and are rebuilt on `restore`.
+///
+/// Used both for save states and for the time-travel rewind timeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenesisCoreSnapshot {
+    /// 68000 CPU register state.
+    pub cpu: crate::cpu::CpuSnapshot,
+    /// Full VDP state (minus framebuffer).
+    pub vdp: crate::vdp::VdpSnapshot,
+    /// Cycle scheduler counters.
+    pub scheduler: crate::scheduler::SchedulerSnapshot,
+    /// Z80 CPU register state.
+    pub z80: z80::Z80Snapshot,
+    /// 64KB work RAM (stored as bytes for native serde support).
+    pub work_ram: Vec<u8>,
+    /// 8KB Z80 RAM.
+    pub z80_ram: Vec<u8>,
+    /// 68K ROM bank register.
+    pub z80_bank: u32,
+    /// 68K has requested the Z80 bus.
+    pub z80_bus_requested: bool,
+    /// Z80 in reset state.
+    pub z80_reset: bool,
+    /// Z80 reset transition pending.
+    pub z80_reset_pending: bool,
+    /// Z80 bus released at some point during the current scanline.
+    pub z80_bus_released_this_scanline: bool,
+    /// SN76489 PSG state.
+    pub psg: psg::Psg,
+    /// YM2612 FM synthesis state.
+    pub ym2612: ym2612::Ym2612,
+    /// Controller port 1.
+    pub port1: ControllerPort,
+    /// Controller port 2.
+    pub port2: ControllerPort,
+    /// Frame counter.
+    pub frame_count: u64,
+    /// Emulation speed in permille.
+    pub speed_permille: u16,
+    /// Whether emulation is paused.
+    pub paused: bool,
+}
+
 /// A YM2612 register write observed on the live machine timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimedYm2612Write {
@@ -1800,6 +1855,63 @@ impl GenesisCore {
     #[must_use]
     pub fn z80_snapshot(&self) -> z80::Z80Snapshot {
         self.z80.snapshot()
+    }
+
+    /// Captures a complete snapshot of the deterministic emulation state.
+    ///
+    /// The result excludes the immutable ROM, the RGBA framebuffer, and the
+    /// audio-DSP/debug scratch state (see [`GenesisCoreSnapshot`]).
+    #[must_use]
+    pub fn snapshot(&self) -> GenesisCoreSnapshot {
+        GenesisCoreSnapshot {
+            cpu: self.cpu.snapshot(),
+            vdp: self.vdp.snapshot(),
+            scheduler: self.scheduler.snapshot(),
+            z80: self.z80.snapshot(),
+            work_ram: self.work_ram.to_vec(),
+            z80_ram: self.z80_ram.to_vec(),
+            z80_bank: self.z80_bank,
+            z80_bus_requested: self.z80_bus_requested,
+            z80_reset: self.z80_reset,
+            z80_reset_pending: self.z80_reset_pending,
+            z80_bus_released_this_scanline: self.z80_bus_released_this_scanline,
+            psg: self.psg.clone(),
+            ym2612: self.ym2612.clone(),
+            port1: self.port1.clone(),
+            port2: self.port2.clone(),
+            frame_count: self.frame_count,
+            speed_permille: self.speed_permille,
+            paused: self.paused,
+        }
+    }
+
+    /// Restores the deterministic emulation state from a snapshot.
+    ///
+    /// The immutable ROM and header are left untouched. The RGBA framebuffer is
+    /// re-derived by subsequent rendering. The audio-DSP resampler/filter state
+    /// is rebuilt so the core is left internally consistent for audio output.
+    pub fn restore(&mut self, snap: &GenesisCoreSnapshot) {
+        self.cpu.restore(&snap.cpu);
+        self.vdp.restore(&snap.vdp);
+        self.scheduler.restore(&snap.scheduler);
+        self.z80.restore(&snap.z80);
+        self.work_ram.copy_from_slice(&snap.work_ram);
+        self.z80_ram.copy_from_slice(&snap.z80_ram);
+        self.z80_bank = snap.z80_bank;
+        self.z80_bus_requested = snap.z80_bus_requested;
+        self.z80_reset = snap.z80_reset;
+        self.z80_reset_pending = snap.z80_reset_pending;
+        self.z80_bus_released_this_scanline = snap.z80_bus_released_this_scanline;
+        self.psg = snap.psg.clone();
+        self.ym2612 = snap.ym2612.clone();
+        self.port1 = snap.port1.clone();
+        self.port2 = snap.port2.clone();
+        self.frame_count = snap.frame_count;
+        self.speed_permille = snap.speed_permille;
+        self.paused = snap.paused;
+        // Rebuild the audio resampler/filter pipeline so the (excluded) DSP
+        // scratch state is consistent with the restored chip state.
+        self.reset_audio_resampler_state();
     }
 
     /// Returns the Z80 RAM (8KB) for debugging.
@@ -3889,6 +4001,40 @@ mod tests {
             "expected high shelf to cut treble more than mids, got 700Hz {:.4} vs 6kHz {:.4}",
             high_shelf_700,
             high_shelf_6000
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_roundtrip() {
+        let rom = vec![0u8; 0x8000];
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+
+        // Advance to a non-trivial state.
+        for _ in 0..10 {
+            core.execute(Command::StepFrame);
+        }
+        let snap = core.snapshot();
+
+        // Run forward and capture the reference framebuffer.
+        for _ in 0..10 {
+            core.execute(Command::StepFrame);
+        }
+        let fb_forward = core.framebuffer_rgba().to_vec();
+        let snap_forward = core.snapshot();
+
+        // Restore and replay the same frames — must reproduce exactly.
+        core.restore(&snap);
+        assert_eq!(core.frame_count(), snap.frame_count);
+        for _ in 0..10 {
+            core.execute(Command::StepFrame);
+        }
+        let fb_replay = core.framebuffer_rgba().to_vec();
+
+        assert_eq!(fb_forward, fb_replay, "framebuffers diverged after restore");
+        assert!(
+            core.snapshot() == snap_forward,
+            "snapshot state diverged after restore+replay"
         );
     }
 }
