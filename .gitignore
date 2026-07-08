@@ -17,3 +17,6 @@ third_party/*.zip
 
 # Local work-in-progress scratch
 *.wip
+
+# Z80 single-step test vectors (downloaded, not checked in)
+tests/z80-tests/
