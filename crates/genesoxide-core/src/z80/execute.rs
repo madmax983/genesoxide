@@ -369,7 +369,10 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
     // Increment R: lower 7 bits wrap, bit 7 is preserved.
     cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_add(1)) & 0x7F);
 
-    match opcode {
+    // Snapshot F to maintain the Q register (see below).
+    let f_before = cpu.f;
+
+    let cycles = match opcode {
         // ── NOP ────────────────────────────────────────────────────
         0x00 => 4,
 
@@ -645,11 +648,13 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── SCF ───────────────────────────────────────────────────
         0x37 => {
+            // Undocumented X/Y: ((Q ^ F) | A) & (X|Y). Q is the flags value
+            // from the previous flag-modifying instruction (0 otherwise).
+            let xy = ((cpu.q ^ cpu.f) | cpu.a) & (FLAG_X | FLAG_Y);
             cpu.set_flag(FLAG_C, true);
             cpu.set_flag(FLAG_H, false);
             cpu.set_flag(FLAG_N, false);
-            cpu.set_flag(FLAG_X, cpu.a & FLAG_X != 0);
-            cpu.set_flag(FLAG_Y, cpu.a & FLAG_Y != 0);
+            cpu.f = (cpu.f & !(FLAG_X | FLAG_Y)) | xy;
             4
         }
 
@@ -662,12 +667,13 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── CCF ───────────────────────────────────────────────────
         0x3F => {
+            // Undocumented X/Y: ((Q ^ F) | A) & (X|Y), same rule as SCF.
+            let xy = ((cpu.q ^ cpu.f) | cpu.a) & (FLAG_X | FLAG_Y);
             let old_c = cpu.flag(FLAG_C);
             cpu.set_flag(FLAG_H, old_c);
             cpu.set_flag(FLAG_N, false);
             cpu.set_flag(FLAG_C, !old_c);
-            cpu.set_flag(FLAG_X, cpu.a & FLAG_X != 0);
-            cpu.set_flag(FLAG_Y, cpu.a & FLAG_Y != 0);
+            cpu.f = (cpu.f & !(FLAG_X | FLAG_Y)) | xy;
             4
         }
 
@@ -993,7 +999,15 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
         // since we cover 0x00-0xFF above.
         #[allow(unreachable_patterns)]
         _ => 4,
-    }
+    };
+
+    // Maintain the Q register: it holds the flags value produced by the last
+    // instruction that modified F, and 0 if F was left untouched. SCF/CCF read
+    // it to reconstruct their undocumented X/Y flags. Prefixed instructions set
+    // Q themselves (the DD/FD/ED/CB fetch resets it before the real opcode runs).
+    cpu.q = if cpu.f != f_before { cpu.f } else { 0 };
+
+    cycles
 }
 
 // ── CB prefix handler ──────────────────────────────────────────────────
@@ -1846,6 +1860,10 @@ fn read_reg16_indexed(cpu: &Z80, pair: u8, is_ix: bool) -> u16 {
 /// Executes a DD/FD-prefixed opcode. is_ix = true for DD (IX), false for FD (IY).
 /// Returns total T-states for the prefixed instruction.
 fn execute_ddfd(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8, is_ix: bool) -> u8 {
+    // The DD/FD prefix fetch does not modify F, so it resets Q to 0. A
+    // following SCF/CCF (e.g. DD 37) therefore sees Q = 0 rather than the Q
+    // left by the instruction before the prefix.
+    cpu.q = 0;
     match sub {
         // DD/FD followed by another prefix: treat current as NOP, let main loop
         // re-process. We already consumed the sub-opcode byte and incremented R.
