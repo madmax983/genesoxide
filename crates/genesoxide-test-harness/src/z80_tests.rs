@@ -216,6 +216,9 @@ pub fn load_cpu_state(cpu: &mut Z80, state: &TestState) {
     cpu.halted = false;
     cpu.cycles = 0;
     cpu.wz = state.wz;
+    // Q holds the flags produced by the previous flag-modifying instruction;
+    // SCF/CCF read it to derive their undocumented X/Y flags.
+    cpu.q = state.q;
 }
 
 // ── State comparison ───────────────────────────────────────────────────

@@ -152,6 +152,42 @@ fn set_sz_xy(cpu: &mut Z80, result: u8) {
     cpu.set_flag(FLAG_Y, result & FLAG_Y != 0);
 }
 
+/// Applies the undocumented flag corrections for a repeating block I/O
+/// instruction (INIR/INDR/OTIR/OTDR) that is about to repeat.
+///
+/// The base S/Z/PV/H/C/N flags (and X/Y from B) must already be set by the
+/// caller, and PC must not yet have been rewound. `val` is the byte that was
+/// transferred (the port byte for IN, the memory byte for OUT).
+///
+/// This implements Patrik Rak's documented behaviour: on a repeat, X/Y are
+/// taken from the high byte of the rewound PC, and H/PV get an extra
+/// adjustment derived from the carry, the transferred byte's sign, and the
+/// post-decrement value of B.
+#[inline]
+fn block_io_repeat(cpu: &mut Z80, val: u8) {
+    cpu.pc = cpu.pc.wrapping_sub(2);
+    cpu.wz = cpu.pc.wrapping_add(1);
+
+    // X/Y from the high byte of PC (now pointing back at the instruction).
+    let pch = (cpu.pc >> 8) as u8;
+    cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+    cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
+
+    let b = cpu.b; // B after decrement
+    let base_pv = cpu.flag(FLAG_PV);
+    let (hf, pv) = if cpu.flag(FLAG_C) {
+        if val & 0x80 != 0 {
+            (b & 0x0F == 0x00, base_pv ^ parity(b.wrapping_sub(1) & 7) ^ true)
+        } else {
+            (b & 0x0F == 0x0F, base_pv ^ parity(b.wrapping_add(1) & 7) ^ true)
+        }
+    } else {
+        (false, base_pv ^ parity(b & 7) ^ true)
+    };
+    cpu.set_flag(FLAG_H, hf);
+    cpu.set_flag(FLAG_PV, pv);
+}
+
 /// ADD A,val — sets all flags.
 #[inline]
 fn alu_add(cpu: &mut Z80, val: u8) {
@@ -369,7 +405,10 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
     // Increment R: lower 7 bits wrap, bit 7 is preserved.
     cpu.r = (cpu.r & 0x80) | ((cpu.r.wrapping_add(1)) & 0x7F);
 
-    match opcode {
+    // Snapshot F to maintain the Q register (see below).
+    let f_before = cpu.f;
+
+    let cycles = match opcode {
         // ── NOP ────────────────────────────────────────────────────
         0x00 => 4,
 
@@ -645,11 +684,13 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── SCF ───────────────────────────────────────────────────
         0x37 => {
+            // Undocumented X/Y: ((Q ^ F) | A) & (X|Y). Q is the flags value
+            // from the previous flag-modifying instruction (0 otherwise).
+            let xy = ((cpu.q ^ cpu.f) | cpu.a) & (FLAG_X | FLAG_Y);
             cpu.set_flag(FLAG_C, true);
             cpu.set_flag(FLAG_H, false);
             cpu.set_flag(FLAG_N, false);
-            cpu.set_flag(FLAG_X, cpu.a & FLAG_X != 0);
-            cpu.set_flag(FLAG_Y, cpu.a & FLAG_Y != 0);
+            cpu.f = (cpu.f & !(FLAG_X | FLAG_Y)) | xy;
             4
         }
 
@@ -662,12 +703,13 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
 
         // ── CCF ───────────────────────────────────────────────────
         0x3F => {
+            // Undocumented X/Y: ((Q ^ F) | A) & (X|Y), same rule as SCF.
+            let xy = ((cpu.q ^ cpu.f) | cpu.a) & (FLAG_X | FLAG_Y);
             let old_c = cpu.flag(FLAG_C);
             cpu.set_flag(FLAG_H, old_c);
             cpu.set_flag(FLAG_N, false);
             cpu.set_flag(FLAG_C, !old_c);
-            cpu.set_flag(FLAG_X, cpu.a & FLAG_X != 0);
-            cpu.set_flag(FLAG_Y, cpu.a & FLAG_Y != 0);
+            cpu.f = (cpu.f & !(FLAG_X | FLAG_Y)) | xy;
             4
         }
 
@@ -993,7 +1035,15 @@ pub fn execute_instruction(cpu: &mut Z80, bus: &mut dyn Bus) -> u8 {
         // since we cover 0x00-0xFF above.
         #[allow(unreachable_patterns)]
         _ => 4,
-    }
+    };
+
+    // Maintain the Q register: it holds the flags value produced by the last
+    // instruction that modified F, and 0 if F was left untouched. SCF/CCF read
+    // it to reconstruct their undocumented X/Y flags. Prefixed instructions set
+    // Q themselves (the DD/FD/ED/CB fetch resets it before the real opcode runs).
+    cpu.q = if cpu.f != f_before { cpu.f } else { 0 };
+
+    cycles
 }
 
 // ── CB prefix handler ──────────────────────────────────────────────────
@@ -1540,9 +1590,11 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
                 cpu.set_flag(FLAG_PV, true);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                // Undocumented X/Y come from the high byte of PC (now pointing
+                // back at the instruction), i.e. bits 13 and 11 of PC.
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 cpu.set_flag(FLAG_PV, false);
@@ -1566,9 +1618,9 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
                 cpu.set_flag(FLAG_PV, true);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 cpu.set_flag(FLAG_PV, false);
@@ -1596,9 +1648,10 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             if cpu.bc() != 0 && result != 0 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                // Undocumented X/Y come from the high byte of PC (bits 13/11).
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 let n = result.wrapping_sub(if hf { 1 } else { 0 });
@@ -1625,9 +1678,10 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             if cpu.bc() != 0 && result != 0 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                // Undocumented X/Y come from the high byte of PC (bits 13/11).
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 let n = result.wrapping_sub(if hf { 1 } else { 0 });
@@ -1651,11 +1705,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1676,11 +1726,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1701,11 +1747,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1726,11 +1768,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1846,6 +1884,10 @@ fn read_reg16_indexed(cpu: &Z80, pair: u8, is_ix: bool) -> u16 {
 /// Executes a DD/FD-prefixed opcode. is_ix = true for DD (IX), false for FD (IY).
 /// Returns total T-states for the prefixed instruction.
 fn execute_ddfd(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8, is_ix: bool) -> u8 {
+    // The DD/FD prefix fetch does not modify F, so it resets Q to 0. A
+    // following SCF/CCF (e.g. DD 37) therefore sees Q = 0 rather than the Q
+    // left by the instruction before the prefix.
+    cpu.q = 0;
     match sub {
         // DD/FD followed by another prefix: treat current as NOP, let main loop
         // re-process. We already consumed the sub-opcode byte and incremented R.

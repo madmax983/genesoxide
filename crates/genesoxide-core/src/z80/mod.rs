@@ -110,6 +110,10 @@ pub struct Z80 {
     pub ei_pending: bool,
     /// Internal WZ/MEMPTR register (used for undocumented flag behavior).
     pub wz: u16,
+    /// Internal Q register: the value written to F by the last instruction
+    /// that modified the flags, or 0 if the last instruction left F alone.
+    /// Consumed by SCF/CCF to reconstruct their undocumented X/Y flags.
+    pub q: u8,
     /// Level-triggered maskable interrupt line (directly connected to VDP
     /// V-blank on the Genesis). When asserted (`true`) and IFF1 is set,
     /// the Z80 will service the interrupt before the next instruction.
@@ -150,6 +154,7 @@ impl Z80 {
             cycles: 0,
             ei_pending: false,
             wz: 0,
+            q: 0,
             int_line: false,
         }
     }
@@ -279,6 +284,7 @@ impl Z80 {
             cycles: self.cycles,
             ei_pending: self.ei_pending,
             wz: self.wz,
+            q: self.q,
             int_line: self.int_line,
         }
     }
@@ -314,6 +320,7 @@ impl Z80 {
         self.cycles = snap.cycles;
         self.ei_pending = snap.ei_pending;
         self.wz = snap.wz;
+        self.q = snap.q;
         self.int_line = snap.int_line;
     }
 }
@@ -358,6 +365,9 @@ pub struct Z80Snapshot {
     pub cycles: u64,
     pub ei_pending: bool,
     pub wz: u16,
+    /// Internal Q register (see [`Z80::q`]); must round-trip so SCF/CCF
+    /// undocumented flags stay deterministic across save-state/rewind.
+    pub q: u8,
     pub int_line: bool,
 }
 

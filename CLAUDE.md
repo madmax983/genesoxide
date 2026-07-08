@@ -25,6 +25,13 @@ Sega Genesis / Mega Drive emulator in Rust. Part of the oxide emulator family.
 
 The Z80 CPU (audio driver), YM2612 FM synth, and SN76489 PSG are all implemented;
 audio is generated, not silent.
+## Implemented Audio / Z80
+
+- Z80 CPU: full instruction set, validated per-opcode against the
+  SingleStepTests/z80 suite (see `genesoxide-test-harness --test z80_suite`).
+  VBlank /INT is asserted to the Z80 for one scanline per frame.
+- YM2612 FM synth and SN76489 PSG are present and wired (owned/tuned by a
+  separate audio workstream — avoid editing `ym2612.rs` / `psg.rs` blindly).
 
 ## Patterns
 
