@@ -284,6 +284,7 @@ impl Z80 {
             cycles: self.cycles,
             ei_pending: self.ei_pending,
             wz: self.wz,
+            q: self.q,
             int_line: self.int_line,
         }
     }
@@ -319,6 +320,7 @@ impl Z80 {
         self.cycles = snap.cycles;
         self.ei_pending = snap.ei_pending;
         self.wz = snap.wz;
+        self.q = snap.q;
         self.int_line = snap.int_line;
     }
 }
@@ -363,6 +365,9 @@ pub struct Z80Snapshot {
     pub cycles: u64,
     pub ei_pending: bool,
     pub wz: u16,
+    /// Internal Q register (see [`Z80::q`]); must round-trip so SCF/CCF
+    /// undocumented flags stay deterministic across save-state/rewind.
+    pub q: u8,
     pub int_line: bool,
 }
 
