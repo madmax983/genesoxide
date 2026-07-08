@@ -260,8 +260,9 @@ impl Operator {
         } else {
             self.env_state = EnvState::Attack;
         }
-        // SSG-EG: every new note starts non-inverted
-        self.ssg_output_invert = false;
+        // SSG-EG: on key-on the inverted state is seeded directly from the mode's
+        // attack bit (ymfm `start_attack`: `m_ssg_inverted = enable & bit2`).
+        self.ssg_output_invert = self.ssg_enabled() && self.ssg_attack();
     }
 
     /// Trigger key-off: transition to the release phase.
@@ -270,61 +271,62 @@ impl Operator {
             return;
         }
         self.key_on = false;
-        // SSG-EG: bake the current inversion into the stored attenuation before
-        // entering Release, because the output path does NOT apply inversion
-        // during Release (the release envelope must start from the correct level).
-        if self.ssg_enabled()
-            && self.env_state != EnvState::Release
-            && self.ssg_output_invert != self.ssg_attack()
-        {
+        // SSG-EG: if the output is currently inverted, snap the inverted attenuation
+        // as the starting point for release and clear the invert flag, so release
+        // decays from the correct level (ymfm `start_release`).
+        if self.ssg_enabled() && self.ssg_output_invert {
             self.envelope = 0x200u16.wrapping_sub(self.envelope) & 0x3FF;
+            self.ssg_output_invert = false;
         }
         self.env_state = EnvState::Release;
     }
 
-    /// SSG-EG state machine. Called every EG tick when SSG-EG is enabled and
-    /// attenuation has crossed the 0x200 threshold.
+    /// SSG-EG state machine. Called every EG tick when SSG-EG is enabled, once the
+    /// attenuation has crossed above the 0x200 midpoint.
     ///
-    /// Handles looping (restart attack), alternating (toggle inversion), holding,
-    /// and phase reset. Reference: jgenesis + Nuked-OPN2.
+    /// Mirrors ymfm `clock_ssg_eg_state`. `ssg_output_invert` is the direct
+    /// inverted-output flag (ymfm `m_ssg_inverted`), applied unconditionally at the
+    /// output. Mode bits: bit2 = attack (initial invert), bit1 = alternate,
+    /// bit0 = hold.
     fn ssg_clock(&mut self, fnum: u16, block: u8) {
+        // Work only happens once the attenuation crosses above 0x200 (bit 9 set).
         if self.envelope < 0x200 {
             return;
         }
 
-        // 1. Update inversion state
-        if self.ssg_alternate() {
-            if self.ssg_hold() {
-                // Alternate + hold: permanently set inversion after first cycle
-                self.ssg_output_invert = true;
-            } else {
-                // Alternate: toggle inversion each cycle
+        let mode = self.ssg_eg & 0x07;
+        let attack = mode & 0x04 != 0;
+        let alternate = mode & 0x02 != 0;
+        let hold = mode & 0x01 != 0;
+
+        if hold {
+            // Hold modes (1/3/5/7): settle the invert flag to its end state, then
+            // once past the attack phase pin the attenuation to the held level.
+            self.ssg_output_invert = attack ^ alternate;
+            if self.env_state != EnvState::Attack {
+                self.envelope = if self.ssg_output_invert { 0x200 } else { 0x3FF };
+            }
+        } else {
+            // Continuous modes (0/2/4/6): alternating modes toggle the invert flag.
+            if alternate {
                 self.ssg_output_invert = !self.ssg_output_invert;
             }
-        }
-
-        // 2. Phase reset for non-alternating, non-holding loops.
-        //    Keeps the oscillator frozen at 0 until attenuation drops below 0x200.
-        if !self.ssg_alternate() && !self.ssg_hold() {
-            self.phase = 0;
-        }
-
-        // 3. Loop / hold / silence logic (if-else: loop takes priority over silence)
-        if matches!(self.env_state, EnvState::Decay | EnvState::Sustain) && !self.ssg_hold() {
-            // Loop: restart attack-decay cycle
-            let rate = self.effective_rate(self.attack_rate, fnum, block);
-            if rate >= 62 {
-                // Instant attack: skip directly to Decay
-                self.envelope = 0;
-                self.env_state = EnvState::Decay;
-            } else {
+            // Restart the attack when looping out of decay/sustain.
+            if matches!(self.env_state, EnvState::Decay | EnvState::Sustain) {
                 self.env_state = EnvState::Attack;
+                let rate = self.effective_rate(self.attack_rate, fnum, block);
+                if rate >= 62 {
+                    self.envelope = 0;
+                }
             }
-        } else if self.env_state == EnvState::Release
-            || (self.env_state != EnvState::Attack && self.ssg_output_invert == self.ssg_attack())
-        {
-            // Silence: force max attenuation when in Release, or when the current
-            // inversion state matches the attack flag (= "default" direction).
+            // Non-alternating modes (0/4) reset the phase each cycle.
+            if !alternate {
+                self.phase = 0;
+            }
+        }
+
+        // In every mode, the release phase forces maximum attenuation.
+        if self.env_state == EnvState::Release {
             self.envelope = 0x3FF;
         }
     }
@@ -513,14 +515,11 @@ impl Operator {
         // Sine lookup (log domain) — 256-entry quarter-wave ROM from Nuked-OPN2
         let log_sin = SIN_TABLE[index];
 
-        // SSG-EG output inversion: when active, the attenuation is mirrored
-        // around the 0x200 midpoint, flipping the envelope shape.
-        // Applied only during Attack/Decay/Sustain (NOT Release), and only when
-        // the current inversion state differs from the attack flag.
-        let effective_envelope = if self.ssg_enabled()
-            && self.env_state != EnvState::Release
-            && self.ssg_output_invert != self.ssg_attack()
-        {
+        // SSG-EG output inversion (ymfm `envelope_attenuation`): when the invert
+        // flag is set, mirror the attenuation around the 0x200 midpoint. The flag
+        // is maintained directly by the SSG-EG state machine and is cleared on
+        // release, so this applies uniformly without a per-state guard.
+        let effective_envelope = if self.ssg_enabled() && self.ssg_output_invert {
             0x200u16.wrapping_sub(self.envelope) & 0x3FF
         } else {
             self.envelope
@@ -2201,3 +2200,4 @@ mod tests {
         );
     }
 }
+
