@@ -9,6 +9,7 @@ use crate::cpu::execute::Bus;
 use crate::cpu::{self, Cpu};
 use crate::io::ControllerPort;
 use crate::psg;
+use crate::rewind;
 use crate::rom::{self, RomHeader};
 use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Scheduler};
 use crate::vdp::Vdp;
@@ -980,6 +981,12 @@ pub enum Command {
     Pause,
     /// Resume emulation.
     Resume,
+    /// Rewind emulation by the given number of frames (time-travel).
+    Rewind { frames: u32 },
+    /// Step exactly one frame backward (equivalent to `Rewind { frames: 1 }`).
+    StepBack,
+    /// Reconfigure the rewind timeline (history window, keyframe policy, enable).
+    SetRewindConfig(rewind::RewindConfig),
 }
 
 /// Queries for reading emulator state without mutation.
@@ -997,6 +1004,8 @@ pub enum CoreQuery {
     FpsMilli,
     /// Frame counter.
     FrameCounter,
+    /// Rewind buffer status (frames available, memory used, window bounds).
+    RewindStatus,
 }
 
 /// A complete, serializable snapshot of the deterministic emulation state.
@@ -1474,6 +1483,8 @@ pub struct GenesisCore {
     speed_permille: u16,
     /// Whether emulation is paused.
     paused: bool,
+    /// Time-travel rewind buffer (anchor + delta compressed timeline).
+    rewind: rewind::RewindBuffer,
 }
 
 impl GenesisCore {
@@ -1664,6 +1675,7 @@ impl GenesisCore {
             frame_count: 0,
             speed_permille: 1000,
             paused: false,
+            rewind: rewind::RewindBuffer::new(rewind::RewindConfig::default()),
         };
         core.reset_audio_resampler_state();
         core
@@ -1698,6 +1710,20 @@ impl GenesisCore {
             }
             Command::Pause => self.paused = true,
             Command::Resume => self.paused = false,
+            Command::Rewind { frames } => self.rewind_frames(frames),
+            Command::StepBack => self.rewind_frames(1),
+            Command::SetRewindConfig(cfg) => self.rewind.set_config(cfg),
+        }
+    }
+
+    /// Rewinds by `frames`, reconstructing the older state, restoring it, and
+    /// truncating the abandoned forward history so subsequent stepping records
+    /// over it.
+    fn rewind_frames(&mut self, frames: u32) {
+        let target = self.frame_count.saturating_sub(u64::from(frames));
+        if let Some(snap) = self.rewind.reconstruct(target) {
+            self.restore(&snap);
+            self.rewind.truncate_after(target);
         }
     }
 
@@ -1914,6 +1940,24 @@ impl GenesisCore {
         self.reset_audio_resampler_state();
     }
 
+    /// Returns the current rewind buffer status.
+    #[must_use]
+    pub fn rewind_status(&self) -> rewind::RewindStatus {
+        self.rewind.status()
+    }
+
+    /// Returns the number of frames currently available to rewind through.
+    #[must_use]
+    pub fn rewind_frames_available(&self) -> u64 {
+        self.rewind.frames_available()
+    }
+
+    /// Returns the estimated memory (bytes) used by the rewind timeline.
+    #[must_use]
+    pub fn rewind_memory_used(&self) -> usize {
+        self.rewind.memory_used()
+    }
+
     /// Returns the Z80 RAM (8KB) for debugging.
     #[must_use]
     pub fn z80_ram(&self) -> &[u8] {
@@ -1980,6 +2024,10 @@ impl GenesisCore {
         self.ym2612 = ym2612::Ym2612::new();
         self.reset_audio_resampler_state();
         self.frame_count = 0;
+
+        // A new power cycle invalidates any recorded rewind history; keep the
+        // active configuration but start the timeline fresh.
+        self.rewind = rewind::RewindBuffer::new(self.rewind.config.clone());
 
         // 68000 boot: read SSP from 0x000000, PC from 0x000004
         if self.rom.len() >= 8 {
@@ -2211,6 +2259,19 @@ impl GenesisCore {
         self.port1.reset_th_counter();
         self.port2.reset_th_counter();
         self.frame_count += 1;
+
+        // Record this frame into the rewind timeline. record() is a no-op when
+        // rewind is disabled; when enabled it captures a snapshot plus the input
+        // that produced this frame so the state can later be rewound and the
+        // input stream deterministically replayed.
+        if self.rewind.config.enabled {
+            let snapshot = self.snapshot();
+            let input = rewind::FrameInput {
+                port1_buttons: self.port1.buttons(),
+                port2_buttons: self.port2.buttons(),
+            };
+            self.rewind.record(self.frame_count, snapshot, input);
+        }
     }
 
     /// Returns the current frame's audio samples (stereo interleaved f32).
