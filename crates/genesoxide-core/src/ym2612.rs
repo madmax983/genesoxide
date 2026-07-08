@@ -156,7 +156,7 @@ pub enum EnvState {
 // ── Operator ─────────────────────────────────────────────────────────────
 
 /// A single FM operator with phase generator and envelope generator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Operator {
     /// 20-bit phase accumulator.
     phase: u32,
@@ -561,7 +561,7 @@ impl Operator {
 // ── Channel ──────────────────────────────────────────────────────────────
 
 /// One of six FM channels, containing four operators connected by an algorithm.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
     /// The four FM operators.
     operators: [Operator; 4],
@@ -914,7 +914,7 @@ impl Channel {
 /// ```ignore
 /// let (left, right) = ym.output_sample();
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ym2612 {
     /// The six FM channels.
     channels: [Channel; 6],

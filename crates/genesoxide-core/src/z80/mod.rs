@@ -282,6 +282,40 @@ impl Z80 {
             int_line: self.int_line,
         }
     }
+
+    /// Restores CPU state from a snapshot.
+    pub fn restore(&mut self, snap: &Z80Snapshot) {
+        self.a = snap.a;
+        self.f = snap.f;
+        self.b = snap.b;
+        self.c = snap.c;
+        self.d = snap.d;
+        self.e = snap.e;
+        self.h = snap.h;
+        self.l = snap.l;
+        self.a_prime = snap.a_prime;
+        self.f_prime = snap.f_prime;
+        self.b_prime = snap.b_prime;
+        self.c_prime = snap.c_prime;
+        self.d_prime = snap.d_prime;
+        self.e_prime = snap.e_prime;
+        self.h_prime = snap.h_prime;
+        self.l_prime = snap.l_prime;
+        self.ix = snap.ix;
+        self.iy = snap.iy;
+        self.sp = snap.sp;
+        self.pc = snap.pc;
+        self.i = snap.i;
+        self.r = snap.r;
+        self.iff1 = snap.iff1;
+        self.iff2 = snap.iff2;
+        self.im = snap.im;
+        self.halted = snap.halted;
+        self.cycles = snap.cycles;
+        self.ei_pending = snap.ei_pending;
+        self.wz = snap.wz;
+        self.int_line = snap.int_line;
+    }
 }
 
 impl Default for Z80 {
