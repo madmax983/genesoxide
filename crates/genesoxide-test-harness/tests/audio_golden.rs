@@ -5272,10 +5272,10 @@ fn resolve_ghz_references_prefers_manifest_order_and_skips_disabled() {
     )
     .expect("expected manifest");
     let discovered = vec![
-        PathBuf::from(r"C:\tmp\sonic_ghz_a.flac"),
-        PathBuf::from(r"C:\tmp\sonic_ghz_disabled.flac"),
-        PathBuf::from(r"C:\tmp\sonic_ghz_b.flac"),
-        PathBuf::from(r"C:\tmp\sonic_ghz_extra.flac"),
+        PathBuf::from("/tmp/sonic_ghz_a.flac"),
+        PathBuf::from("/tmp/sonic_ghz_disabled.flac"),
+        PathBuf::from("/tmp/sonic_ghz_b.flac"),
+        PathBuf::from("/tmp/sonic_ghz_extra.flac"),
     ];
 
     let resolved = resolve_ghz_references(&discovered, Some(&manifest));
@@ -5315,8 +5315,8 @@ fn resolve_ghz_references_defaults_unlisted_weights_to_one() {
     )
     .expect("expected manifest");
     let discovered = vec![
-        PathBuf::from(r"C:\tmp\sonic_ghz_primary.flac"),
-        PathBuf::from(r"C:\tmp\sonic_ghz_unlisted.flac"),
+        PathBuf::from("/tmp/sonic_ghz_primary.flac"),
+        PathBuf::from("/tmp/sonic_ghz_unlisted.flac"),
     ];
 
     let resolved = resolve_ghz_references(&discovered, Some(&manifest));
@@ -5373,8 +5373,8 @@ fn ghz_reference_weight_with_side_overrides_only_changes_targeted_side_weight() 
 #[test]
 fn summarize_reference_authority_tracks_manual_and_effective_weights() {
     let loaded_refs = vec![
-        (PathBuf::from(r"C:\tmp\sonic_ghz.flac"), vec![]),
-        (PathBuf::from(r"C:\tmp\sonic_ghz_16bap.flac"), vec![]),
+        (PathBuf::from("/tmp/sonic_ghz.flac"), vec![]),
+        (PathBuf::from("/tmp/sonic_ghz_16bap.flac"), vec![]),
     ];
     let mono_refs = vec![
         FixedMonoConsensusReference {

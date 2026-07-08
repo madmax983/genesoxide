@@ -343,6 +343,172 @@ mod tests {
         assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
     }
 
+    /// Build a single-carrier tone driving the SSG-EG in a looping configuration:
+    /// instant attack, moderate decay toward a high sustain level, and a fast
+    /// sustain climb, so the attenuation repeatedly crosses the 0x200 SSG midpoint
+    /// and the SSG-EG state machine actually cycles.
+    fn ssg_eg_looping_vgm(mode: u8) -> crate::vgm::Vgm {
+        let (fnum, block) = (1083u16, 4u8);
+        let fnum_hi = ((block & 7) << 3) | ((fnum >> 8) & 0x07) as u8;
+        let fnum_lo = (fnum & 0xFF) as u8;
+        VgmBuilder::new()
+            .ym_write(0, 0xB0, 0x07) // algorithm 7 (all operators are carriers)
+            .ym_write(0, 0xB4, 0xC0) // L + R
+            .ym_write(0, 0x40, 127)
+            .ym_write(0, 0x44, 127)
+            .ym_write(0, 0x48, 127)
+            .ym_write(0, 0x4C, 127)
+            .ym_write(0, 0x30, 0x01) // op1 MUL=1
+            .ym_write(0, 0x40, 0x00) // op1 TL=0
+            .ym_write(0, 0x50, 0x1F) // AR=31 (instant attack)
+            .ym_write(0, 0x60, 0x10) // DR=16
+            .ym_write(0, 0x70, 0x1F) // SR=31 (fast sustain climb)
+            .ym_write(0, 0x80, 0xF0) // SL=15, RR=0
+            .ym_write(0, 0x90, mode) // SSG-EG mode
+            .ym_write(0, 0xA4, fnum_hi)
+            .ym_write(0, 0xA0, fnum_lo)
+            .ym_write(0, 0x28, 0x10) // key on op1
+            .wait(22_050)
+            .build()
+    }
+
+    /// A 4-operator tone on a single algorithm with operator 1 feedback, used to
+    /// exercise each algorithm's operator-connection topology against ymfm.
+    fn algorithm_vgm(algo: u8, feedback: u8) -> crate::vgm::Vgm {
+        let (fnum, block) = (1083u16, 4u8);
+        let fnum_hi = ((block & 7) << 3) | ((fnum >> 8) & 0x07) as u8;
+        let fnum_lo = (fnum & 0xFF) as u8;
+        let mut b = VgmBuilder::new()
+            .ym_write(0, 0xB0, (feedback << 3) | (algo & 0x07))
+            .ym_write(0, 0xB4, 0xC0);
+        // register slot order: 0x00=op1, 0x08=op2, 0x04=op3, 0x0C=op4
+        for off in [0x00u8, 0x08, 0x04, 0x0C] {
+            b = b
+                .ym_write(0, 0x30 + off, 0x01)
+                .ym_write(0, 0x40 + off, 0x00)
+                .ym_write(0, 0x50 + off, 0x1F)
+                .ym_write(0, 0x60 + off, 0x00)
+                .ym_write(0, 0x70 + off, 0x00)
+                .ym_write(0, 0x80 + off, 0x0F);
+        }
+        b.ym_write(0, 0xA4, fnum_hi)
+            .ym_write(0, 0xA0, fnum_lo)
+            .ym_write(0, 0x28, 0xF0) // key on all four operators
+            .wait(22_050)
+            .build()
+    }
+
+    #[test]
+    fn all_algorithms_match_ymfm() {
+        // Regression for algorithm operator routing. Algorithm 2 had op1/op2 swapped
+        // in the op3/op4 modulation inputs, which only showed up once a modulator was
+        // driven hard (feedback or non-zero modulator TL): corr collapsed to ~0.05
+        // while all other algorithms stayed > 0.99. Check every algorithm with op1
+        // feedback so a topology error cannot hide behind silent modulators.
+        for algo in 0u8..=7 {
+            let vgm = algorithm_vgm(algo, 6);
+            let m = Ymfm2612Renderer::compare_against_genesoxide(&vgm);
+            eprintln!(
+                "algorithm {algo} (fb=6): corr={:.4} rms_ratio={:.4}",
+                m.correlation_left, m.rms_ratio_left
+            );
+            assert!(
+                m.correlation_left > 0.95,
+                "algorithm {algo} routing diverged from ymfm: corr={:.4}",
+                m.correlation_left
+            );
+            assert!(
+                (0.8..=1.2).contains(&m.rms_ratio_left),
+                "algorithm {algo} level off vs ymfm: rms_ratio={:.4}",
+                m.rms_ratio_left
+            );
+        }
+    }
+
+    /// Single sustained carrier with LFO phase modulation (vibrato) at a given
+    /// PM sensitivity, used to check vibrato depth/shape against ymfm.
+    fn lfo_pm_vgm(pms: u8, lfo_freq: u8) -> crate::vgm::Vgm {
+        let (fnum, block) = (1083u16, 4u8);
+        let fnum_hi = ((block & 7) << 3) | ((fnum >> 8) & 0x07) as u8;
+        let fnum_lo = (fnum & 0xFF) as u8;
+        VgmBuilder::new()
+            .ym_write(0, 0x22, 0x08 | (lfo_freq & 0x07)) // LFO enable + rate
+            .ym_write(0, 0xB0, 0x07)
+            .ym_write(0, 0xB4, 0xC0 | (pms & 0x07)) // L+R, PMS
+            .ym_write(0, 0x40, 127)
+            .ym_write(0, 0x44, 127)
+            .ym_write(0, 0x48, 127)
+            .ym_write(0, 0x4C, 127)
+            .ym_write(0, 0x30, 0x01)
+            .ym_write(0, 0x40, 0x00)
+            .ym_write(0, 0x50, 0x1F)
+            .ym_write(0, 0x60, 0x00)
+            .ym_write(0, 0x70, 0x00)
+            .ym_write(0, 0x80, 0x00) // sustain forever
+            .ym_write(0, 0xA4, fnum_hi)
+            .ym_write(0, 0xA0, fnum_lo)
+            .ym_write(0, 0x28, 0x10)
+            .wait(44_100)
+            .build()
+    }
+
+    #[test]
+    fn lfo_pm_depth_matches_ymfm() {
+        // Regression for LFO phase modulation (vibrato), which was 2x too deep and
+        // badly decorrelated at high PM sensitivity (PMS 7 was corr ~0.05).
+        for &(pms, min_corr) in &[(3u8, 0.97f32), (5, 0.97), (6, 0.93), (7, 0.85)] {
+            let vgm = lfo_pm_vgm(pms, 4);
+            let m = Ymfm2612Renderer::compare_against_genesoxide(&vgm);
+            eprintln!(
+                "lfo_pm pms={pms}: corr={:.4} rms_ratio={:.4}",
+                m.correlation_left, m.rms_ratio_left
+            );
+            assert!(
+                m.correlation_left > min_corr,
+                "PM pms={pms} correlation {:.4} below {:.2} (vibrato depth/shape wrong)",
+                m.correlation_left,
+                min_corr
+            );
+            assert!(
+                (0.8..=1.2).contains(&m.rms_ratio_left),
+                "PM pms={pms} level off vs ymfm: rms_ratio={:.4}",
+                m.rms_ratio_left
+            );
+        }
+    }
+
+    #[test]
+    fn ssg_eg_modes_match_ymfm() {
+        // Regression for the SSG-EG "attack"/invert modes (12-15, i.e. register
+        // values 0x0C-0x0F) which were previously near-silent (rms ~0.03x ymfm).
+        // All eight enabled SSG-EG modes should now track ymfm in level and shape.
+        for mode in 0x08u8..=0x0F {
+            let vgm = ssg_eg_looping_vgm(mode);
+            let m = Ymfm2612Renderer::compare_against_genesoxide(&vgm);
+            eprintln!(
+                "ssg_eg mode {mode:#04x}: corr={:.4} rms_ratio={:.4} peak_ratio={:.4}",
+                m.correlation_left, m.rms_ratio_left, m.peak_ratio_left
+            );
+            assert!(
+                m.correlation_left > 0.95,
+                "SSG mode {mode:#04x} shape diverged: corr={:.4}",
+                m.correlation_left
+            );
+            // The attack modes must no longer collapse to silence; every mode should
+            // land near the ~0.93x per-channel level ymfm produces.
+            assert!(
+                m.rms_ratio_left > 0.5,
+                "SSG mode {mode:#04x} too quiet vs ymfm: rms_ratio={:.4}",
+                m.rms_ratio_left
+            );
+            assert!(
+                (0.8..=1.2).contains(&m.peak_ratio_left),
+                "SSG mode {mode:#04x} peak off vs ymfm: peak_ratio={:.4}",
+                m.peak_ratio_left
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn dump_genesoxide_vs_ymfm_reference_cases() {
