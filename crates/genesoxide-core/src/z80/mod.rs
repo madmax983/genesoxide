@@ -110,6 +110,10 @@ pub struct Z80 {
     pub ei_pending: bool,
     /// Internal WZ/MEMPTR register (used for undocumented flag behavior).
     pub wz: u16,
+    /// Internal Q register: the value written to F by the last instruction
+    /// that modified the flags, or 0 if the last instruction left F alone.
+    /// Consumed by SCF/CCF to reconstruct their undocumented X/Y flags.
+    pub q: u8,
     /// Level-triggered maskable interrupt line (directly connected to VDP
     /// V-blank on the Genesis). When asserted (`true`) and IFF1 is set,
     /// the Z80 will service the interrupt before the next instruction.
@@ -150,6 +154,7 @@ impl Z80 {
             cycles: 0,
             ei_pending: false,
             wz: 0,
+            q: 0,
             int_line: false,
         }
     }
