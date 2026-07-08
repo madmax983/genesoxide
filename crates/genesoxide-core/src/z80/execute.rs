@@ -152,6 +152,42 @@ fn set_sz_xy(cpu: &mut Z80, result: u8) {
     cpu.set_flag(FLAG_Y, result & FLAG_Y != 0);
 }
 
+/// Applies the undocumented flag corrections for a repeating block I/O
+/// instruction (INIR/INDR/OTIR/OTDR) that is about to repeat.
+///
+/// The base S/Z/PV/H/C/N flags (and X/Y from B) must already be set by the
+/// caller, and PC must not yet have been rewound. `val` is the byte that was
+/// transferred (the port byte for IN, the memory byte for OUT).
+///
+/// This implements Patrik Rak's documented behaviour: on a repeat, X/Y are
+/// taken from the high byte of the rewound PC, and H/PV get an extra
+/// adjustment derived from the carry, the transferred byte's sign, and the
+/// post-decrement value of B.
+#[inline]
+fn block_io_repeat(cpu: &mut Z80, val: u8) {
+    cpu.pc = cpu.pc.wrapping_sub(2);
+    cpu.wz = cpu.pc.wrapping_add(1);
+
+    // X/Y from the high byte of PC (now pointing back at the instruction).
+    let pch = (cpu.pc >> 8) as u8;
+    cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+    cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
+
+    let b = cpu.b; // B after decrement
+    let base_pv = cpu.flag(FLAG_PV);
+    let (hf, pv) = if cpu.flag(FLAG_C) {
+        if val & 0x80 != 0 {
+            (b & 0x0F == 0x00, base_pv ^ parity(b.wrapping_sub(1) & 7) ^ true)
+        } else {
+            (b & 0x0F == 0x0F, base_pv ^ parity(b.wrapping_add(1) & 7) ^ true)
+        }
+    } else {
+        (false, base_pv ^ parity(b & 7) ^ true)
+    };
+    cpu.set_flag(FLAG_H, hf);
+    cpu.set_flag(FLAG_PV, pv);
+}
+
 /// ADD A,val — sets all flags.
 #[inline]
 fn alu_add(cpu: &mut Z80, val: u8) {
@@ -1554,9 +1590,11 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
                 cpu.set_flag(FLAG_PV, true);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                // Undocumented X/Y come from the high byte of PC (now pointing
+                // back at the instruction), i.e. bits 13 and 11 of PC.
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 cpu.set_flag(FLAG_PV, false);
@@ -1580,9 +1618,9 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
                 cpu.set_flag(FLAG_PV, true);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 cpu.set_flag(FLAG_PV, false);
@@ -1610,9 +1648,10 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             if cpu.bc() != 0 && result != 0 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                // Undocumented X/Y come from the high byte of PC (bits 13/11).
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 let n = result.wrapping_sub(if hf { 1 } else { 0 });
@@ -1639,9 +1678,10 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             if cpu.bc() != 0 && result != 0 {
                 cpu.pc = cpu.pc.wrapping_sub(2);
                 cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                // Undocumented X/Y come from the high byte of PC (bits 13/11).
+                let pch = (cpu.pc >> 8) as u8;
+                cpu.set_flag(FLAG_X, pch & FLAG_X != 0);
+                cpu.set_flag(FLAG_Y, pch & FLAG_Y != 0);
                 21
             } else {
                 let n = result.wrapping_sub(if hf { 1 } else { 0 });
@@ -1665,11 +1705,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1690,11 +1726,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1715,11 +1747,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
@@ -1740,11 +1768,7 @@ fn execute_ed(cpu: &mut Z80, bus: &mut dyn Bus, sub: u8) -> u8 {
             cpu.set_flag(FLAG_C, k > 255);
             cpu.set_flag(FLAG_PV, parity(((k & 7) as u8) ^ cpu.b));
             if cpu.b != 0 {
-                cpu.pc = cpu.pc.wrapping_sub(2);
-                cpu.wz = cpu.pc.wrapping_add(1);
-                let wz_hi = (cpu.wz >> 8) as u8;
-                cpu.set_flag(FLAG_X, wz_hi & FLAG_X != 0);
-                cpu.set_flag(FLAG_Y, wz_hi & FLAG_Y != 0);
+                block_io_repeat(cpu, val);
                 21
             } else {
                 16
