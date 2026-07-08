@@ -11,9 +11,60 @@ pub struct GenesisConfig {
     /// Desktop frontend settings.
     #[serde(default)]
     pub desktop: DesktopConfig,
+    /// Time-travel rewind settings.
+    #[serde(default)]
+    pub rewind: RewindConfig,
     /// Named ROM paths.
     #[serde(default)]
     pub roms: std::collections::HashMap<String, String>,
+}
+
+/// Time-travel rewind configuration (TOML section `[rewind]`).
+///
+/// This mirrors `genesoxide_core::RewindConfig` but is defined locally so the
+/// config crate does not depend on the core crate. The desktop frontend maps
+/// it into the core type when sending `Command::SetRewindConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindConfig {
+    /// Whether rewind recording is active.
+    #[serde(default = "default_rewind_enabled")]
+    pub enabled: bool,
+    /// How many seconds of history to retain.
+    #[serde(default = "default_max_history_seconds")]
+    pub max_history_seconds: u32,
+    /// Fixed keyframe promotion interval, in frames.
+    #[serde(default = "default_keyframe_base_interval")]
+    pub keyframe_base_interval: u64,
+    /// Delta size (bytes) above which a spike keyframe may be promoted.
+    #[serde(default = "default_delta_spike_threshold")]
+    pub delta_spike_threshold: u32,
+}
+
+impl Default for RewindConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rewind_enabled(),
+            max_history_seconds: default_max_history_seconds(),
+            keyframe_base_interval: default_keyframe_base_interval(),
+            delta_spike_threshold: default_delta_spike_threshold(),
+        }
+    }
+}
+
+fn default_rewind_enabled() -> bool {
+    true
+}
+
+fn default_max_history_seconds() -> u32 {
+    30
+}
+
+fn default_keyframe_base_interval() -> u64 {
+    60
+}
+
+fn default_delta_spike_threshold() -> u32 {
+    2048
 }
 
 /// Desktop frontend configuration.
@@ -112,6 +163,29 @@ mod tests {
         assert_eq!(config.desktop.window_scale, 4);
         assert!(config.desktop.audio_enabled);
         assert_eq!(config.roms["sonic"], "/path/to/sonic.bin");
+    }
+
+    #[test]
+    fn default_rewind_config() {
+        let config = GenesisConfig::default();
+        assert!(config.rewind.enabled);
+        assert_eq!(config.rewind.max_history_seconds, 30);
+        assert_eq!(config.rewind.keyframe_base_interval, 60);
+        assert_eq!(config.rewind.delta_spike_threshold, 2048);
+    }
+
+    #[test]
+    fn parse_rewind_toml() {
+        let toml = r#"
+            [rewind]
+            enabled = false
+            max_history_seconds = 10
+        "#;
+        let config: GenesisConfig = toml::from_str(toml).unwrap();
+        assert!(!config.rewind.enabled);
+        assert_eq!(config.rewind.max_history_seconds, 10);
+        // Unspecified fields fall back to defaults.
+        assert_eq!(config.rewind.keyframe_base_interval, 60);
     }
 
     #[test]
