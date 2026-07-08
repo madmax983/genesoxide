@@ -100,6 +100,15 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
     let mut core = GenesisCore::new();
     core.execute(Command::LoadRom(rom_data));
 
+    // Apply the configured rewind settings (mapping the config-crate struct to
+    // the core struct).
+    core.execute(Command::SetRewindConfig(genesoxide_core::RewindConfig {
+        enabled: config.rewind.enabled,
+        keyframe_base_interval: config.rewind.keyframe_base_interval,
+        max_history_seconds: config.rewind.max_history_seconds,
+        delta_spike_threshold: config.rewind.delta_spike_threshold,
+    }));
+
     if let Some(header) = core.rom_header() {
         eprintln!("Loaded: {}", header.title_overseas);
         eprintln!("Region: {}", header.region);
@@ -123,6 +132,8 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         audio,
         last_frame_time: None,
         frame_duration: Duration::from_nanos(FRAME_PERIOD_NS),
+        rewind_held: false,
+        paused: false,
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
@@ -137,6 +148,10 @@ struct App {
     audio: Option<audio::AudioOutput>,
     last_frame_time: Option<Instant>,
     frame_duration: Duration,
+    /// True while Backspace is held (hold-to-rewind).
+    rewind_held: bool,
+    /// True when emulation is paused (P toggles).
+    paused: bool,
 }
 
 impl ApplicationHandler for App {
@@ -184,6 +199,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
+                    let pressed = event.state.is_pressed();
                     let button = match key {
                         KeyCode::ArrowUp => Some(genesoxide_core::Button::Up),
                         KeyCode::ArrowDown => Some(genesoxide_core::Button::Down),
@@ -197,11 +213,46 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                             None
                         }
+                        // Backspace: hold-to-rewind.
+                        KeyCode::Backspace => {
+                            self.rewind_held = pressed;
+                            None
+                        }
+                        // P: toggle pause (only on key press).
+                        KeyCode::KeyP => {
+                            if pressed {
+                                self.paused = !self.paused;
+                                self.core.execute(if self.paused {
+                                    Command::Pause
+                                } else {
+                                    Command::Resume
+                                });
+                            }
+                            None
+                        }
+                        // '.' or F: single-frame step forward while paused.
+                        KeyCode::Period | KeyCode::KeyF => {
+                            if pressed && self.paused {
+                                // step_frame() is a no-op while the core is
+                                // paused, so momentarily resume for one frame.
+                                self.core.execute(Command::Resume);
+                                self.core.execute(Command::StepFrame);
+                                self.core.execute(Command::Pause);
+                            }
+                            None
+                        }
+                        // ',' : single-frame step backward.
+                        KeyCode::Comma => {
+                            if pressed {
+                                self.core.execute(Command::StepBack);
+                            }
+                            None
+                        }
                         _ => None,
                     };
 
                     if let Some(btn) = button {
-                        let cmd = if event.state.is_pressed() {
+                        let cmd = if pressed {
                             Command::PressButton {
                                 port: 0,
                                 button: btn,
@@ -217,7 +268,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.core.execute(Command::StepFrame);
+                if self.rewind_held {
+                    self.core.execute(Command::StepBack);
+                } else if !self.paused {
+                    self.core.execute(Command::StepFrame);
+                }
 
                 // Push audio samples to output
                 if let Some(audio) = &mut self.audio {
