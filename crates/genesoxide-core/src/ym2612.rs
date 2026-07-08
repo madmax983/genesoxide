@@ -734,11 +734,12 @@ impl Channel {
                 (o4 >> RS).clamp(-CLIP, CLIP)
             }
             2 => {
-                // op1→op3, op2 standalone, (op2+op3)→op4
+                // (op1 + (op2→op3))→op4  [ymfm ALGORITHM(0,2,6): op2 standalone,
+                // op2 modulates op3, op1+op3 modulate op4; carrier op4]
                 let o1 = ops[0].compute(inc0, fb_mod, am_atten);
                 let o2 = ops[1].compute(inc1, 0, am_atten);
-                let o3 = ops[2].compute(inc2, o1 >> 1, am_atten);
-                let o4 = ops[3].compute(inc3, (o2 >> 1) + (o3 >> 1), am_atten);
+                let o3 = ops[2].compute(inc2, o2 >> 1, am_atten);
+                let o4 = ops[3].compute(inc3, (o1 >> 1) + (o3 >> 1), am_atten);
                 (o4 >> RS).clamp(-CLIP, CLIP)
             }
             3 => {
@@ -852,10 +853,11 @@ impl Channel {
                 (o4 >> RS).clamp(-CLIP, CLIP)
             }
             2 => {
+                // (op1 + (op2→op3))→op4  [ymfm ALGORITHM(0,2,6)]
                 let o1 = ops[0].compute(inc0, fb_mod, am_atten);
                 let o2 = ops[1].compute(inc1, 0, am_atten);
-                let o3 = ops[2].compute(inc2, o1 >> 1, am_atten);
-                let o4 = ops[3].compute(inc3, (o2 >> 1) + (o3 >> 1), am_atten);
+                let o3 = ops[2].compute(inc2, o2 >> 1, am_atten);
+                let o4 = ops[3].compute(inc3, (o1 >> 1) + (o3 >> 1), am_atten);
                 (o4 >> RS).clamp(-CLIP, CLIP)
             }
             3 => {
