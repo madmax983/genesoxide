@@ -583,8 +583,17 @@ impl AudioOutputConfig {
     }
 }
 
-impl Default for AudioOutputConfig {
-    fn default() -> Self {
+impl AudioOutputConfig {
+    /// GHZ-tuned colored output profile (opt-in, **not** the shipped default).
+    ///
+    /// This 5-stage EQ + crossfeed + side-EQ chain was historically the shipped
+    /// default. It was fit against a single Green Hill Zone hardware FLAC that the
+    /// fidelity log repeatedly shows is an unreliable oracle (loop-inconsistent,
+    /// phase-incoherent), so it scoops sub-bass and darkens the top in a way the
+    /// reference cannot justify. It is retained here as an explicitly selectable
+    /// profile for anyone who wants that particular coloration.
+    #[must_use]
+    pub fn ghz_colored() -> Self {
         Self::legacy()
             .with_gain(2.2)
             .with_ym_gain(1.1)
@@ -601,6 +610,17 @@ impl Default for AudioOutputConfig {
             .with_post_eq_5(AudioEqStage::peaking(560.0, 1.20, -2.4))
             .with_post_side_eq_1(AudioEqStage::peaking(450.0, 1.50, -4.0))
             .with_post_side_eq_2(AudioEqStage::peaking(2_600.0, 0.90, 0.0))
+    }
+}
+
+impl Default for AudioOutputConfig {
+    fn default() -> Self {
+        // Flat, uncolored default: only the Legacy YM anti-alias low-pass, unity
+        // EQ, no crossfeed, no side coloration. `master_gain` is set so a loud
+        // multi-channel patch peaks near (but under) full scale ahead of the
+        // final soft limiter, giving healthy loudness without brickwall clipping.
+        // The former GHZ-fit coloration is available via `ghz_colored()`.
+        Self::legacy().with_gain(1.35)
     }
 }
 
@@ -670,6 +690,26 @@ fn first_order_high_pass_filter_spec(cutoff_hz: f32, sample_rate_hz: f32) -> Aud
     let b1 = -b0;
     let a1 = (k - 1.0) / (k + 1.0);
     AudioFilterSpec::FirstOrder { b0, b1, a1 }
+}
+
+/// Smooth soft-clip / saturator applied as the final output-stage limiter.
+///
+/// The signal passes through unchanged (linear) below `KNEE`; above the knee the
+/// excess is compressed with a `tanh` curve that is asymptotically bounded to
+/// `(-1.0, 1.0)`. The slope is continuous at the knee (`tanh'(0) == 1`), so
+/// transients round off gracefully instead of squaring off into the odd-harmonic
+/// buzz a brickwall `clamp(-1.0, 1.0)` produces. Stays `f32` throughout.
+fn soft_limit(x: f32) -> f32 {
+    const KNEE: f32 = 0.8;
+    const RANGE: f32 = 1.0 - KNEE;
+    let magnitude = x.abs();
+    if magnitude <= KNEE {
+        x
+    } else {
+        let over = magnitude - KNEE;
+        let compressed = KNEE + RANGE * (over / RANGE).tanh();
+        x.signum() * compressed
+    }
 }
 
 fn apply_stereo_crossfeed(left: f32, right: f32, amount: f32) -> (f32, f32) {
@@ -2422,8 +2462,8 @@ impl GenesisCore {
         let delayed_right = self.post_delay_right.filter(fir_right);
         let left = delayed_left * self.audio_master_gain;
         let right = delayed_right * self.audio_master_gain;
-        self.audio_buffer.push(left.clamp(-1.0, 1.0));
-        self.audio_buffer.push(right.clamp(-1.0, 1.0));
+        self.audio_buffer.push(soft_limit(left));
+        self.audio_buffer.push(soft_limit(right));
 
         self.ym_window_left_acc = 0.0;
         self.ym_window_right_acc = 0.0;
@@ -3293,6 +3333,156 @@ mod tests {
         }
 
         output
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()))
+    }
+
+    /// Fraction of samples at or above a near-full-scale magnitude threshold.
+    fn clipped_fraction(samples: &[f32], threshold: f32) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let clipped = samples.iter().filter(|&&s| s.abs() >= threshold).count();
+        clipped as f32 / samples.len() as f32
+    }
+
+    /// Configures one YM channel as a loud sustained tone: algorithm 7 (all four
+    /// operators are carriers), max volume (TL 0), fast attack, no decay, hard-panned
+    /// to both outputs.
+    fn configure_loud_channel(ym: &mut ym2612::Ym2612, bank: u8, ch: u8, fnum: u16, block: u8) {
+        write_ym_reg(ym, bank, 0xB0 + ch, 0x07); // algorithm 7, feedback 0
+        write_ym_reg(ym, bank, 0xB4 + ch, 0xC0); // left + right enabled
+        for op in [0x00u8, 0x04, 0x08, 0x0C] {
+            let reg = ch + op;
+            write_ym_reg(ym, bank, 0x30 + reg, 0x01); // detune 0, multiple 1
+            write_ym_reg(ym, bank, 0x40 + reg, 0x00); // total level 0 (loudest)
+            write_ym_reg(ym, bank, 0x50 + reg, 0x1F); // attack rate 31
+            write_ym_reg(ym, bank, 0x60 + reg, 0x00); // decay rate 0
+            write_ym_reg(ym, bank, 0x70 + reg, 0x00); // sustain rate 0
+            write_ym_reg(ym, bank, 0x80 + reg, 0x00); // sustain level 0, release 0
+        }
+        write_ym_reg(ym, bank, 0xA4 + ch, (block << 3) | ((fnum >> 8) as u8 & 0x07));
+        write_ym_reg(ym, bank, 0xA0 + ch, (fnum & 0xFF) as u8);
+    }
+
+    /// Loud, dense representative patch: four simultaneous algorithm-7 channels at
+    /// distinct pitches (16 carriers summed), all keyed on and hard-panned centre.
+    fn configure_loud_patch(ym: &mut ym2612::Ym2612) {
+        configure_loud_channel(ym, 0, 0, 617, 4);
+        configure_loud_channel(ym, 0, 1, 800, 4);
+        configure_loud_channel(ym, 0, 2, 1000, 4);
+        configure_loud_channel(ym, 1, 0, 1083, 4);
+        // Key on all four operators of channels 1, 2, 3 (bank 0) and 4 (bank 1).
+        for code in [0x00u8, 0x01, 0x02, 0x04] {
+            write_ym_reg(ym, 0, 0x28, 0xF0 | code);
+        }
+    }
+
+    /// Renders the loud patch through the full live output chain under `config`,
+    /// returning the interleaved stereo output buffer (post soft limiter).
+    fn render_loud_patch(config: AudioOutputConfig, stereo_pairs: usize) -> Vec<f32> {
+        let mut core = GenesisCore::new();
+        core.audio_output_config = config;
+        core.rebuild_audio_output_pipeline();
+        configure_loud_patch(&mut core.audio_ym2612);
+        while core.audio_buffer.len() < stereo_pairs * 2 {
+            core.collect_audio_samples();
+        }
+        core.audio_buffer.clone()
+    }
+
+    #[test]
+    fn default_audio_config_is_flat() {
+        let cfg = AudioOutputConfig::default();
+        // No baked EQ coloration.
+        assert!(cfg.post_eq_1.is_none());
+        assert!(cfg.post_eq_2.is_none());
+        assert!(cfg.post_eq_3.is_none());
+        assert!(cfg.post_eq_4.is_none());
+        assert!(cfg.post_eq_5.is_none());
+        assert!(cfg.post_side_eq_1.is_none());
+        assert!(cfg.post_side_eq_2.is_none());
+        // No crossfeed / side coloration / side memory.
+        assert_eq!(cfg.stereo_crossfeed, 0.0);
+        assert_eq!(cfg.mid_gain, 1.0);
+        assert_eq!(cfg.side_gain, 1.0);
+        assert_eq!(cfg.ym_channel_side_memory_amounts, [0.0; 6]);
+        // Unity per-chip gains, only the Legacy YM anti-alias low-pass profile.
+        assert_eq!(cfg.ym_gain, 1.0);
+        assert_eq!(cfg.psg_gain, 1.0);
+        assert_eq!(cfg.profile, AudioOutputProfile::Legacy);
+        // The former colored chain is still reachable, but is not the default.
+        assert_ne!(cfg, AudioOutputConfig::ghz_colored());
+    }
+
+    #[test]
+    fn soft_limit_is_smooth_and_bounded() {
+        // Linear (identity) below the knee.
+        assert!((soft_limit(0.5) - 0.5).abs() < 1e-6);
+        assert!((soft_limit(-0.79) - (-0.79)).abs() < 1e-6);
+        // Never exceeds full scale, and stays strictly inside it for moderate overshoot.
+        assert!(soft_limit(100.0) <= 1.0);
+        assert!(soft_limit(-100.0) >= -1.0);
+        assert!(soft_limit(2.0) < 1.0);
+        assert!(soft_limit(-2.0) > -1.0);
+        // Monotonic and continuous around the knee.
+        assert!(soft_limit(0.85) > soft_limit(0.8));
+        assert!(soft_limit(0.85) < 0.85);
+    }
+
+    #[test]
+    fn soft_limiter_keeps_loud_patch_unclipped() {
+        const PAIRS: usize = 8_000;
+        // Skip the attack transient at the very start of the render.
+        const SKIP: usize = 2_000;
+
+        // AFTER: new flat default (soft limiter, gain tuned for loudness).
+        let after = render_loud_patch(AudioOutputConfig::default(), PAIRS);
+        let after = &after[SKIP..];
+        let after_clip = clipped_fraction(after, 0.999);
+        let after_peak = peak(after);
+        let after_rms = rms(after);
+
+        // BEFORE (reference numbers): the old shipped default (`ghz_colored`,
+        // master_gain 2.2, colored EQ) fed a brickwall `clamp(-1.0, 1.0)`. The
+        // pre-limiter chain is linear in master_gain, so render it at a tiny gain,
+        // scale back up to the old 2.2 gain, and hard-clamp to reproduce the old
+        // behavior on the identical patch.
+        let unity = render_loud_patch(AudioOutputConfig::ghz_colored().with_gain(0.01), PAIRS);
+        let before_hard: Vec<f32> = unity[SKIP..]
+            .iter()
+            .map(|&s| (s * 100.0 * 2.2).clamp(-1.0, 1.0))
+            .collect();
+        let before_clip = clipped_fraction(&before_hard, 0.999);
+        let before_peak = peak(&before_hard);
+        let before_rms = rms(&before_hard);
+
+        eprintln!(
+            "[soft-limiter] BEFORE (old default, hard clamp): clip%={:.2} peak={:.4} rms={:.4}",
+            before_clip * 100.0,
+            before_peak,
+            before_rms
+        );
+        eprintln!(
+            "[soft-limiter] AFTER  (new flat default, soft):   clip%={:.2} peak={:.4} rms={:.4}",
+            after_clip * 100.0,
+            after_peak,
+            after_rms
+        );
+
+        // The soft limiter must virtually eliminate clipping...
+        assert!(
+            after_clip < 0.01,
+            "clipped fraction too high: {after_clip}"
+        );
+        // ...while keeping a healthy, loud level well inside full scale.
+        assert!(
+            (0.5..=0.99).contains(&after_peak),
+            "peak outside healthy loud range: {after_peak}"
+        );
+        assert!(after_rms > 0.1, "output too quiet: rms={after_rms}");
     }
 
     #[test]
