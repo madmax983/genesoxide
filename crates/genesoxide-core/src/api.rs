@@ -4098,4 +4098,170 @@ mod tests {
             "snapshot state diverged after restore+replay"
         );
     }
+
+    /// Deterministic scripted controller input for frame `frame`.
+    fn scripted_buttons(frame: u64) -> u16 {
+        // A fixed, frame-dependent bit pattern. The exact semantics are
+        // irrelevant — both runs receive the identical stream, so the emulator
+        // must reach identical state.
+        let mut b = 0u16;
+        if frame % 2 == 0 {
+            b |= 0x0001;
+        }
+        if frame % 3 == 0 {
+            b |= 0x0010;
+        }
+        if frame % 5 == 0 {
+            b |= 0x0020;
+        }
+        if frame % 7 == 0 {
+            b |= 0x0008;
+        }
+        b
+    }
+
+    #[test]
+    fn determinism_frame_to_frame() {
+        let rom = vec![0u8; 0x8000];
+        let mut a = GenesisCore::new();
+        let mut b = GenesisCore::new();
+        a.execute(Command::LoadRom(rom.clone()));
+        b.execute(Command::LoadRom(rom));
+
+        for frame in 0..120u64 {
+            let buttons = scripted_buttons(frame);
+            a.execute(Command::SetControllerState { port: 0, buttons });
+            b.execute(Command::SetControllerState { port: 0, buttons });
+            a.execute(Command::StepFrame);
+            b.execute(Command::StepFrame);
+        }
+
+        let sa = a.snapshot();
+        let sb = b.snapshot();
+        assert!(sa == sb, "snapshot state diverged between identical runs");
+        // Byte-equal serialized snapshots.
+        let ja = serde_json::to_vec(&sa).unwrap();
+        let jb = serde_json::to_vec(&sb).unwrap();
+        assert_eq!(ja, jb, "serialized snapshots are not byte-equal");
+        // Framebuffers identical.
+        assert_eq!(
+            a.framebuffer_rgba(),
+            b.framebuffer_rgba(),
+            "framebuffers diverged between identical runs"
+        );
+    }
+
+    #[test]
+    fn rewind_roundtrip() {
+        const F: u64 = 120;
+        const R: u32 = 30;
+        let rom = vec![0u8; 0x8000];
+
+        // Core under test (rewind enabled by default).
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom.clone()));
+        // Reference core that never rewinds.
+        let mut reference = GenesisCore::new();
+        reference.execute(Command::LoadRom(rom));
+
+        for frame in 0..F {
+            let buttons = scripted_buttons(frame);
+            core.execute(Command::SetControllerState { port: 0, buttons });
+            reference.execute(Command::SetControllerState { port: 0, buttons });
+            core.execute(Command::StepFrame);
+            reference.execute(Command::StepFrame);
+        }
+
+        let ref_snap = reference.snapshot();
+        let ref_fb = reference.framebuffer_rgba().to_vec();
+        assert_eq!(core.frame_count(), F);
+
+        // Rewind, then replay the same input stream for the abandoned frames.
+        core.execute(Command::Rewind { frames: R });
+        assert_eq!(core.frame_count(), F - u64::from(R));
+        for frame in (F - u64::from(R))..F {
+            let buttons = scripted_buttons(frame);
+            core.execute(Command::SetControllerState { port: 0, buttons });
+            core.execute(Command::StepFrame);
+        }
+        assert_eq!(core.frame_count(), F);
+
+        assert!(
+            core.snapshot() == ref_snap,
+            "state after rewind+replay differs from the never-rewound reference"
+        );
+        assert_eq!(
+            serde_json::to_vec(&core.snapshot()).unwrap(),
+            serde_json::to_vec(&ref_snap).unwrap(),
+            "serialized state after rewind+replay is not byte-equal to reference"
+        );
+        assert_eq!(
+            core.framebuffer_rgba(),
+            ref_fb.as_slice(),
+            "framebuffer after rewind+replay differs from reference"
+        );
+    }
+
+    /// Reports snapshot size, capture cost, and naive-vs-delta memory.
+    /// Run with `cargo test -p genesoxide-core rewind_measurements -- --nocapture`.
+    #[test]
+    fn rewind_measurements() {
+        let rom = vec![0u8; 0x8000];
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+
+        // Warm up to a representative state.
+        for _ in 0..120 {
+            core.execute(Command::StepFrame);
+        }
+
+        let snap = core.snapshot();
+        let json_bytes = serde_json::to_vec(&snap).unwrap().len();
+        let bin_bytes = bincode::serialize(&snap).unwrap().len();
+
+        // Time snapshot capture.
+        let iters = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let s = core.snapshot();
+            std::hint::black_box(&s);
+        }
+        let per_capture = start.elapsed() / iters;
+
+        // Fill a full 30s window (default config = 1800 frames) and measure the
+        // compressed timeline against a naive full-snapshot ring buffer.
+        const WINDOW_FRAMES: u64 = 1800;
+        for _ in 0..WINDOW_FRAMES {
+            core.execute(Command::StepFrame);
+        }
+        let delta_bytes = core.rewind_memory_used();
+        let naive_bytes = (bin_bytes as u64) * WINDOW_FRAMES;
+
+        eprintln!("=== rewind measurements (synthetic 0x8000 ROM) ===");
+        eprintln!(
+            "snapshot serialized size: {} bytes (bincode), {} bytes (serde_json)",
+            bin_bytes, json_bytes
+        );
+        eprintln!("snapshot capture time: {:?} per snapshot", per_capture);
+        eprintln!(
+            "naive ring buffer (30s @ 60fps = {} frames x {} B): {} bytes ({:.2} MB)",
+            WINDOW_FRAMES,
+            bin_bytes,
+            naive_bytes,
+            naive_bytes as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "anchor+delta timeline actual: {} bytes ({:.2} MB), frames_available={}",
+            delta_bytes,
+            delta_bytes as f64 / (1024.0 * 1024.0),
+            core.rewind_frames_available()
+        );
+        eprintln!(
+            "compression ratio: {:.1}x",
+            naive_bytes as f64 / delta_bytes.max(1) as f64
+        );
+
+        assert!(delta_bytes > 0);
+        assert!((delta_bytes as u64) < naive_bytes);
+    }
 }
