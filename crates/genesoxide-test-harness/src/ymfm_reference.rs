@@ -372,6 +372,58 @@ mod tests {
             .build()
     }
 
+    /// Single sustained carrier with LFO phase modulation (vibrato) at a given
+    /// PM sensitivity, used to check vibrato depth/shape against ymfm.
+    fn lfo_pm_vgm(pms: u8, lfo_freq: u8) -> crate::vgm::Vgm {
+        let (fnum, block) = (1083u16, 4u8);
+        let fnum_hi = ((block & 7) << 3) | ((fnum >> 8) & 0x07) as u8;
+        let fnum_lo = (fnum & 0xFF) as u8;
+        VgmBuilder::new()
+            .ym_write(0, 0x22, 0x08 | (lfo_freq & 0x07)) // LFO enable + rate
+            .ym_write(0, 0xB0, 0x07)
+            .ym_write(0, 0xB4, 0xC0 | (pms & 0x07)) // L+R, PMS
+            .ym_write(0, 0x40, 127)
+            .ym_write(0, 0x44, 127)
+            .ym_write(0, 0x48, 127)
+            .ym_write(0, 0x4C, 127)
+            .ym_write(0, 0x30, 0x01)
+            .ym_write(0, 0x40, 0x00)
+            .ym_write(0, 0x50, 0x1F)
+            .ym_write(0, 0x60, 0x00)
+            .ym_write(0, 0x70, 0x00)
+            .ym_write(0, 0x80, 0x00) // sustain forever
+            .ym_write(0, 0xA4, fnum_hi)
+            .ym_write(0, 0xA0, fnum_lo)
+            .ym_write(0, 0x28, 0x10)
+            .wait(44_100)
+            .build()
+    }
+
+    #[test]
+    fn lfo_pm_depth_matches_ymfm() {
+        // Regression for LFO phase modulation (vibrato), which was 2x too deep and
+        // badly decorrelated at high PM sensitivity (PMS 7 was corr ~0.05).
+        for &(pms, min_corr) in &[(3u8, 0.97f32), (5, 0.97), (6, 0.93), (7, 0.85)] {
+            let vgm = lfo_pm_vgm(pms, 4);
+            let m = Ymfm2612Renderer::compare_against_genesoxide(&vgm);
+            eprintln!(
+                "lfo_pm pms={pms}: corr={:.4} rms_ratio={:.4}",
+                m.correlation_left, m.rms_ratio_left
+            );
+            assert!(
+                m.correlation_left > min_corr,
+                "PM pms={pms} correlation {:.4} below {:.2} (vibrato depth/shape wrong)",
+                m.correlation_left,
+                min_corr
+            );
+            assert!(
+                (0.8..=1.2).contains(&m.rms_ratio_left),
+                "PM pms={pms} level off vs ymfm: rms_ratio={:.4}",
+                m.rms_ratio_left
+            );
+        }
+    }
+
     #[test]
     fn ssg_eg_modes_match_ymfm() {
         // Regression for the SSG-EG "attack"/invert modes (12-15, i.e. register

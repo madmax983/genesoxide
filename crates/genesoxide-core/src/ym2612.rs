@@ -644,8 +644,16 @@ impl Channel {
             fm <<= pms - 5;
         }
 
-        // Final scale-down (matches Nuked-OPN2 >>2)
+        // Final scale-down (matches Nuked-OPN2 / ymfm >>2)
         fm >>= 2;
+
+        // Depth correction: ymfm adds this adjustment to the *doubled* 12-bit fnum
+        // (`fnum << 1`) before a `>> 2` block shift, whereas genesoxide adds the
+        // offset to the 11-bit fnum before a `>> 1` block shift (see
+        // `phase_increment`). That doubled the effective vibrato depth, leaving deep
+        // vibrato (high PMS) badly decorrelated from ymfm (PMS 7 was ~0.05). Halving
+        // here restores the correct depth; `fm` is non-negative so the shift floors.
+        fm >>= 1;
 
         if sign { -fm } else { fm }
     }
