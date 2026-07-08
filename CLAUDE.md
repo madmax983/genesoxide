@@ -9,7 +9,7 @@ Sega Genesis / Mega Drive emulator in Rust. Part of the oxide emulator family.
   - Extract framebuffer: `core.framebuffer_rgba()` (320x224 RGBA)
   - All state serializable for snapshots
 - **genesoxide-config**: TOML config, `GenesisConfig::load_or_default()`
-- **genesoxide-desktop**: CLI frontend. Winit + Pixels + Rodio + Gilrs.
+- **genesoxide-desktop**: CLI frontend. Winit + Pixels + cpal + ringbuf + Gilrs.
 - **genesoxide-test-harness**: ROM-based integration tests, golden frame comparison.
 
 ## Hardware Emulated (v0.1)
@@ -21,9 +21,10 @@ Sega Genesis / Mega Drive emulator in Rust. Part of the oxide emulator family.
 
 ## Not Yet Implemented
 
-- Z80 CPU (audio driver — stubbed silent)
-- YM2612 FM synth / SN76489 PSG
 - Mappers beyond standard ≤4MB
+
+The Z80 CPU (audio driver), YM2612 FM synth, and SN76489 PSG are all implemented;
+audio is generated, not silent.
 
 ## Patterns
 
@@ -31,7 +32,8 @@ Sega Genesis / Mega Drive emulator in Rust. Part of the oxide emulator family.
 - Concrete types, no trait objects. Enum dispatch for mappers.
 - Snapshot-based save states via serde Serialize/Deserialize
 - Verus specs on bus mapping, 68000 decoder, VDP command parser
-- Proptest on CPU instruction semantics
+- Proptest on CPU instruction semantics (aspirational — proptest is a dev-dependency
+  but no property tests are written yet)
 
 ## Key Constants
 
