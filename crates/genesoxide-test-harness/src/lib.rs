@@ -72,4 +72,57 @@ mod tests {
         b[0] = 0xFF;
         assert_eq!(compare_framebuffers(&a, &b), 1);
     }
+
+    #[test]
+    fn rewind_reproduces_reference_run() {
+        // End-to-end rewind exercise on a synthetic ROM: run forward, rewind,
+        // replay, and confirm the reconstructed run matches a reference core
+        // that never rewound.
+        const F: u64 = 90;
+        const R: u32 = 30;
+        let rom = vec![0u8; 0x8000];
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom.clone()));
+        let mut reference = GenesisCore::new();
+        reference.execute(Command::LoadRom(rom));
+
+        for _ in 0..F {
+            core.execute(Command::StepFrame);
+            reference.execute(Command::StepFrame);
+        }
+        let reference_fb = reference.framebuffer_rgba().to_vec();
+
+        // Rewind buffer should hold history and report non-zero memory.
+        assert!(core.rewind_frames_available() > 0);
+        assert!(core.rewind_memory_used() > 0);
+
+        core.execute(Command::Rewind { frames: R });
+        assert_eq!(core.frame_count(), F - u64::from(R));
+        for _ in 0..R {
+            core.execute(Command::StepFrame);
+        }
+        assert_eq!(core.frame_count(), F);
+
+        assert_eq!(
+            compare_framebuffers(core.framebuffer_rgba(), &reference_fb),
+            0,
+            "rewind+replay framebuffer differs from reference"
+        );
+    }
+
+    #[test]
+    fn step_back_walks_backward() {
+        let rom = vec![0u8; 0x8000];
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+        for _ in 0..30 {
+            core.execute(Command::StepFrame);
+        }
+        assert_eq!(core.frame_count(), 30);
+        core.execute(Command::StepBack);
+        assert_eq!(core.frame_count(), 29);
+        core.execute(Command::StepBack);
+        assert_eq!(core.frame_count(), 28);
+    }
 }
