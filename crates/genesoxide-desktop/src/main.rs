@@ -134,6 +134,7 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         frame_duration: Duration::from_nanos(FRAME_PERIOD_NS),
         rewind_held: false,
         paused: false,
+        audio_log_counter: 0,
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
@@ -152,6 +153,8 @@ struct App {
     rewind_held: bool,
     /// True when emulation is paused (P toggles).
     paused: bool,
+    /// Frame counter for periodic audio diagnostics logging.
+    audio_log_counter: u32,
 }
 
 impl ApplicationHandler for App {
@@ -274,11 +277,32 @@ impl ApplicationHandler for App {
                     self.core.execute(Command::StepFrame);
                 }
 
-                // Push audio samples to output
+                // Push audio samples to output (rate-matched to the device clock).
                 if let Some(audio) = &mut self.audio {
                     let samples = self.core.audio_samples();
-                    audio.push_samples(samples);
+                    audio.push_frame(samples);
                     self.core.clear_audio_buffer();
+
+                    // Periodically report audio-path health (~ every 2 seconds).
+                    self.audio_log_counter += 1;
+                    if self.audio_log_counter >= 120 {
+                        self.audio_log_counter = 0;
+                        let d = audio.diagnostics();
+                        eprintln!(
+                            "Audio: fill {}/{} ({:.0}% of target {}) underruns={} dropped={} ratio={:.4}",
+                            d.fill,
+                            d.capacity,
+                            if d.target_fill > 0 {
+                                d.fill as f32 / d.target_fill as f32 * 100.0
+                            } else {
+                                0.0
+                            },
+                            d.target_fill,
+                            d.underruns,
+                            d.dropped,
+                            d.last_ratio,
+                        );
+                    }
                 }
 
                 // Copy framebuffer to pixel surface

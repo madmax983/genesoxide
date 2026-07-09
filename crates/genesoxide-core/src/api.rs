@@ -4192,6 +4192,51 @@ mod tests {
         );
     }
 
+    /// The core must produce audio samples at the configured device rate,
+    /// frame-locked, so the desktop producer keeps up with the device clock. This
+    /// also guards that the PR #9 DMA cycle-cost change to 68000 timing did not
+    /// alter the per-frame audio sample budget: stepping N frames at 48 kHz must
+    /// yield ~= N * 48000 / 59.92 stereo pairs (drift-free, tick-based).
+    #[test]
+    fn audio_samples_per_frame_track_configured_rate() {
+        const RATE: u32 = 48_000;
+        const FRAMES: u32 = 600;
+        let mut core = GenesisCore::new();
+        core.execute(Command::SetAudioSampleRate(RATE));
+
+        let mut total_pairs = 0u64;
+        for _ in 0..FRAMES {
+            core.execute(Command::StepFrame);
+            total_pairs += (core.audio_samples().len() / 2) as u64;
+            core.clear_audio_buffer();
+        }
+
+        // Expected pairs = frames * rate * frame_period. The frame period is
+        // MASTER_TICKS_PER_SCANLINE * SCANLINES_PER_FRAME / MASTER_CLOCK_NTSC.
+        let frame_ticks = MASTER_TICKS_PER_SCANLINE * u64::from(SCANLINES_PER_FRAME);
+        let expected = f64::from(FRAMES) * f64::from(RATE) * frame_ticks as f64
+            / MASTER_CLOCK_NTSC as f64;
+        let actual = total_pairs as f64;
+        let per_frame = actual / f64::from(FRAMES);
+        eprintln!(
+            "[keep-up] {FRAMES} frames @ {RATE} Hz -> {total_pairs} pairs \
+             ({per_frame:.2}/frame, expected {:.2}/frame)",
+            expected / f64::from(FRAMES),
+        );
+        // Frame-quantized generation drifts by at most ~1 pair per frame, so allow
+        // a small relative tolerance around the drift-free expectation.
+        let rel_err = (actual - expected).abs() / expected;
+        assert!(
+            rel_err < 0.005,
+            "audio sample count off: actual={actual} expected={expected} rel_err={rel_err}"
+        );
+        // Sanity: ~801 pairs/frame at 48 kHz / 59.92 Hz.
+        assert!(
+            (799.0..=803.0).contains(&per_frame),
+            "per-frame pair count {per_frame} not ~801"
+        );
+    }
+
     #[test]
     fn ym_channel_side_sign_align_follows_current_polarity_instead_of_replaying_old_phase() {
         let mut side_memory = [0.5f32, 0.0, 0.0, 0.0, 0.0, 0.0];
