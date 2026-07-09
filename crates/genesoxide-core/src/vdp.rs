@@ -627,7 +627,11 @@ impl Vdp {
     /// H40 draws 320 dots at the faster clock — and in the DMA byte-per-line
     /// budget, which `dma_cost_cycles`'s `bytes_per_line` table accounts for
     /// via its `(h40, blanking)` key.
-    const CPU_CYCLES_PER_LINE: u32 = 488;
+    ///
+    /// Centralized in [`crate::timing`]; used here purely as the coarse per-line
+    /// DMA word-transfer budget (the Software Manual quotes DMA slot rates per
+    /// scanline).
+    const CPU_CYCLES_PER_LINE: u32 = crate::timing::CPU_CYCLES_PER_LINE_H40;
 
     /// Computes the CPU-cycle cost (and hence DMA-busy duration / CPU stall) of
     /// a DMA transfer of `length` words.

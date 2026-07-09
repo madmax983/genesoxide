@@ -11,7 +11,11 @@ use crate::io::ControllerPort;
 use crate::psg;
 use crate::rewind;
 use crate::rom::{self, RomHeader, SramLayout};
-use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Region, Scheduler};
+use crate::scheduler::{Region, Scheduler};
+use crate::timing::{
+    LINES_PER_FRAME_NTSC, MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80,
+    MASTER_TICKS_PER_LINE_H40,
+};
 use crate::vdp::Vdp;
 use crate::ym2612;
 use crate::z80;
@@ -52,11 +56,11 @@ pub const FRAME_PERIOD_NS: u64 = 16_688_155;
 pub const FRAME_PERIOD_NS_PAL: u64 = Region::Pal.frame_period_ns();
 
 /// Scanlines per frame (NTSC): 224 active + 38 blanking = 262 total.
-pub const SCANLINES_PER_FRAME: u16 = 262;
-/// Active (visible) scanlines (NTSC / V28).
-pub const ACTIVE_SCANLINES: u16 = 224;
-/// NTSC Genesis master-clock ticks per scanline in H40 timing.
-const MASTER_TICKS_PER_SCANLINE: u64 = 3420;
+pub const SCANLINES_PER_FRAME: u16 = LINES_PER_FRAME_NTSC as u16;
+/// Active (visible) scanlines (NTSC / V28). Re-exported from [`crate::timing`]
+/// so the `crate::api::ACTIVE_SCANLINES` path callers use keeps resolving.
+/// Region-aware code should query `Vdp::active_height()` (240 in PAL V30).
+pub use crate::timing::ACTIVE_SCANLINES;
 /// YM2612 audio clock period in master-clock ticks.
 const YM_AUDIO_TICKS: u64 = 1008;
 /// PSG audio clock period in master-clock ticks.
@@ -2632,19 +2636,24 @@ impl GenesisCore {
     }
 
     fn step_scanline(&mut self) {
-        // Genesis H40: ~488 68K cycles per scanline.
-        // Run instructions until we've consumed enough cycles.
-        let target = self.cpu.cycles + 488;
-        while self.cpu.cycles < target {
+        // Debug single-scanline step. Run the 68000 until the shared master
+        // clock has advanced exactly one H40 scanline from where it is now,
+        // using the same master-tick boundary discipline as the frame loop
+        // (see `step_scanline_with_timing`).
+        let line_boundary = self.scheduler.master_ticks() + MASTER_TICKS_PER_LINE_H40;
+        while self.scheduler.master_ticks() < line_boundary {
             // Stall the 68000 while the VDP holds the bus (DMA in flight):
             // burn the remaining DMA-busy budget as CPU cycles rather than
             // running an instruction. This matches hardware where a 68K→VRAM
             // DMA / VRAM fill / VRAM copy freezes the CPU off the bus for the
-            // transfer's duration.
+            // transfer's duration. The DMA budget is charged in CPU cycles, so
+            // convert the remaining master-tick budget to CPU cycles (rounded
+            // up to guarantee forward progress off the sub-cycle remainder).
             let busy = self.vdp.dma_busy_cpu_cycles();
             if busy > 0 {
-                let remaining = target - self.cpu.cycles;
-                let stall = u64::from(busy).min(remaining);
+                let remaining_cpu =
+                    (line_boundary - self.scheduler.master_ticks()).div_ceil(MASTER_PER_CPU);
+                let stall = u64::from(busy).min(remaining_cpu);
                 self.cpu.cycles += stall;
                 self.scheduler.advance_cpu(stall);
                 self.vdp.advance_dma_busy(stall as u32);
@@ -2656,20 +2665,53 @@ impl GenesisCore {
                 self.execute_vdp_dma();
             }
             if self.cpu.halted || self.cpu.stopped {
+                // The 68000 is idle (HALT / STOP) but the master clock keeps
+                // running: fast-forward to the line boundary so the scanline
+                // still advances a full line of master time.
+                let idle_cpu =
+                    (line_boundary - self.scheduler.master_ticks()) / MASTER_PER_CPU;
+                self.cpu.cycles += idle_cpu;
+                self.scheduler.advance_cpu(idle_cpu);
                 break;
             }
         }
     }
 
     fn step_scanline_with_timing(&mut self, scanline: u16, scanline_start_tick: u64) -> u64 {
-        let target = self.cpu.cycles + 488;
+        // Absolute master-tick boundary for the END of this scanline, derived
+        // from the continuous line count so it is monotonic across frames.
+        // Because the boundary is carried (not recomputed from a per-frame
+        // base), any per-line overshoot from the final instruction rolls
+        // forward and the long-run average is exactly MASTER_TICKS_PER_LINE_H40
+        // per line — i.e. total_scanlines(region) * MASTER_TICKS_PER_LINE_H40
+        // master ticks per frame: 262 * 3420 = 896_040 (NTSC, 59.9227 Hz) or
+        // 313 * 3420 = 1_070_460 (PAL, ~49.70 Hz). This is the same absolute
+        // timeline the audio-synthesis path advances, keeping the CPU and audio
+        // clocks locked together. Interrupt-delivery cycles (added in
+        // `step_frame` via `scheduler.advance_cpu`) share this master-tick
+        // timeline, so they count toward the budget: the next scanline's run is
+        // automatically shortened by whatever the H/V interrupt consumed.
+        //
+        // The lines-per-frame factor comes from the region accessor (single
+        // source of truth in `scheduler::Region`), so the loop is region-generic
+        // yet keeps NTSC exact. The absolute `frame_count * lines_per_frame` form
+        // assumes a constant region across the run, which holds except across an
+        // explicit region reconfigure (ROM load / override) — a boundary that is
+        // inherently a discontinuity anyway.
+        let lines_per_frame = u64::from(self.region.total_scanlines());
+        let line_boundary = (self.frame_count * lines_per_frame
+            + u64::from(scanline)
+            + 1)
+            * MASTER_TICKS_PER_LINE_H40;
         let cpu_cycle_base = self.cpu.cycles;
-        while self.cpu.cycles < target {
-            // See comment in `step_scanline` — stall the 68000 during DMA.
+        while self.scheduler.master_ticks() < line_boundary {
+            // See comment in `step_scanline` — stall the 68000 during DMA,
+            // charged in CPU cycles converted from the remaining master budget.
             let busy = self.vdp.dma_busy_cpu_cycles();
             if busy > 0 {
-                let remaining = target - self.cpu.cycles;
-                let stall = u64::from(busy).min(remaining);
+                let remaining_cpu =
+                    (line_boundary - self.scheduler.master_ticks()).div_ceil(MASTER_PER_CPU);
+                let stall = u64::from(busy).min(remaining_cpu);
                 self.cpu.cycles += stall;
                 self.scheduler.advance_cpu(stall);
                 self.vdp.advance_dma_busy(stall as u32);
@@ -2682,6 +2724,14 @@ impl GenesisCore {
                 self.execute_vdp_dma();
             }
             if self.cpu.halted || self.cpu.stopped {
+                // The 68000 is idle (HALT / STOP) but the master clock keeps
+                // running: fast-forward to the line boundary so frame length
+                // stays exact. A level-4/6 interrupt raised at the line
+                // boundary in `step_frame` can then wake it on a later line.
+                let idle_cpu =
+                    (line_boundary - self.scheduler.master_ticks()) / MASTER_PER_CPU;
+                self.cpu.cycles += idle_cpu;
+                self.scheduler.advance_cpu(idle_cpu);
                 break;
             }
         }
@@ -2901,7 +2951,7 @@ impl GenesisCore {
                 &ym_writes,
                 &psg_writes,
                 scanline_start_tick,
-                scanline_start_tick + MASTER_TICKS_PER_SCANLINE,
+                scanline_start_tick + MASTER_TICKS_PER_LINE_H40,
             );
         }
 
@@ -3234,7 +3284,7 @@ impl GenesisCore {
     #[cfg(test)]
     fn collect_audio_samples(&mut self) {
         let start_tick = self.audio_master_tick;
-        let end_tick = start_tick + MASTER_TICKS_PER_SCANLINE;
+        let end_tick = start_tick + MASTER_TICKS_PER_LINE_H40;
         self.synthesize_audio_interval(&[], &[], start_tick, end_tick);
     }
 
@@ -5176,8 +5226,8 @@ mod tests {
         }
 
         // Expected pairs = frames * rate * frame_period. The frame period is
-        // MASTER_TICKS_PER_SCANLINE * SCANLINES_PER_FRAME / MASTER_CLOCK_NTSC.
-        let frame_ticks = MASTER_TICKS_PER_SCANLINE * u64::from(SCANLINES_PER_FRAME);
+        // MASTER_TICKS_PER_LINE_H40 * SCANLINES_PER_FRAME / MASTER_CLOCK_NTSC.
+        let frame_ticks = MASTER_TICKS_PER_LINE_H40 * u64::from(SCANLINES_PER_FRAME);
         let expected = f64::from(FRAMES) * f64::from(RATE) * frame_ticks as f64
             / MASTER_CLOCK_NTSC as f64;
         let actual = total_pairs as f64;
@@ -5692,6 +5742,61 @@ mod tests {
             core.z80_ram[0x1F00], 1,
             "VBlank handler must run exactly once per frame, got {} times",
             core.z80_ram[0x1F00]
+        );
+    }
+
+    /// NTSC frame length must be exactly 896_040 master ticks (59.9227 Hz).
+    ///
+    /// The CPU/scheduler master clock is advanced to per-scanline master-tick
+    /// boundaries (not a fixed 488-CPU-cycle budget), so the long-run average
+    /// frame length converges to `LINES_PER_FRAME_NTSC *
+    /// MASTER_TICKS_PER_LINE_H40 = 896_040`.
+    #[test]
+    fn ntsc_frame_advances_master_clock_by_896040() {
+        use crate::timing::MASTER_TICKS_PER_FRAME_NTSC;
+
+        // The derived constant is the exact hardware value.
+        assert_eq!(MASTER_TICKS_PER_FRAME_NTSC, 896_040);
+
+        // Inert 68000 ROM: reset vectors + branch-to-self, so the CPU spins
+        // harmlessly consuming cycles for the whole frame (no DMA, no halt).
+        let mut rom = vec![0u8; 512];
+        rom[0..4].copy_from_slice(&0x00FF_0000u32.to_be_bytes()); // initial SSP
+        rom[4..8].copy_from_slice(&0x0000_0008u32.to_be_bytes()); // initial PC
+        rom[8] = 0x60; // BRA.S
+        rom[9] = 0xFE; // -2  → branch to self
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+
+        // Measure the running average over several frames. A single frame can
+        // overshoot the ideal boundary by at most one instruction's worth of
+        // master ticks (the last scanline's final instruction steps past the
+        // boundary); because boundaries are carried forward absolutely, that
+        // overshoot rolls into the next frame, so the AVERAGE converges to the
+        // exact 896_040.
+        const FRAMES: u64 = 10;
+        let start = core.master_ticks();
+        for _ in 0..FRAMES {
+            core.execute(Command::StepFrame);
+        }
+        let total = core.master_ticks() - start;
+        let avg = total as f64 / FRAMES as f64;
+
+        // Tolerance = at most one 68000 instruction's master ticks (worst case
+        // DIVS ≈ 158 CPU cycles ≈ 1106 master ticks) amortized over the run.
+        let tolerance = 1106.0 / FRAMES as f64 + 1.0;
+        assert!(
+            (avg - MASTER_TICKS_PER_FRAME_NTSC as f64).abs() <= tolerance,
+            "running average {avg} mclk/frame must be within {tolerance} of \
+             {MASTER_TICKS_PER_FRAME_NTSC} (total {total} over {FRAMES} frames)"
+        );
+
+        // Implied refresh derived from the achieved frame length.
+        let hz = MASTER_CLOCK_NTSC as f64 / avg;
+        assert!(
+            (hz - 59.92).abs() < 0.05,
+            "implied NTSC refresh {hz} Hz must be ~59.92 Hz"
         );
     }
 
