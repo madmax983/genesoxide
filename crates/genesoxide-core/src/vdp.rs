@@ -82,6 +82,11 @@ pub struct VdpSnapshot {
     pub h_interrupt_pending: bool,
     pub control_code: u8,
     pub odd_frame: bool,
+    /// Latched V-interrupt-pending (VIP) flag — see [`Vdp::vint_pending`].
+    pub vint_pending: bool,
+    /// Remaining CPU cycles for which the DMA-busy status bit stays asserted
+    /// and the 68000 is held off the bus — see [`Vdp::dma_busy_cpu_cycles`].
+    pub dma_busy_cpu_cycles: u32,
 }
 
 /// Maximum sprites evaluated per frame (H40 mode).
@@ -129,6 +134,25 @@ pub struct Vdp {
     control_code: u8,
     /// Odd frame toggle — flipped each frame for interlace/status register.
     odd_frame: bool,
+    /// Latched V-interrupt-pending (VIP) flag.
+    ///
+    /// The VDP raises this at the start of V-blank when the V-interrupt is
+    /// enabled and holds it until the level-6 interrupt is actually taken by
+    /// the 68000. Because the 68000 may be inside a mask-7 critical section at
+    /// the instant V-blank begins, delivering the interrupt as a one-shot at
+    /// that scanline would silently drop it (SGDK disables interrupts during
+    /// boot for several frames). Latching it so it is taken as soon as the CPU
+    /// mask falls below 6 matches the level-triggered IPL lines on hardware and
+    /// is what lets SGDK's V-blank-driven tilemap/DMA path make progress.
+    vint_pending: bool,
+    /// Remaining CPU cycles for which a DMA holds the bus.
+    ///
+    /// While this is non-zero the DMA-busy status bit (bit 1) reads as set and
+    /// the 68000 is stalled off the bus, matching hardware where a 68K→VRAM
+    /// DMA / VRAM fill / VRAM copy freezes the CPU for the transfer's duration.
+    /// It is decremented as CPU cycles elapse and reaches zero when the
+    /// transfer completes.
+    dma_busy_cpu_cycles: u32,
 }
 
 impl Vdp {
@@ -155,6 +179,8 @@ impl Vdp {
             h_interrupt_pending: false,
             control_code: 0,
             odd_frame: false,
+            vint_pending: false,
+            dma_busy_cpu_cycles: 0,
         }
     }
 
@@ -351,9 +377,16 @@ impl Vdp {
         if self.in_hblank {
             status |= 0x0004;
         }
-        // Bit 1: DMA busy
-        if self.dma_pending {
+        // Bit 1: DMA busy — asserted for the whole duration of an in-flight
+        // transfer (68K→VRAM/CRAM/VSRAM, VRAM fill, or VRAM copy), cleared once
+        // the transfer's cycle budget has elapsed.
+        if self.dma_busy_cpu_cycles > 0 {
             status |= 0x0002;
+        }
+        // Bit 7: V-interrupt pending (VIP) — latched at V-blank, cleared when
+        // the level-6 interrupt is taken.
+        if self.vint_pending {
+            status |= 0x0080;
         }
         status
     }
@@ -434,6 +467,89 @@ impl Vdp {
         self.in_vblank = val;
     }
 
+    /// Returns true while a DMA holds the bus (DMA-busy status bit is set).
+    #[must_use]
+    pub fn dma_busy(&self) -> bool {
+        self.dma_busy_cpu_cycles > 0
+    }
+
+    /// Returns the number of CPU cycles for which the current DMA still holds
+    /// the bus. Zero when no DMA is in flight.
+    #[must_use]
+    pub fn dma_busy_cpu_cycles(&self) -> u32 {
+        self.dma_busy_cpu_cycles
+    }
+
+    /// Advances DMA-busy accounting by `cycles` CPU cycles, clearing the
+    /// DMA-busy state once the transfer's budget has fully elapsed. Called by
+    /// the core as the 68000 (or a stall) consumes cycles.
+    pub fn advance_dma_busy(&mut self, cycles: u32) {
+        self.dma_busy_cpu_cycles = self.dma_busy_cpu_cycles.saturating_sub(cycles);
+    }
+
+    /// Returns true if a V-interrupt (VIP) is latched and awaiting delivery.
+    #[must_use]
+    pub fn vint_pending(&self) -> bool {
+        self.vint_pending
+    }
+
+    /// Latches the V-interrupt-pending (VIP) flag. Called by the core at the
+    /// start of V-blank when the V-interrupt is enabled.
+    pub fn set_vint_pending(&mut self) {
+        self.vint_pending = true;
+    }
+
+    /// Clears the latched V-interrupt-pending flag. Called once the level-6
+    /// interrupt has actually been taken by the 68000.
+    pub fn clear_vint_pending(&mut self) {
+        self.vint_pending = false;
+    }
+
+    /// CPU cycles the CPU is stalled per scanline of active display (H40).
+    ///
+    /// One NTSC H40 scanline is 3420 master clocks; at 1 CPU cycle ≈ 7 master
+    /// clocks that is ≈ 488 CPU cycles, matching the core's per-scanline budget.
+    const CPU_CYCLES_PER_LINE: u32 = 488;
+
+    /// Computes the CPU-cycle cost (and hence DMA-busy duration / CPU stall) of
+    /// a DMA transfer of `length` words.
+    ///
+    /// The Sega Genesis Software Manual specifies how many bytes a DMA can move
+    /// per scanline; the figures differ between active display and blanking and
+    /// between H32 and H40. In H40 a 68K→VRAM DMA moves ~205 bytes/line during
+    /// blanking versus ~18 bytes/line during active display; in H32 it is ~167
+    /// vs ~16 bytes/line (see plutiedev.com "DMA transfers" and Nemesis's timing
+    /// research on SpritesMind, which tabulate the same slot rates). CRAM/VSRAM
+    /// writes and VRAM fills move one word per slot like VRAM writes; a VRAM→VRAM
+    /// copy needs a read *and* a write per unit and so runs at half the rate.
+    ///
+    /// A VRAM word occupies two bytes, so words/line = bytes/line ÷ 2. The cost
+    /// is the fraction of scanlines the transfer occupies, rounded up, times the
+    /// per-line CPU-cycle budget.
+    #[must_use]
+    fn dma_cost_cycles(&self, length: u32, copy: bool) -> u32 {
+        if length == 0 {
+            return 0;
+        }
+        let h40 = self.registers[0x0C] & 0x81 != 0;
+        let blanking = self.in_vblank || (self.registers[1] & 0x40 == 0);
+        // Bytes movable per scanline, per the Software Manual DMA timing table.
+        let bytes_per_line: u32 = match (h40, blanking) {
+            (true, true) => 205,
+            (true, false) => 18,
+            (false, true) => 167,
+            (false, false) => 16,
+        };
+        // Words per line (each VRAM word = 2 bytes); copy runs at half rate.
+        let mut words_per_line = (bytes_per_line / 2).max(1);
+        if copy {
+            words_per_line = (words_per_line / 2).max(1);
+        }
+        // Fraction of scanlines occupied, rounded up, times the per-line budget.
+        let lines = length.div_ceil(words_per_line);
+        lines.saturating_mul(Self::CPU_CYCLES_PER_LINE)
+    }
+
     /// Executes a pending 68K-to-VRAM/CRAM/VSRAM DMA transfer.
     ///
     /// `read_word` is a callback that reads a 16-bit word from the 68K address space.
@@ -449,6 +565,12 @@ impl Vdp {
         if length == 0 {
             return;
         }
+
+        // Hold the bus (assert DMA-busy and stall the 68000) for the transfer's
+        // cycle cost. The data is moved in one shot below, but the busy window
+        // and CPU stall are charged so software that overlaps DMA with CPU work,
+        // polls DMA-busy, or spreads a transfer across V-blank stays in sync.
+        self.dma_busy_cpu_cycles = self.dma_cost_cycles(length, false);
 
         let src_base = u32::from(self.registers[0x15])
             | (u32::from(self.registers[0x16]) << 8)
@@ -499,6 +621,9 @@ impl Vdp {
     fn execute_dma_fill(&mut self, value: u16) {
         let length = u32::from(self.registers[0x13]) | (u32::from(self.registers[0x14]) << 8);
         let fill_byte = (value >> 8) as u8;
+
+        // Hold the bus for the fill's duration (see `run_dma`).
+        self.dma_busy_cpu_cycles = self.dma_cost_cycles(length.max(1), false);
 
         // First, write the full word to the current VRAM address
         let addr = self.address as usize;
@@ -1116,6 +1241,8 @@ impl Vdp {
             h_interrupt_pending: self.h_interrupt_pending,
             control_code: self.control_code,
             odd_frame: self.odd_frame,
+            vint_pending: self.vint_pending,
+            dma_busy_cpu_cycles: self.dma_busy_cpu_cycles,
         }
     }
 
@@ -1140,6 +1267,8 @@ impl Vdp {
         self.h_interrupt_pending = snap.h_interrupt_pending;
         self.control_code = snap.control_code;
         self.odd_frame = snap.odd_frame;
+        self.vint_pending = snap.vint_pending;
+        self.dma_busy_cpu_cycles = snap.dma_busy_cpu_cycles;
     }
 }
 
@@ -2182,5 +2311,145 @@ mod tests {
             &normal,
             "high-priority sprite renders at full normal color"
         );
+    }
+
+    // ---- DMA-busy / VInt-latch / status bits (regression tests for the fix) ----
+
+    /// The DMA-busy status bit (bit 1) is not set at reset and does not appear
+    /// in `read_status` until a transfer charges its cycle countdown.
+    #[test]
+    fn dma_busy_defaults_clear() {
+        let vdp = Vdp::new();
+        assert_eq!(vdp.dma_busy_cpu_cycles(), 0);
+        assert!(!vdp.dma_busy());
+        assert_eq!(vdp.read_status() & 0x0002, 0);
+    }
+
+    /// `dma_cost_cycles` charges more cycles in H40 than in H32, and more
+    /// during active display than during blanking (rates from the Sega
+    /// Software Manual DMA timing table).
+    #[test]
+    fn dma_cost_reflects_mode_and_blanking() {
+        let mut vdp = Vdp::new();
+        // H40 mode, display enabled → active-display rates.
+        vdp.registers[0x0C] = 0x81;
+        vdp.registers[1] = 0x40;
+        vdp.in_vblank = false;
+        let h40_active = vdp.dma_cost_cycles(1000, false);
+        // H40, blanking (display off).
+        vdp.registers[1] = 0x00;
+        let h40_blank = vdp.dma_cost_cycles(1000, false);
+        // H32 blanking runs slower per line than H40 blanking.
+        vdp.registers[0x0C] = 0x00;
+        let h32_blank = vdp.dma_cost_cycles(1000, false);
+
+        assert!(
+            h40_active > h40_blank,
+            "active-display DMA stalls the CPU for more cycles than blanking (h40_active={h40_active}, h40_blank={h40_blank})"
+        );
+        assert!(
+            h32_blank > h40_blank,
+            "H32 blanking DMA is slower per line than H40 blanking (h32_blank={h32_blank}, h40_blank={h40_blank})"
+        );
+
+        // Zero-length transfers cost nothing.
+        assert_eq!(vdp.dma_cost_cycles(0, false), 0);
+        // Copy DMA runs at half the rate → costs more than a normal move of
+        // the same length.
+        let move_cost = vdp.dma_cost_cycles(1000, false);
+        let copy_cost = vdp.dma_cost_cycles(1000, true);
+        assert!(copy_cost >= move_cost);
+    }
+
+    /// A pending 68K→VRAM DMA charges DMA-busy for the transfer's cycle cost;
+    /// the status register reflects it; `advance_dma_busy` drains the countdown
+    /// and clears the bit.
+    #[test]
+    fn dma_busy_asserted_by_run_dma_and_drains_to_zero() {
+        let mut vdp = setup_vdp_for_rendering();
+        // 8-word transfer from address 0 into VRAM at 0xE000.
+        vdp.registers[0x13] = 0x08;
+        vdp.registers[0x14] = 0x00;
+        vdp.registers[0x15] = 0x00;
+        vdp.registers[0x16] = 0x00;
+        vdp.registers[0x17] = 0x00;
+        vdp.address = 0xE000;
+        vdp.access_type = Some(AccessType::VramWrite);
+        vdp.dma_pending = true;
+
+        vdp.run_dma(&mut |_addr| 0xBEEF);
+
+        let cost = vdp.dma_busy_cpu_cycles();
+        assert!(cost > 0, "run_dma must charge DMA-busy cycles");
+        assert!(vdp.dma_busy());
+        assert_ne!(
+            vdp.read_status() & 0x0002,
+            0,
+            "status register bit 1 (DMA busy) is set while the transfer holds the bus"
+        );
+
+        // Drain part-way: still busy.
+        vdp.advance_dma_busy(cost / 2);
+        assert!(vdp.dma_busy());
+
+        // Drain the rest: DMA-busy clears.
+        vdp.advance_dma_busy(cost);
+        assert!(!vdp.dma_busy());
+        assert_eq!(vdp.read_status() & 0x0002, 0);
+    }
+
+    /// A VRAM fill also charges DMA-busy and stalls the bus.
+    #[test]
+    fn dma_fill_asserts_dma_busy() {
+        let mut vdp = setup_vdp_for_rendering();
+        vdp.registers[0x13] = 0x40;
+        vdp.registers[0x14] = 0x00;
+        vdp.registers[0x17] = 0x80; // fill
+        vdp.address = 0x0000;
+        vdp.access_type = Some(AccessType::VramWrite);
+
+        vdp.execute_dma_fill(0xABCD);
+
+        assert!(vdp.dma_busy_cpu_cycles() > 0);
+        assert_ne!(vdp.read_status() & 0x0002, 0);
+    }
+
+    /// The V-interrupt-pending (VIP) latch: setting it exposes status bit 7;
+    /// clearing it hides it again.
+    #[test]
+    fn vint_pending_latch_shows_in_status_bit_7() {
+        let mut vdp = Vdp::new();
+        assert!(!vdp.vint_pending());
+        assert_eq!(vdp.read_status() & 0x0080, 0);
+
+        vdp.set_vint_pending();
+        assert!(vdp.vint_pending());
+        assert_ne!(
+            vdp.read_status() & 0x0080,
+            0,
+            "status bit 7 (V-interrupt pending) tracks the latched flag"
+        );
+
+        vdp.clear_vint_pending();
+        assert!(!vdp.vint_pending());
+        assert_eq!(vdp.read_status() & 0x0080, 0);
+    }
+
+    /// Snapshot round-trip preserves the new fields — mirrors the coverage the
+    /// rewind determinism test in `genesoxide-test-harness` relies on.
+    #[test]
+    fn snapshot_roundtrip_covers_vint_and_dma_busy() {
+        let mut vdp = Vdp::new();
+        vdp.set_vint_pending();
+        vdp.dma_busy_cpu_cycles = 1234;
+
+        let snap = vdp.snapshot();
+        assert!(snap.vint_pending);
+        assert_eq!(snap.dma_busy_cpu_cycles, 1234);
+
+        let mut restored = Vdp::new();
+        restored.restore(&snap);
+        assert!(restored.vint_pending());
+        assert_eq!(restored.dma_busy_cpu_cycles(), 1234);
     }
 }
