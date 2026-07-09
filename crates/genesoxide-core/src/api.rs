@@ -5537,6 +5537,136 @@ mod tests {
         assert!(!core.sram_is_dirty()); // loading is not a dirtying write
     }
 
+    /// Builds a minimal SEGA-header ROM whose serial matches a database EEPROM
+    /// title (Wonder Boy in Monster World, "G-4060", SEGA mapper / X24C01).
+    fn rom_with_eeprom_serial() -> Vec<u8> {
+        let mut rom = vec![0u8; 1024];
+        rom[0..4].copy_from_slice(&0x00FF_FFF0u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        rom[0x180..0x188].copy_from_slice(b"GM G-406"); // serial fragment "G-4060"
+        rom[0x188..0x18E].copy_from_slice(b"0 -00 ");
+        rom
+    }
+
+    // --- SEGA-mapper (mode-1 X24C01) I2C bit-bang helpers, driven through the
+    // real 68000 CoreBus at odd address 0x200001 (SCL=D1, SDA=D0). ---
+    const EE_ADDR: u32 = 0x20_0001;
+
+    fn ee_wr(bus: &mut CoreBus, scl: u8, sda: u8) {
+        use crate::cpu::execute::Bus as _;
+        bus.write_byte(EE_ADDR, (scl << 1) | sda);
+    }
+    fn ee_start(bus: &mut CoreBus) {
+        ee_wr(bus, 1, 1);
+        ee_wr(bus, 1, 0);
+        ee_wr(bus, 0, 0);
+    }
+    fn ee_stop(bus: &mut CoreBus) {
+        ee_wr(bus, 0, 0);
+        ee_wr(bus, 1, 0);
+        ee_wr(bus, 1, 1);
+    }
+    fn ee_bit(bus: &mut CoreBus, b: u8) {
+        ee_wr(bus, 0, b);
+        ee_wr(bus, 1, b);
+        ee_wr(bus, 0, b);
+    }
+    fn ee_addr7(bus: &mut CoreBus, addr: u8, rw: u8) {
+        for i in 0..7 {
+            ee_bit(bus, (addr >> (6 - i)) & 1);
+        }
+        ee_bit(bus, rw);
+        ee_bit(bus, 1);
+    }
+    fn ee_send(bus: &mut CoreBus, d: u8) {
+        for i in 0..8 {
+            ee_bit(bus, (d >> (7 - i)) & 1);
+        }
+        ee_bit(bus, 1);
+    }
+    fn ee_read1(bus: &mut CoreBus, addr: u8) -> u8 {
+        use crate::cpu::execute::Bus as _;
+        ee_start(bus);
+        ee_addr7(bus, addr, 1);
+        let mut v = 0u8;
+        for _ in 0..8 {
+            let bit = bus.read_byte(EE_ADDR) & 1;
+            v = (v << 1) | bit;
+            ee_wr(bus, 1, 1);
+            ee_wr(bus, 0, 1);
+        }
+        // NACK to end the read.
+        ee_wr(bus, 0, 1);
+        ee_wr(bus, 1, 1);
+        ee_wr(bus, 0, 1);
+        ee_stop(bus);
+        v
+    }
+
+    #[test]
+    fn eeprom_detected_from_rom_serial() {
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_eeprom_serial()));
+        assert!(core.has_eeprom());
+        assert!(!core.has_battery_sram());
+        assert_eq!(core.eeprom_data().len(), 128); // X24C01
+    }
+
+    #[test]
+    fn eeprom_round_trip_through_68000_bus() {
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_eeprom_serial()));
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            // Write 0x5A to word address 0x10 via the I2C protocol.
+            ee_start(&mut bus);
+            ee_addr7(&mut bus, 0x10, 0);
+            ee_send(&mut bus, 0x5A);
+            ee_stop(&mut bus);
+            // Read it back over the same bus.
+            assert_eq!(ee_read1(&mut bus, 0x10), 0x5A);
+        }
+        assert!(core.eeprom_is_dirty());
+        assert_eq!(core.eeprom_data()[0x10], 0x5A);
+    }
+
+    #[test]
+    fn eeprom_included_in_snapshot() {
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_eeprom_serial()));
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            ee_start(&mut bus);
+            ee_addr7(&mut bus, 0x05, 0);
+            ee_send(&mut bus, 0x42);
+            ee_stop(&mut bus);
+        }
+        let snap = core.snapshot();
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            ee_start(&mut bus);
+            ee_addr7(&mut bus, 0x05, 0);
+            ee_send(&mut bus, 0x99);
+            ee_stop(&mut bus);
+        }
+        assert_eq!(core.eeprom_data()[0x05], 0x99);
+        core.restore(&snap);
+        assert_eq!(core.eeprom_data()[0x05], 0x42, "EEPROM state restored from snapshot");
+    }
+
+    #[test]
+    fn eeprom_snapshot_default_for_old_saves() {
+        // A snapshot deserialized without the `eeprom` field must default to an
+        // absent EEPROM (serde default), so pre-EEPROM save states still load.
+        let core = GenesisCore::new();
+        let snap = core.snapshot();
+        let mut json = serde_json::to_value(&snap).unwrap();
+        json.as_object_mut().unwrap().remove("eeprom");
+        let restored: GenesisCoreSnapshot = serde_json::from_value(json).unwrap();
+        assert!(!restored.eeprom.is_present());
+    }
+
     #[test]
     fn step_frame_increments_counter() {
         let mut core = GenesisCore::new();
