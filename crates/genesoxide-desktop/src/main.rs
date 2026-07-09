@@ -120,6 +120,25 @@ fn srm_path_for(rom_path: &Path, saves_dir: Option<&str>) -> PathBuf {
     }
 }
 
+/// Derives the `.eep` serial-EEPROM save path for a ROM. Serial EEPROM and
+/// battery SRAM are mutually exclusive per cart, but the raw EEPROM dump is a
+/// distinct byte image, so it gets its own extension to avoid format ambiguity.
+/// Placement mirrors [`srm_path_for`].
+fn eep_path_for(rom_path: &Path, saves_dir: Option<&str>) -> PathBuf {
+    match saves_dir {
+        Some(dir) => {
+            let stem = rom_path
+                .file_stem()
+                .map(std::ffi::OsString::from)
+                .unwrap_or_default();
+            let mut file = stem;
+            file.push(".eep");
+            Path::new(dir).join(file)
+        }
+        None => rom_path.with_extension("eep"),
+    }
+}
+
 /// Writes the core's SRAM to `srm_path` if it holds data worth persisting.
 fn flush_sram(core: &GenesisCore, srm_path: &Path) {
     if !core.sram_worth_saving() {
@@ -132,6 +151,21 @@ fn flush_sram(core: &GenesisCore, srm_path: &Path) {
     }
     if let Err(e) = fs::write(srm_path, core.sram()) {
         eprintln!("Warning: failed to write SRAM {}: {e}", srm_path.display());
+    }
+}
+
+/// Writes the core's serial EEPROM to `eep_path` if the cart has one.
+fn flush_eeprom(core: &GenesisCore, eep_path: &Path) {
+    if !core.eeprom_worth_saving() {
+        return;
+    }
+    if let Some(parent) = eep_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    if let Err(e) = fs::write(eep_path, core.eeprom_data()) {
+        eprintln!("Warning: failed to write EEPROM {}: {e}", eep_path.display());
     }
 }
 
@@ -166,6 +200,22 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
             Err(e) => eprintln!(
                 "Warning: failed to read SRAM {}: {e}",
                 srm_path.display()
+            ),
+        }
+    }
+
+    // Serial-EEPROM persistence: derive the `.eep` path and load any existing
+    // save into the cartridge EEPROM before the game boots.
+    let eep_path = eep_path_for(&rom_path, config.desktop.saves_dir.as_deref());
+    if eep_path.exists() {
+        match fs::read(&eep_path) {
+            Ok(bytes) => {
+                core.load_eeprom(&bytes);
+                eprintln!("Loaded EEPROM: {}", eep_path.display());
+            }
+            Err(e) => eprintln!(
+                "Warning: failed to read EEPROM {}: {e}",
+                eep_path.display()
             ),
         }
     }
@@ -232,6 +282,7 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         paused: false,
         audio_log_counter: 0,
         srm_path,
+        eep_path,
         frames_since_flush: 0,
         gilrs,
         last_dims: (FRAME_WIDTH as u32, FRAME_HEIGHT as u32),
@@ -242,6 +293,8 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
     // Final save-on-exit flush (covers a clean event-loop return).
     flush_sram(&app.core, &app.srm_path);
     app.core.clear_sram_dirty();
+    flush_eeprom(&app.core, &app.eep_path);
+    app.core.clear_eeprom_dirty();
     Ok(())
 }
 
@@ -264,7 +317,9 @@ struct App {
     audio_log_counter: u32,
     /// Battery-save file path for this ROM.
     srm_path: PathBuf,
-    /// Frames elapsed since the last periodic SRAM flush.
+    /// Serial-EEPROM save file path for this ROM.
+    eep_path: PathBuf,
+    /// Frames elapsed since the last periodic SRAM/EEPROM flush.
     frames_since_flush: u32,
     /// Gamepad input context (`None` when unavailable).
     gilrs: Option<Gilrs>,
@@ -340,6 +395,8 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 flush_sram(&self.core, &self.srm_path);
                 self.core.clear_sram_dirty();
+                flush_eeprom(&self.core, &self.eep_path);
+                self.core.clear_eeprom_dirty();
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -362,6 +419,8 @@ impl ApplicationHandler for App {
                         KeyCode::Escape => {
                             flush_sram(&self.core, &self.srm_path);
                             self.core.clear_sram_dirty();
+                            flush_eeprom(&self.core, &self.eep_path);
+                            self.core.clear_eeprom_dirty();
                             event_loop.exit();
                             None
                         }
@@ -429,9 +488,15 @@ impl ApplicationHandler for App {
                 // Periodically flush dirty battery SRAM so a crash does not
                 // discard recent saves.
                 self.frames_since_flush = self.frames_since_flush.saturating_add(1);
-                if self.frames_since_flush >= SRAM_FLUSH_INTERVAL && self.core.sram_is_dirty() {
-                    flush_sram(&self.core, &self.srm_path);
-                    self.core.clear_sram_dirty();
+                if self.frames_since_flush >= SRAM_FLUSH_INTERVAL {
+                    if self.core.sram_is_dirty() {
+                        flush_sram(&self.core, &self.srm_path);
+                        self.core.clear_sram_dirty();
+                    }
+                    if self.core.eeprom_is_dirty() {
+                        flush_eeprom(&self.core, &self.eep_path);
+                        self.core.clear_eeprom_dirty();
+                    }
                     self.frames_since_flush = 0;
                 }
 
