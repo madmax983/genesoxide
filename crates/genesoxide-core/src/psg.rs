@@ -173,20 +173,20 @@ impl Psg {
         if self.noise_counter == 0 {
             self.noise_counter = if noise_period == 0 { 1 } else { noise_period };
 
-            let was_high = self.noise_polarity;
+            // Track the internal toggle for state parity, but clock the LFSR on
+            // EVERY counter expiry — on real SN76489 hardware the shift register
+            // advances each time the noise counter reloads (once per half-period
+            // of the driving tone), not only on the high->low toggle transition.
             self.noise_polarity = !self.noise_polarity;
 
-            // Shift LFSR on falling edge (true -> false).
-            if was_high && !self.noise_polarity {
-                let feedback = if self.noise_mode {
-                    // White noise: input bit = bit 0 XOR bit 3
-                    (self.noise_shift & 1) ^ ((self.noise_shift >> 3) & 1)
-                } else {
-                    // Periodic noise: input bit = bit 0
-                    self.noise_shift & 1
-                };
-                self.noise_shift = (self.noise_shift >> 1) | (feedback << 15);
-            }
+            let feedback = if self.noise_mode {
+                // White noise: input bit = bit 0 XOR bit 3
+                (self.noise_shift & 1) ^ ((self.noise_shift >> 3) & 1)
+            } else {
+                // Periodic noise: input bit = bit 0
+                self.noise_shift & 1
+            };
+            self.noise_shift = (self.noise_shift >> 1) | (feedback << 15);
         } else {
             self.noise_counter -= 1;
         }
@@ -322,6 +322,45 @@ mod tests {
         // White noise uses feedback = bit0 XOR bit3, so the sequence is
         // deterministic. Verify the LFSR didn't degenerate to 0.
         assert_ne!(psg.noise_shift, 0, "LFSR should not be zero");
+    }
+
+    #[test]
+    fn noise_lfsr_shifts_every_counter_reload() {
+        // Regression for the half-rate noise bug: the LFSR must advance on EVERY
+        // noise-counter expiry, not only on the high->low toggle transition.
+        //
+        // Rate 0 -> reload period 0x10 (16). One expiry occurs every 17 ticks
+        // (1 reload tick + 16 decrement ticks), so 4352 ticks yields exactly
+        // 256 counter expiries -> 256 LFSR shifts.
+        //
+        //   Pre-fix (buggy, half-rate): 128 shifts.
+        //   Post-fix (correct):         256 shifts.
+        //
+        // Use periodic mode seeded at 0x8000: the single set bit walks the
+        // register and the value strictly changes on every shift, so counting
+        // register transitions counts shifts.
+        let mut psg = Psg::new();
+
+        // 0xE0 = ch3 tone/noise, data 0b0000 => rate 0, periodic mode.
+        psg.write(0xE0);
+        assert!(!psg.noise_mode);
+        assert_eq!(psg.noise_rate, 0);
+        assert_eq!(psg.noise_shift, 0x8000);
+
+        let mut shifts = 0u32;
+        let mut prev = psg.noise_shift;
+        for _ in 0..4352 {
+            psg.clock_tick();
+            if psg.noise_shift != prev {
+                shifts += 1;
+                prev = psg.noise_shift;
+            }
+        }
+
+        assert_eq!(
+            shifts, 256,
+            "LFSR must shift once per counter reload (256), not the half-rate 128"
+        );
     }
 
     #[test]
