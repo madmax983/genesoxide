@@ -67,6 +67,23 @@ fn default_delta_spike_threshold() -> u32 {
     2048
 }
 
+/// Console region selection for the desktop frontend (TOML `region` field).
+///
+/// Mirrors the core's region notion locally so this crate does not depend on
+/// `genesoxide-core`; the desktop frontend maps it into
+/// `Command::SetRegionOverride`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RegionSetting {
+    /// Auto-detect the region from the ROM header (default).
+    #[default]
+    Auto,
+    /// Force NTSC (60 Hz).
+    Ntsc,
+    /// Force PAL (50 Hz).
+    Pal,
+}
+
 /// Desktop frontend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopConfig {
@@ -95,6 +112,9 @@ pub struct DesktopConfig {
     /// Whether controller port 2 has a 6-button pad (`false` = 3-button).
     #[serde(default = "default_true")]
     pub pad2_six_button: bool,
+    /// Console region: `auto` (detect from ROM header), `ntsc`, or `pal`.
+    #[serde(default)]
+    pub region: RegionSetting,
 }
 
 impl Default for DesktopConfig {
@@ -107,6 +127,7 @@ impl Default for DesktopConfig {
             saves_dir: None,
             pad1_six_button: default_true(),
             pad2_six_button: default_true(),
+            region: RegionSetting::default(),
         }
     }
 }
@@ -235,6 +256,26 @@ mod tests {
         assert!(!config.desktop.pad1_six_button);
         // Unspecified port keeps the six-button default.
         assert!(config.desktop.pad2_six_button);
+    }
+
+    #[test]
+    fn region_defaults_to_auto_and_parses() {
+        let config = GenesisConfig::default();
+        assert_eq!(config.desktop.region, RegionSetting::Auto);
+
+        let toml = r#"
+            [desktop]
+            region = "pal"
+        "#;
+        let config: GenesisConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.desktop.region, RegionSetting::Pal);
+
+        let toml = r#"
+            [desktop]
+            region = "ntsc"
+        "#;
+        let config: GenesisConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.desktop.region, RegionSetting::Ntsc);
     }
 
     #[test]
