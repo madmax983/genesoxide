@@ -2222,6 +2222,36 @@ impl GenesisCore {
             // This handles tight bus polling loops where the 68K requests/releases
             // the bus multiple times per scanline — the Z80 must get cycles in the
             // brief release windows or the SMPS sound driver handshake deadlocks.
+            //
+            // KNOWN LIMITATION (BUSREQ granularity — deferred, see below).
+            // Arbitration is sampled once per scanline: the 68000 runs the whole
+            // scanline first, then the Z80 runs a full 228 T-states in one shot if
+            // it got the bus at any point. The sticky `z80_bus_released_this_scanline`
+            // flag therefore over-grants Z80 time when the 68000 held BUSREQ for
+            // most of the scanline and released it only briefly — the Z80 still gets
+            // all 228 cycles, feeding the FM/PSG write timeline slightly too much
+            // Z80 time (flagged by PR #3). Finer, sub-scanline arbitration was
+            // assessed and intentionally deferred rather than implemented, because:
+            //
+            //   1. No available test exercises the real 68000<->Z80 SMPS handshake
+            //      this flag protects: the Sonic ROM (the designated end-to-end
+            //      guard) is absent here, so `sonic_boot` and `audio_golden` skip,
+            //      and `vgm_playback` feeds the sound chips directly, bypassing Z80
+            //      bus arbitration entirely. Changing this delicate code blind to
+            //      its guard risks silently reintroducing the documented deadlock.
+            //   2. Interleaving 68000/Z80 stepping per sub-scanline slice would
+            //      multiply the existing per-stream master_tick ordering violation
+            //      in the audio write trace. `synthesize_audio_interval` merges the
+            //      YM and PSG streams assuming each is monotonic in master_tick
+            //      within a scanline; finer interleaving of the CPU- and Z80-timed
+            //      writes would mis-order register writes and could DEGRADE audio —
+            //      the opposite of the intended payoff — and fixing it properly
+            //      reaches into the separately-owned audio-synthesis timeline.
+            //   3. The payoff is modest: more accurate sub-scanline FM/PSG write
+            //      timestamps, not game-logic correctness. The cost/risk (an
+            //      unvalidatable change to deadlock-sensitive, audio-timeline code)
+            //      outweighs it. Revisit once a real-driver regression guard (a
+            //      bootable Sonic/SMPS ROM through the Z80 path) is available.
             let z80_gets_cycles =
                 !self.z80_reset && (!self.z80_bus_requested || self.z80_bus_released_this_scanline);
             if z80_gets_cycles {
@@ -2354,9 +2384,20 @@ impl GenesisCore {
                 let mut bus = Z80Bus {
                     z80_ram: &mut self.z80_ram,
                     rom: &self.rom,
+                    work_ram: &mut self.work_ram,
+                    vdp: &self.vdp,
+                    port1: &mut self.port1,
+                    port2: &mut self.port2,
                     z80_bank: &mut self.z80_bank,
+                    z80_bus_requested: &mut self.z80_bus_requested,
+                    z80_reset: &mut self.z80_reset,
+                    z80_reset_pending: &mut self.z80_reset_pending,
+                    z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                     ym2612: &mut self.ym2612,
                     psg: &mut self.psg,
+                    z80_cmd_trace: &mut self.z80_cmd_trace,
+                    z80_driver_write_count: &mut self.z80_driver_write_count,
+                    z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
                     ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
                     psg_timed_write_trace: &mut self.psg_timed_write_trace,
                     frame_count: self.frame_count,
@@ -2379,9 +2420,20 @@ impl GenesisCore {
             let mut bus = Z80Bus {
                 z80_ram: &mut self.z80_ram,
                 rom: &self.rom,
+                work_ram: &mut self.work_ram,
+                vdp: &self.vdp,
+                port1: &mut self.port1,
+                port2: &mut self.port2,
                 z80_bank: &mut self.z80_bank,
+                z80_bus_requested: &mut self.z80_bus_requested,
+                z80_reset: &mut self.z80_reset,
+                z80_reset_pending: &mut self.z80_reset_pending,
+                z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                 ym2612: &mut self.ym2612,
                 psg: &mut self.psg,
+                z80_cmd_trace: &mut self.z80_cmd_trace,
+                z80_driver_write_count: &mut self.z80_driver_write_count,
+                z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
                 ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
                 psg_timed_write_trace: &mut self.psg_timed_write_trace,
                 frame_count: self.frame_count,
@@ -2768,6 +2820,213 @@ impl GenesisCore {
     }
 }
 
+/// Timing context needed to record FM/PSG writes into the audio write trace.
+///
+/// Bundled so the shared [`write_68k_byte`] helper can push accurately-timed
+/// YM2612/PSG writes regardless of whether the write came from the 68000 or
+/// the Z80's banked window.
+struct AudioTraceCtx<'a> {
+    ym2612_timed_write_trace: &'a mut Vec<TimedYm2612Write>,
+    psg_timed_write_trace: &'a mut Vec<TimedPsgWrite>,
+    frame_count: u64,
+    scanline: u16,
+    master_tick: u64,
+}
+
+impl AudioTraceCtx<'_> {
+    fn record_ym2612(&mut self, ym2612: &mut ym2612::Ym2612, port: u8, value: u8) {
+        let addr = ym2612.latched_address(port);
+        self.ym2612_timed_write_trace.push(TimedYm2612Write {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            port,
+            addr,
+            value,
+        });
+        ym2612.write_data(port, value);
+    }
+
+    fn record_psg(&mut self, psg: &mut psg::Psg, value: u8) {
+        self.psg_timed_write_trace.push(TimedPsgWrite {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            value,
+        });
+        psg.write(value);
+    }
+}
+
+/// Reads one byte of the 68000's 24-bit address space.
+///
+/// This is the single source of truth for 68000 byte-level memory mapping.
+/// It is shared by the 68000 CPU bus ([`CoreBus::read_byte`]) and the Z80's
+/// banked `0x8000-0xFFFF` window, so both observe an identical view of ROM,
+/// work RAM, the VDP, I/O and the sound chips. All references are read-only;
+/// the mapping performs no CPU re-entry, so routing the Z80 window here can
+/// never recurse into either CPU.
+#[allow(clippy::too_many_arguments)]
+fn read_68k_byte(
+    addr: u32,
+    rom: &[u8],
+    work_ram: &[u8; 0x10000],
+    vdp: &Vdp,
+    port1: &ControllerPort,
+    port2: &ControllerPort,
+    z80_ram: &[u8; 0x2000],
+    ym2612: &ym2612::Ym2612,
+    z80_bus_requested: bool,
+) -> u8 {
+    match bus::map_region(addr) {
+        bus::BusRegion::CartridgeRom => {
+            let offset = (addr & 0x3FFFFF) as usize;
+            rom.get(offset).copied().unwrap_or(0)
+        }
+        bus::BusRegion::WorkRam => {
+            let offset = (addr & 0xFFFF) as usize;
+            work_ram[offset]
+        }
+        bus::BusRegion::IoRegisters => {
+            let reg = (addr & 0x1F) as u8;
+            match reg {
+                0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
+                0x02 | 0x03 => port1.read_data(),
+                0x04 | 0x05 => port2.read_data(),
+                0x08 | 0x09 => port1.read_ctrl(),
+                0x0A | 0x0B => port2.read_ctrl(),
+                _ => 0,
+            }
+        }
+        bus::BusRegion::Z80Area => {
+            let z80_addr = addr & 0xFFFF;
+            match z80_addr {
+                0x0000..=0x1FFF => z80_ram[z80_addr as usize],
+                0x2000..=0x3FFF => z80_ram[(z80_addr & 0x1FFF) as usize],
+                0x4000..=0x4003 => ym2612.read_status(),
+                _ => 0xFF,
+            }
+        }
+        bus::BusRegion::ControlRegisters => {
+            let offset = addr & 0x01FF;
+            match offset {
+                0x0000..=0x0001 => {
+                    if z80_bus_requested { 0x00 } else { 0x01 }
+                }
+                _ => 0x00,
+            }
+        }
+        bus::BusRegion::Vdp => {
+            let vdp_addr = addr & 0x1F;
+            match vdp_addr {
+                0x04 | 0x06 => {
+                    let status = vdp.read_status();
+                    if addr & 1 == 0 {
+                        (status >> 8) as u8
+                    } else {
+                        status as u8
+                    }
+                }
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Writes one byte to the 68000's 24-bit address space.
+///
+/// The write-side counterpart to [`read_68k_byte`] and the single source of
+/// truth for 68000 byte-level write mapping, shared by [`CoreBus::write_byte`]
+/// and the Z80's banked window. Like the read path it performs only flat field
+/// access (never re-enters a CPU), so the Z80 banking to its own area
+/// (`0xA00000`) or its control ports resolves sanely without recursion.
+#[allow(clippy::too_many_arguments)]
+fn write_68k_byte(
+    addr: u32,
+    val: u8,
+    work_ram: &mut [u8; 0x10000],
+    port1: &mut ControllerPort,
+    port2: &mut ControllerPort,
+    z80_ram: &mut [u8; 0x2000],
+    ym2612: &mut ym2612::Ym2612,
+    psg: &mut psg::Psg,
+    z80_bus_requested: &mut bool,
+    z80_reset: &mut bool,
+    z80_reset_pending: &mut bool,
+    z80_bus_released_this_scanline: &mut bool,
+    z80_cmd_trace: &mut Vec<(u64, u8)>,
+    z80_driver_write_count: &mut u32,
+    z80_driver_last_write_frame: &mut u64,
+    trace: &mut AudioTraceCtx,
+) {
+    match bus::map_region(addr) {
+        bus::BusRegion::WorkRam => {
+            let offset = (addr & 0xFFFF) as usize;
+            work_ram[offset] = val;
+        }
+        bus::BusRegion::IoRegisters => {
+            let reg = (addr & 0x1F) as u8;
+            match reg {
+                0x02 | 0x03 => port1.write_data(val),
+                0x04 | 0x05 => port2.write_data(val),
+                0x08 | 0x09 => port1.write_ctrl(val),
+                0x0A | 0x0B => port2.write_ctrl(val),
+                _ => {}
+            }
+        }
+        bus::BusRegion::Z80Area => {
+            let z80_addr = addr & 0xFFFF;
+            match z80_addr {
+                0x0000..=0x1FFF => {
+                    if z80_addr == 0x1FFF && z80_cmd_trace.len() < 100 {
+                        z80_cmd_trace.push((trace.frame_count, val));
+                    }
+                    if z80_addr <= 0x00FF {
+                        *z80_driver_write_count += 1;
+                        *z80_driver_last_write_frame = trace.frame_count;
+                    }
+                    z80_ram[z80_addr as usize] = val;
+                }
+                0x2000..=0x3FFF => z80_ram[(z80_addr & 0x1FFF) as usize] = val,
+                0x4000 => ym2612.write_address(0, val),
+                0x4001 => trace.record_ym2612(ym2612, 0, val),
+                0x4002 => ym2612.write_address(1, val),
+                0x4003 => trace.record_ym2612(ym2612, 1, val),
+                _ => {}
+            }
+        }
+        bus::BusRegion::ControlRegisters => {
+            let reg = addr & 0xFFFF;
+            match reg {
+                0x1100..=0x1101 => {
+                    let new_req = val & 0x01 != 0;
+                    if *z80_bus_requested && !new_req {
+                        *z80_bus_released_this_scanline = true;
+                    }
+                    *z80_bus_requested = new_req;
+                }
+                0x1200..=0x1201 => {
+                    let new_reset = val & 0x01 == 0;
+                    if *z80_reset && !new_reset {
+                        *z80_reset_pending = true;
+                    }
+                    *z80_reset = new_reset;
+                }
+                _ => {}
+            }
+        }
+        bus::BusRegion::Vdp => {
+            let vdp_addr = addr & 0x1F;
+            match vdp_addr {
+                0x11 | 0x13 | 0x15 | 0x17 => trace.record_psg(psg, val),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Bus wrapper that borrows non-CPU fields from [`GenesisCore`],
 /// allowing the CPU executor to access memory without conflicting
 /// with the mutable borrow of the CPU.
@@ -2807,77 +3066,21 @@ impl CoreBus<'_> {
         });
         self.ym2612.write_data(port, value);
     }
-
-    fn write_psg(&mut self, value: u8) {
-        self.psg_timed_write_trace.push(TimedPsgWrite {
-            master_tick: self.master_tick,
-            frame: self.frame_count,
-            scanline: self.scanline,
-            value,
-        });
-        self.psg.write(value);
-    }
 }
 
 impl Bus for CoreBus<'_> {
     fn read_byte(&mut self, addr: u32) -> u8 {
-        match bus::map_region(addr) {
-            bus::BusRegion::CartridgeRom => {
-                let offset = (addr & 0x3FFFFF) as usize;
-                self.rom.get(offset).copied().unwrap_or(0)
-            }
-            bus::BusRegion::WorkRam => {
-                let offset = (addr & 0xFFFF) as usize;
-                self.work_ram[offset]
-            }
-            bus::BusRegion::IoRegisters => {
-                let reg = (addr & 0x1F) as u8;
-                match reg {
-                    0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
-                    0x02 | 0x03 => self.port1.read_data(),
-                    0x04 | 0x05 => self.port2.read_data(),
-                    0x08 | 0x09 => self.port1.read_ctrl(),
-                    0x0A | 0x0B => self.port2.read_ctrl(),
-                    _ => 0,
-                }
-            }
-            bus::BusRegion::Z80Area => {
-                let z80_addr = addr & 0xFFFF;
-                match z80_addr {
-                    0x0000..=0x1FFF => self.z80_ram[z80_addr as usize],
-                    0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize],
-                    0x4000..=0x4003 => self.ym2612.read_status(),
-                    _ => 0xFF,
-                }
-            }
-            bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
-                let offset = addr & 0x01FF;
-                match offset {
-                    0x0000..=0x0001 => {
-                        // Return bus status: if bus was requested and Z80 is idle,
-                        // bit 0 = 0 means bus granted
-                        if *self.z80_bus_requested { 0x00 } else { 0x01 }
-                    }
-                    _ => 0x00,
-                }
-            }
-            bus::BusRegion::Vdp => {
-                let vdp_addr = addr & 0x1F;
-                match vdp_addr {
-                    0x04 | 0x06 => {
-                        let status = self.vdp.read_status();
-                        if addr & 1 == 0 {
-                            (status >> 8) as u8
-                        } else {
-                            status as u8
-                        }
-                    }
-                    _ => 0,
-                }
-            }
-            _ => 0,
-        }
+        read_68k_byte(
+            addr,
+            self.rom,
+            &**self.work_ram,
+            self.vdp,
+            self.port1,
+            self.port2,
+            &**self.z80_ram,
+            self.ym2612,
+            *self.z80_bus_requested,
+        )
     }
 
     fn read_word(&mut self, addr: u32) -> u16 {
@@ -2953,74 +3156,31 @@ impl Bus for CoreBus<'_> {
     }
 
     fn write_byte(&mut self, addr: u32, val: u8) {
-        match bus::map_region(addr) {
-            bus::BusRegion::WorkRam => {
-                let offset = (addr & 0xFFFF) as usize;
-                self.work_ram[offset] = val;
-            }
-            bus::BusRegion::IoRegisters => {
-                let reg = (addr & 0x1F) as u8;
-                match reg {
-                    0x02 | 0x03 => self.port1.write_data(val),
-                    0x04 | 0x05 => self.port2.write_data(val),
-                    0x08 | 0x09 => self.port1.write_ctrl(val),
-                    0x0A | 0x0B => self.port2.write_ctrl(val),
-                    _ => {}
-                }
-            }
-            bus::BusRegion::Z80Area => {
-                let z80_addr = addr & 0xFFFF;
-                match z80_addr {
-                    0x0000..=0x1FFF => {
-                        if z80_addr == 0x1FFF && self.z80_cmd_trace.len() < 100 {
-                            self.z80_cmd_trace.push((self.frame_count, val));
-                        }
-                        if z80_addr <= 0x00FF {
-                            *self.z80_driver_write_count += 1;
-                            *self.z80_driver_last_write_frame = self.frame_count;
-                        }
-                        self.z80_ram[z80_addr as usize] = val;
-                    }
-                    0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize] = val,
-                    0x4000 => self.ym2612.write_address(0, val),
-                    0x4001 => self.write_ym2612_data(0, val),
-                    0x4002 => self.ym2612.write_address(1, val),
-                    0x4003 => self.write_ym2612_data(1, val),
-                    _ => {}
-                }
-            }
-            bus::BusRegion::ControlRegisters => {
-                // 0xA11100 = Z80 bus request, 0xA11200 = Z80 reset
-                let reg = addr & 0xFFFF;
-                match reg {
-                    0x1100..=0x1101 => {
-                        let new_req = val & 0x01 != 0;
-                        if *self.z80_bus_requested && !new_req {
-                            *self.z80_bus_released_this_scanline = true;
-                        }
-                        *self.z80_bus_requested = new_req;
-                    }
-                    0x1200..=0x1201 => {
-                        let new_reset = val & 0x01 == 0;
-                        if *self.z80_reset && !new_reset {
-                            *self.z80_reset_pending = true;
-                        }
-                        *self.z80_reset = new_reset;
-                    }
-                    _ => {}
-                }
-            }
-            bus::BusRegion::Vdp => {
-                let vdp_addr = addr & 0x1F;
-                match vdp_addr {
-                    0x11 | 0x13 | 0x15 | 0x17 => {
-                        self.write_psg(val);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+        let mut trace = AudioTraceCtx {
+            ym2612_timed_write_trace: &mut *self.ym2612_timed_write_trace,
+            psg_timed_write_trace: &mut *self.psg_timed_write_trace,
+            frame_count: self.frame_count,
+            scanline: self.scanline,
+            master_tick: self.master_tick,
+        };
+        write_68k_byte(
+            addr,
+            val,
+            &mut **self.work_ram,
+            self.port1,
+            self.port2,
+            &mut **self.z80_ram,
+            self.ym2612,
+            self.psg,
+            self.z80_bus_requested,
+            self.z80_reset,
+            self.z80_reset_pending,
+            self.z80_bus_released_this_scanline,
+            self.z80_cmd_trace,
+            self.z80_driver_write_count,
+            self.z80_driver_last_write_frame,
+            &mut trace,
+        );
     }
 
     fn write_word(&mut self, addr: u32, val: u16) {
@@ -3115,9 +3275,21 @@ impl Bus for CoreBus<'_> {
 struct Z80Bus<'a> {
     z80_ram: &'a mut Box<[u8; 0x2000]>,
     rom: &'a [u8],
+    // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
+    work_ram: &'a mut Box<[u8; 0x10000]>,
+    vdp: &'a Vdp,
+    port1: &'a mut ControllerPort,
+    port2: &'a mut ControllerPort,
     z80_bank: &'a mut u32,
+    z80_bus_requested: &'a mut bool,
+    z80_reset: &'a mut bool,
+    z80_reset_pending: &'a mut bool,
+    z80_bus_released_this_scanline: &'a mut bool,
     ym2612: &'a mut ym2612::Ym2612,
     psg: &'a mut psg::Psg,
+    z80_cmd_trace: &'a mut Vec<(u64, u8)>,
+    z80_driver_write_count: &'a mut u32,
+    z80_driver_last_write_frame: &'a mut u64,
     ym2612_timed_write_trace: &'a mut Vec<TimedYm2612Write>,
     psg_timed_write_trace: &'a mut Vec<TimedPsgWrite>,
     frame_count: u64,
@@ -3157,9 +3329,22 @@ impl z80::execute::Bus for Z80Bus<'_> {
             0x2000..=0x3FFF => self.z80_ram[(addr & 0x1FFF) as usize],
             0x4000..=0x4003 => self.ym2612.read_status(),
             0x8000..=0xFFFF => {
-                // Banked 68K ROM window
-                let offset = *self.z80_bank + u32::from(addr & 0x7FFF);
-                self.rom.get(offset as usize).copied().unwrap_or(0)
+                // Banked window into the full 68000 24-bit address space.
+                // The bank register supplies bits 15-23; addr supplies bits 0-14.
+                // Real hardware routes this through the 68000 bus (ROM, work RAM,
+                // VDP, I/O, ...), not just cartridge ROM.
+                let bus_addr = (*self.z80_bank | u32::from(addr & 0x7FFF)) & 0x00FF_FFFF;
+                read_68k_byte(
+                    bus_addr,
+                    self.rom,
+                    &**self.work_ram,
+                    self.vdp,
+                    self.port1,
+                    self.port2,
+                    &**self.z80_ram,
+                    self.ym2612,
+                    *self.z80_bus_requested,
+                )
             }
             _ => 0xFF,
         }
@@ -3179,6 +3364,39 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 *self.z80_bank = ((*self.z80_bank >> 1) | ((u32::from(val) & 1) << 23)) & 0xFF8000;
             }
             0x7F00..=0x7FFF => self.write_psg(val),
+            0x8000..=0xFFFF => {
+                // Banked window into the full 68000 24-bit address space. Writes
+                // reach work RAM, VDP/PSG, I/O and Z80 control regs just like a
+                // 68000 access (drivers that bank to work RAM were previously
+                // dropped). write_68k_byte only touches flat state, so banking to
+                // the Z80 area or control ports cannot recurse.
+                let bus_addr = (*self.z80_bank | u32::from(addr & 0x7FFF)) & 0x00FF_FFFF;
+                let mut trace = AudioTraceCtx {
+                    ym2612_timed_write_trace: &mut *self.ym2612_timed_write_trace,
+                    psg_timed_write_trace: &mut *self.psg_timed_write_trace,
+                    frame_count: self.frame_count,
+                    scanline: self.scanline,
+                    master_tick: self.master_tick,
+                };
+                write_68k_byte(
+                    bus_addr,
+                    val,
+                    &mut **self.work_ram,
+                    self.port1,
+                    self.port2,
+                    &mut **self.z80_ram,
+                    self.ym2612,
+                    self.psg,
+                    self.z80_bus_requested,
+                    self.z80_reset,
+                    self.z80_reset_pending,
+                    self.z80_bus_released_this_scanline,
+                    self.z80_cmd_trace,
+                    self.z80_driver_write_count,
+                    self.z80_driver_last_write_frame,
+                    &mut trace,
+                );
+            }
             _ => {}
         }
     }
@@ -3228,16 +3446,28 @@ mod tests {
     }
 
     fn z80_bus_with_master_tick<'a>(core: &'a mut GenesisCore, master_tick: u64) -> Z80Bus<'a> {
+        let scanline = core.vdp.scanline();
         Z80Bus {
             z80_ram: &mut core.z80_ram,
             rom: &core.rom,
+            work_ram: &mut core.work_ram,
+            vdp: &core.vdp,
+            port1: &mut core.port1,
+            port2: &mut core.port2,
             z80_bank: &mut core.z80_bank,
+            z80_bus_requested: &mut core.z80_bus_requested,
+            z80_reset: &mut core.z80_reset,
+            z80_reset_pending: &mut core.z80_reset_pending,
+            z80_bus_released_this_scanline: &mut core.z80_bus_released_this_scanline,
             ym2612: &mut core.ym2612,
             psg: &mut core.psg,
+            z80_cmd_trace: &mut core.z80_cmd_trace,
+            z80_driver_write_count: &mut core.z80_driver_write_count,
+            z80_driver_last_write_frame: &mut core.z80_driver_last_write_frame,
             ym2612_timed_write_trace: &mut core.ym2612_timed_write_trace,
             psg_timed_write_trace: &mut core.psg_timed_write_trace,
             frame_count: core.frame_count,
-            scanline: core.vdp.scanline(),
+            scanline,
             master_tick,
         }
     }
@@ -4105,6 +4335,61 @@ mod tests {
             "VBlank handler must run exactly once per frame, got {} times",
             core.z80_ram[0x1F00]
         );
+    }
+
+    /// Regression test for the Z80 banked `0x8000-0xFFFF` window reaching the
+    /// full 68000 address space (not just cartridge ROM).
+    ///
+    /// A byte the 68000 writes into work RAM must be visible when the Z80 banks
+    /// its window to that 68000 address, and a byte the Z80 writes through the
+    /// banked window must be visible to the 68000. Previously the window indexed
+    /// straight into `self.rom`, so work-RAM banking read 0 and writes were
+    /// dropped.
+    #[test]
+    fn z80_bank_window_reaches_full_68k_address_space() {
+        let mut core = GenesisCore::new();
+
+        // 68000 writes known bytes into work RAM (0xFF0000 region).
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xFF_0000, 0x5A);
+            bus.write_byte(0xFF_0010, 0x3C);
+        }
+
+        // Point the Z80 bank so the 0x8000 window base maps to 0xFF0000.
+        // bus_addr = (z80_bank | (addr & 0x7FFF)); addr 0x8000 -> offset 0.
+        core.z80_bank = 0xFF_0000;
+
+        // The Z80 reads the 68000-written bytes back through the banked window.
+        {
+            let mut bus = z80_bus_with_master_tick(&mut core, 0);
+            assert_eq!(
+                bus.read_byte(0x8000),
+                0x5A,
+                "Z80 banked read of work RAM must see the 68000-written byte",
+            );
+            assert_eq!(
+                bus.read_byte(0x8010),
+                0x3C,
+                "Z80 banked read must apply the intra-window offset to 68000 space",
+            );
+        }
+
+        // The Z80 writes into work RAM through the banked window...
+        {
+            let mut bus = z80_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x8020, 0x77);
+        }
+        // ...and the 68000 observes it.
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            assert_eq!(
+                bus.read_byte(0xFF_0020),
+                0x77,
+                "68000 must observe a byte the Z80 banked-wrote into work RAM",
+            );
+        }
+        assert_eq!(core.work_ram[0x0020], 0x77);
     }
 
     #[test]
