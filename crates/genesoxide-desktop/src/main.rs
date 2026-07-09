@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use genesoxide_config::GenesisConfig;
-use genesoxide_core::{Command, FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_WIDTH, GenesisCore};
+use genesoxide_config::{GenesisConfig, RegionSetting};
+use genesoxide_core::{Command, FRAME_HEIGHT, FRAME_WIDTH, GenesisCore, Region};
 use gilrs::{Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
@@ -92,6 +92,17 @@ fn main() -> Result<()> {
     }
 }
 
+/// Returns the core's active framebuffer dimensions as `(width, height)` u32.
+fn frame_dims_u32(core: &GenesisCore) -> (u32, u32) {
+    let (w, h) = core.frame_dimensions();
+    (w as u32, h as u32)
+}
+
+/// Returns the effective region's nominal frame period in nanoseconds.
+fn app_frame_period_ns(core: &GenesisCore) -> u64 {
+    core.frame_period_ns()
+}
+
 /// How often (in frames) to flush dirty SRAM to disk during play, so a crash
 /// or forced kill does not lose recent progress. ~3 seconds at 60 Hz.
 const SRAM_FLUSH_INTERVAL: u32 = 180;
@@ -136,6 +147,16 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to read ROM: {}", rom_path.display()))?;
 
     let mut core = GenesisCore::new();
+
+    // Apply the configured region override before loading the ROM so the ROM's
+    // header-derived region only takes effect in `auto` mode.
+    let region_override = match config.desktop.region {
+        RegionSetting::Auto => None,
+        RegionSetting::Ntsc => Some(Region::Ntsc),
+        RegionSetting::Pal => Some(Region::Pal),
+    };
+    core.execute(Command::SetRegionOverride(region_override));
+
     core.execute(Command::LoadRom(rom_data));
 
     // Battery-save persistence: derive the `.srm` path and load any existing
@@ -198,6 +219,11 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         eprintln!("Warning: no audio output device available");
     }
 
+    // Pace at the effective region's frame period (NTSC ~16.69 ms, PAL ~20.12 ms)
+    // and size the surface from the core's active dimensions (224 or 240 lines).
+    let frame_duration = Duration::from_nanos(app_frame_period_ns(&core));
+    let frame_dims = frame_dims_u32(&core);
+
     let mut app = App {
         core,
         scale,
@@ -205,7 +231,8 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         pixels: None,
         audio,
         last_frame_time: None,
-        frame_duration: Duration::from_nanos(FRAME_PERIOD_NS),
+        frame_duration,
+        frame_dims,
         rewind_held: false,
         paused: false,
         srm_path,
@@ -230,6 +257,9 @@ struct App {
     audio: Option<audio::AudioOutput>,
     last_frame_time: Option<Instant>,
     frame_duration: Duration,
+    /// Current active framebuffer dimensions `(width, height)`; re-checked each
+    /// frame so a V28↔V30 mode switch resizes the pixel surface.
+    frame_dims: (u32, u32),
     /// True while Backspace is held (hold-to-rewind).
     rewind_held: bool,
     /// True when emulation is paused (P toggles).
@@ -276,15 +306,13 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let size = LogicalSize::new(
-            FRAME_WIDTH as u32 * self.scale,
-            FRAME_HEIGHT as u32 * self.scale,
-        );
+        let (fb_w, fb_h) = self.frame_dims;
+        let size = LogicalSize::new(fb_w * self.scale, fb_h * self.scale);
 
         let attrs = Window::default_attributes()
             .with_title("genesoxide")
             .with_inner_size(size)
-            .with_min_inner_size(LogicalSize::new(FRAME_WIDTH as u32, FRAME_HEIGHT as u32));
+            .with_min_inner_size(LogicalSize::new(fb_w, fb_h));
 
         let window = event_loop
             .create_window(attrs)
@@ -295,8 +323,7 @@ impl ApplicationHandler for App {
         let window_ref = self.window.as_ref().unwrap();
         let physical = window_ref.inner_size();
         let surface = SurfaceTexture::new(physical.width, physical.height, window_ref);
-        let pixels = Pixels::new(FRAME_WIDTH as u32, FRAME_HEIGHT as u32, surface)
-            .expect("Failed to create pixel buffer");
+        let pixels = Pixels::new(fb_w, fb_h, surface).expect("Failed to create pixel buffer");
 
         // SAFETY: pixels lifetime is tied to self.window which we keep alive
         // for the duration of the App. Window is never moved or dropped while
@@ -418,11 +445,15 @@ impl ApplicationHandler for App {
                 }
 
                 // Copy framebuffer to pixel surface. The core framebuffer is
-                // native-width (256px in H32, 320px in H40), so on a mode switch
-                // — applied at this frame boundary — resize the Pixels texture
-                // buffer to match before copying. The window/surface physical
-                // size is left unchanged; Pixels scales the narrower H32 buffer
-                // up to the surface for us.
+                // native size — width follows the H32/H40 horizontal mode
+                // (256/320) and height follows the V28/V30 vertical mode
+                // (224/240). Either a width change (H32↔H40) or a height change
+                // (V28↔V30) is applied at this frame boundary, so resize the
+                // Pixels texture buffer to match before copying. The
+                // window/surface physical size is left unchanged; Pixels scales
+                // the buffer up to the surface for us. Region (and hence frame
+                // pacing) is fixed once at startup via SetRegionOverride, so
+                // frame_duration does not change here.
                 if let Some(pixels) = &mut self.pixels {
                     let dims = self.core.framebuffer_dimensions();
                     if dims != self.last_dims && pixels.resize_buffer(dims.0, dims.1).is_ok() {

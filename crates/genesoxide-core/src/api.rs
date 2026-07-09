@@ -2124,10 +2124,14 @@ impl GenesisCore {
     /// Returns the current framebuffer dimensions `(width, height)` in pixels.
     ///
     /// Width follows the VDP horizontal mode (320 in H40, 256 in H32); height
-    /// is always 224 (NTSC). Answers [`CoreQuery::FramebufferDimensions`].
+    /// follows the region/vertical mode (224 in V28, 240 in PAL V30). Answers
+    /// [`CoreQuery::FramebufferDimensions`].
     #[must_use]
     pub fn framebuffer_dimensions(&self) -> (u32, u32) {
-        (u32::from(self.vdp.display_width()), FRAME_HEIGHT as u32)
+        (
+            u32::from(self.vdp.display_width()),
+            self.vdp.active_height() as u32,
+        )
     }
 
     /// Returns the frame counter.
@@ -2505,12 +2509,15 @@ impl GenesisCore {
         self.region.is_pal()
     }
 
-    /// Active framebuffer dimensions `(width, height)` for the current mode:
-    /// `(320, 224)` in V28, `(320, 240)` in PAL V30. Frontends should size their
-    /// output surface from this and re-check it each frame for mode switches.
+    /// Active framebuffer dimensions `(width, height)` for the current mode.
+    ///
+    /// Width follows the VDP horizontal mode (320 in H40, 256 in H32); height
+    /// follows the region/vertical mode (224 in V28, 240 in PAL V30). Frontends
+    /// should size their output surface from this and re-check it each frame for
+    /// mode switches.
     #[must_use]
     pub fn frame_dimensions(&self) -> (usize, usize) {
-        (FRAME_WIDTH, self.vdp.active_height())
+        (self.vdp.display_width() as usize, self.vdp.active_height())
     }
 
     /// Nominal frame period in nanoseconds for the effective region (NTSC
