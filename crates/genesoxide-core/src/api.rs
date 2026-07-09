@@ -2222,6 +2222,36 @@ impl GenesisCore {
             // This handles tight bus polling loops where the 68K requests/releases
             // the bus multiple times per scanline — the Z80 must get cycles in the
             // brief release windows or the SMPS sound driver handshake deadlocks.
+            //
+            // KNOWN LIMITATION (BUSREQ granularity — deferred, see below).
+            // Arbitration is sampled once per scanline: the 68000 runs the whole
+            // scanline first, then the Z80 runs a full 228 T-states in one shot if
+            // it got the bus at any point. The sticky `z80_bus_released_this_scanline`
+            // flag therefore over-grants Z80 time when the 68000 held BUSREQ for
+            // most of the scanline and released it only briefly — the Z80 still gets
+            // all 228 cycles, feeding the FM/PSG write timeline slightly too much
+            // Z80 time (flagged by PR #3). Finer, sub-scanline arbitration was
+            // assessed and intentionally deferred rather than implemented, because:
+            //
+            //   1. No available test exercises the real 68000<->Z80 SMPS handshake
+            //      this flag protects: the Sonic ROM (the designated end-to-end
+            //      guard) is absent here, so `sonic_boot` and `audio_golden` skip,
+            //      and `vgm_playback` feeds the sound chips directly, bypassing Z80
+            //      bus arbitration entirely. Changing this delicate code blind to
+            //      its guard risks silently reintroducing the documented deadlock.
+            //   2. Interleaving 68000/Z80 stepping per sub-scanline slice would
+            //      multiply the existing per-stream master_tick ordering violation
+            //      in the audio write trace. `synthesize_audio_interval` merges the
+            //      YM and PSG streams assuming each is monotonic in master_tick
+            //      within a scanline; finer interleaving of the CPU- and Z80-timed
+            //      writes would mis-order register writes and could DEGRADE audio —
+            //      the opposite of the intended payoff — and fixing it properly
+            //      reaches into the separately-owned audio-synthesis timeline.
+            //   3. The payoff is modest: more accurate sub-scanline FM/PSG write
+            //      timestamps, not game-logic correctness. The cost/risk (an
+            //      unvalidatable change to deadlock-sensitive, audio-timeline code)
+            //      outweighs it. Revisit once a real-driver regression guard (a
+            //      bootable Sonic/SMPS ROM through the Z80 path) is available.
             let z80_gets_cycles =
                 !self.z80_reset && (!self.z80_bus_requested || self.z80_bus_released_this_scanline);
             if z80_gets_cycles {
