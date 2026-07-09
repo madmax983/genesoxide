@@ -627,8 +627,8 @@ const BAND_HEIGHT: usize = 16;
 
 fn build_hint_raster_bands_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
-    // reg 0x0C = H40 only (S/H off), backdrop index 0 initially.
-    base_registers(&mut b, 0x01, 0x00);
+    // reg 0x0C = H40 only (0x81 = RS0|RS1, S/H off), backdrop index 0 initially.
+    base_registers(&mut b, 0x81, 0x00);
 
     // Preload the band palette (CRAM entries 0..13). No tiles or sprites are
     // written, so every plane pixel is transparent and the backdrop fills the
