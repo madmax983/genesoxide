@@ -696,3 +696,256 @@ impl Default for Eeprom {
         Self::empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Odd byte of the SEGA-mapper EEPROM window; SCL=D1, SDA=D0.
+    const SEGA_ADDR: u32 = 0x20_0001;
+
+    /// Drives one SEGA-mapper bus write with the given SCL/SDA levels.
+    fn wr(e: &mut Eeprom, scl: u8, sda: u8, addr: u32) {
+        e.write(addr, (scl << 1) | sda);
+    }
+
+    /// I2C START on the SEGA mapper. Leaves SCL low, ready to clock.
+    fn start(e: &mut Eeprom) {
+        wr(e, 1, 1, SEGA_ADDR);
+        wr(e, 1, 0, SEGA_ADDR); // SDA high->low while SCL high
+        wr(e, 0, 0, SEGA_ADDR); // drop SCL: enter address phase (cycles=1)
+    }
+
+    /// I2C STOP on the SEGA mapper.
+    fn stop(e: &mut Eeprom) {
+        wr(e, 0, 0, SEGA_ADDR);
+        wr(e, 1, 0, SEGA_ADDR);
+        wr(e, 1, 1, SEGA_ADDR); // SDA low->high while SCL high
+    }
+
+    /// Clocks one bit into the chip (set while SCL low, sample on rising edge).
+    fn send_bit(e: &mut Eeprom, b: u8) {
+        wr(e, 0, b, SEGA_ADDR);
+        wr(e, 1, b, SEGA_ADDR); // rising edge: chip latches
+        wr(e, 0, b, SEGA_ADDR); // falling edge: advance cycle
+    }
+
+    /// Mode-1 addressing: 7 address bits (MSB first), R/W bit, then the ACK
+    /// clock that transitions into the data phase.
+    fn send_addr7(e: &mut Eeprom, addr: u8, rw: u8) {
+        for i in 0..7 {
+            send_bit(e, (addr >> (6 - i)) & 1);
+        }
+        send_bit(e, rw); // R/W bit
+        send_bit(e, 1); // ACK clock -> data phase
+    }
+
+    /// Clocks a data byte into the chip (write burst) plus the commit clock.
+    fn send_data(e: &mut Eeprom, d: u8) {
+        for i in 0..8 {
+            send_bit(e, (d >> (7 - i)) & 1);
+        }
+        send_bit(e, 1); // 9th clock: chip commits the byte
+    }
+
+    /// Reads one data byte during a read burst; `cont` selects ACK (continue)
+    /// vs NACK (end) on the 9th clock.
+    fn read_byte(e: &mut Eeprom, cont: bool) -> u8 {
+        let mut v = 0u8;
+        for _ in 0..8 {
+            let bit = e.read(SEGA_ADDR).unwrap() & 1;
+            v = (v << 1) | bit;
+            wr(e, 1, 1, SEGA_ADDR); // rising (data held high by master)
+            wr(e, 0, 1, SEGA_ADDR); // falling: advance to next output bit
+        }
+        let a = if cont { 0 } else { 1 };
+        wr(e, 0, a, SEGA_ADDR);
+        wr(e, 1, a, SEGA_ADDR); // rising @ cycle 9: chip samples ACK/NACK
+        wr(e, 0, a, SEGA_ADDR);
+        v
+    }
+
+    /// Writes `byte` to `word` on a mode-1 (X24C01) SEGA-mapper chip.
+    fn i2c_write(e: &mut Eeprom, word: u8, byte: u8) {
+        start(e);
+        send_addr7(e, word, 0);
+        send_data(e, byte);
+        stop(e);
+    }
+
+    /// Reads one byte from `word` (single-byte read).
+    fn i2c_read1(e: &mut Eeprom, word: u8) -> u8 {
+        start(e);
+        send_addr7(e, word, 1);
+        let v = read_byte(e, false);
+        stop(e);
+        v
+    }
+
+    #[test]
+    fn absent_eeprom_claims_nothing() {
+        let mut e = Eeprom::empty();
+        assert!(!e.is_present());
+        assert_eq!(e.read(0x20_0001), None);
+        assert!(!e.write(0x20_0001, 0xFF));
+    }
+
+    #[test]
+    fn single_byte_write_read_back() {
+        let mut e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        i2c_write(&mut e, 0x12, 0xA5);
+        assert_eq!(e.data()[0x12], 0xA5, "committed byte lands in backing store");
+        assert!(e.is_dirty());
+        assert_eq!(i2c_read1(&mut e, 0x12), 0xA5, "byte reads back over the bus");
+    }
+
+    #[test]
+    fn read_addresses_fall_through_to_none_off_lane() {
+        let e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        // Even lane is not the SDA-out line for the SEGA mapper.
+        assert_eq!(e.read(0x20_0000), None);
+        // In-window odd address is claimed.
+        assert!(e.read(0x20_0001).is_some());
+    }
+
+    #[test]
+    fn sequential_read_auto_increments() {
+        let mut e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        i2c_write(&mut e, 0x00, 0x11);
+        i2c_write(&mut e, 0x01, 0x22);
+        i2c_write(&mut e, 0x02, 0x33);
+        // Address 0x00, then read three bytes with ACK-continue between them.
+        start(&mut e);
+        send_addr7(&mut e, 0x00, 1);
+        assert_eq!(read_byte(&mut e, true), 0x11);
+        assert_eq!(read_byte(&mut e, true), 0x22);
+        assert_eq!(read_byte(&mut e, false), 0x33);
+        stop(&mut e);
+    }
+
+    #[test]
+    fn sequential_read_wraps_at_array_size() {
+        let mut e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        // X24C01 is 128 bytes; size_mask 0x7F. Write to top and bottom.
+        i2c_write(&mut e, 0x7F, 0xEE);
+        i2c_write(&mut e, 0x00, 0xDD);
+        start(&mut e);
+        send_addr7(&mut e, 0x7F, 1);
+        assert_eq!(read_byte(&mut e, true), 0xEE); // 0x7F
+        assert_eq!(read_byte(&mut e, false), 0xDD); // wrapped to 0x00
+        stop(&mut e);
+    }
+
+    #[test]
+    fn page_write_wraps_within_page() {
+        let mut e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        // X24C01 page mask is 0x03 (4-byte page). Start at 0x02 and write 3
+        // bytes in one burst; the third must wrap to 0x00 within the page, not
+        // advance to 0x05.
+        start(&mut e);
+        send_addr7(&mut e, 0x02, 0);
+        send_data(&mut e, 0xA0); // -> 0x02
+        send_data(&mut e, 0xA1); // -> 0x03
+        send_data(&mut e, 0xA2); // -> wraps to 0x00
+        stop(&mut e);
+        assert_eq!(e.data()[0x02], 0xA0);
+        assert_eq!(e.data()[0x03], 0xA1);
+        assert_eq!(e.data()[0x00], 0xA2, "page write wrapped to page base");
+        assert_eq!(e.data()[0x04], 0x00, "did not spill past the page");
+    }
+
+    #[test]
+    fn start_resets_partial_transfer() {
+        let mut e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        start(&mut e);
+        send_addr7(&mut e, 0x40, 0);
+        // A repeated START abandons the in-progress write and re-addresses.
+        start(&mut e);
+        send_addr7(&mut e, 0x05, 0);
+        send_data(&mut e, 0x77);
+        stop(&mut e);
+        assert_eq!(e.data()[0x05], 0x77);
+        assert_eq!(e.data()[0x40], 0x00, "abandoned address was never written");
+    }
+
+    #[test]
+    fn dirty_flag_lifecycle() {
+        let mut e = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        assert!(!e.is_dirty());
+        i2c_write(&mut e, 0x00, 0x01);
+        assert!(e.is_dirty());
+        e.clear_dirty();
+        assert!(!e.is_dirty());
+    }
+
+    #[test]
+    fn load_populates_without_dirtying() {
+        let mut e = Eeprom::new(EepromType::X24C02, EepromMapper::AcclaimOld);
+        let saved: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
+        e.load(&saved);
+        assert_eq!(e.data(), &saved[..]);
+        assert!(!e.is_dirty());
+    }
+
+    fn header_with_serial(serial: &str) -> RomHeader {
+        RomHeader {
+            system_type: "SEGA GENESIS".to_string(),
+            copyright: String::new(),
+            title_domestic: String::new(),
+            title_overseas: String::new(),
+            serial: serial.to_string(),
+            rom_start: 0,
+            rom_end: 0,
+            ram_start: 0,
+            ram_end: 0,
+            checksum: 0,
+            region: "JUE".to_string(),
+            has_sram: false,
+            sram_start: 0,
+            sram_end: 0,
+            sram_type: 0,
+            sram_layout: crate::rom::SramLayout::Both,
+        }
+    }
+
+    #[test]
+    fn for_rom_matches_known_serials() {
+        // Wonder Boy in Monster World (SEGA / X24C01).
+        let e = Eeprom::for_rom(&header_with_serial("GM G-4060 -00"));
+        assert!(e.is_present());
+        assert_eq!(e.chip, Some(EepromType::X24C01));
+        assert_eq!(e.mapper, EepromMapper::Sega);
+
+        // NBA Jam (Acclaim 16M / X24C02).
+        let e = Eeprom::for_rom(&header_with_serial("T-081326-00"));
+        assert_eq!(e.chip, Some(EepromType::X24C02));
+        assert_eq!(e.mapper, EepromMapper::AcclaimOld);
+
+        // NBA Jam TE (Acclaim 32M / 24C04).
+        let e = Eeprom::for_rom(&header_with_serial("T-81406"));
+        assert_eq!(e.chip, Some(EepromType::X24C04));
+        assert_eq!(e.mapper, EepromMapper::AcclaimNew);
+
+        // Brian Lara Cricket (Codemasters J-CART / 24C08).
+        let e = Eeprom::for_rom(&header_with_serial("T-120106"));
+        assert_eq!(e.chip, Some(EepromType::X24C08));
+        assert_eq!(e.mapper, EepromMapper::Codemasters);
+    }
+
+    #[test]
+    fn for_rom_unknown_serial_is_absent() {
+        let e = Eeprom::for_rom(&header_with_serial("T-99999"));
+        assert!(!e.is_present());
+    }
+
+    #[test]
+    fn chip_specs_match_reference() {
+        assert_eq!(EepromType::X24C01.size(), 128);
+        assert_eq!(EepromType::X24C01.address_bits(), 7);
+        assert_eq!(EepromType::X24C01.size_mask(), 0x7F);
+        assert_eq!(EepromType::X24C64.size(), 8192);
+        assert_eq!(EepromType::X24C64.address_bits(), 16);
+        assert_eq!(EepromType::X24C64.size_mask(), 0x1FFF);
+        assert_eq!(EepromType::X24C16.pagewrite_mask(), 0x0F);
+    }
+}
