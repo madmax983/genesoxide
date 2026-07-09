@@ -2366,6 +2366,20 @@ impl GenesisCore {
         // Run instructions until we've consumed enough cycles.
         let target = self.cpu.cycles + 488;
         while self.cpu.cycles < target {
+            // Stall the 68000 while the VDP holds the bus (DMA in flight):
+            // burn the remaining DMA-busy budget as CPU cycles rather than
+            // running an instruction. This matches hardware where a 68K→VRAM
+            // DMA / VRAM fill / VRAM copy freezes the CPU off the bus for the
+            // transfer's duration.
+            let busy = self.vdp.dma_busy_cpu_cycles();
+            if busy > 0 {
+                let remaining = target - self.cpu.cycles;
+                let stall = u64::from(busy).min(remaining);
+                self.cpu.cycles += stall;
+                self.scheduler.advance_cpu(stall);
+                self.vdp.advance_dma_busy(stall as u32);
+                continue;
+            }
             self.step_cpu();
             // After each instruction, check if DMA is pending
             if self.vdp.dma_pending() {
@@ -2381,6 +2395,16 @@ impl GenesisCore {
         let target = self.cpu.cycles + 488;
         let cpu_cycle_base = self.cpu.cycles;
         while self.cpu.cycles < target {
+            // See comment in `step_scanline` — stall the 68000 during DMA.
+            let busy = self.vdp.dma_busy_cpu_cycles();
+            if busy > 0 {
+                let remaining = target - self.cpu.cycles;
+                let stall = u64::from(busy).min(remaining);
+                self.cpu.cycles += stall;
+                self.scheduler.advance_cpu(stall);
+                self.vdp.advance_dma_busy(stall as u32);
+                continue;
+            }
             let instruction_tick =
                 scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
             self.step_cpu_at(scanline, instruction_tick);
@@ -2527,7 +2551,7 @@ impl GenesisCore {
                 self.vdp.render_scanline(scanline);
             }
 
-            // At scanline 224: enter V-blank and fire V-blank interrupt
+            // At scanline 224: enter V-blank and latch the V-blank interrupt.
             if scanline == ACTIVE_SCANLINES {
                 self.vdp.set_vblank(true);
                 // Assert Z80 INT — the Genesis directly connects this to V-blank.
@@ -2535,38 +2559,56 @@ impl GenesisCore {
                 // IFF1 is enabled (the SMPS driver relies on this for music updates).
                 self.z80.int_line = true;
 
-                // Fire level 6 interrupt if V-interrupt is enabled (reg 1, bit 5)
-                let vint_enabled = self.vdp.read_register(1) & 0x20 != 0;
-                if vint_enabled {
-                    let cpu_master_tick =
-                        scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
-                    let mut bus = CoreBus {
-                        rom: &self.rom,
-                        sram: &mut self.sram,
-                        work_ram: &mut self.work_ram,
-                        vdp: &mut self.vdp,
-                        port1: &mut self.port1,
-                        port2: &mut self.port2,
-                        z80_ram: &mut self.z80_ram,
-                        z80_bus_requested: &mut self.z80_bus_requested,
-                        z80_reset: &mut self.z80_reset,
-                        z80_reset_pending: &mut self.z80_reset_pending,
-                        z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
-                        ym2612: &mut self.ym2612,
-                        psg: &mut self.psg,
-                        z80_cmd_trace: &mut self.z80_cmd_trace,
-                        z80_driver_write_count: &mut self.z80_driver_write_count,
-                        z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
-                        ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
-                        psg_timed_write_trace: &mut self.psg_timed_write_trace,
-                        frame_count: self.frame_count,
-                        scanline,
-                        master_tick: cpu_master_tick,
-                    };
-                    let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
-                    self.cpu.cycles += u64::from(cycles);
-                    self.scheduler.advance_cpu(u64::from(cycles));
+                // Latch the V-interrupt-pending (VIP) flag if the V-interrupt is
+                // enabled (reg 1, bit 5). Delivery is attempted below and on every
+                // subsequent scanline, so a VInt raised while the 68000 is inside a
+                // mask-7 critical section is taken the moment the mask drops rather
+                // than being silently lost. SGDK disables interrupts for several
+                // frames during boot; without this latch its V-blank-driven tilemap
+                // / DMA-queue flush never runs and the screen stays black.
+                if self.vdp.read_register(1) & 0x20 != 0 {
+                    self.vdp.set_vint_pending();
                 }
+            }
+
+            // Deliver a latched V-interrupt (level 6) as soon as the CPU's
+            // interrupt mask allows it. The IPL lines are level-triggered on
+            // hardware, so a pending VInt persists across scanlines (and frames)
+            // until taken; `deliver_interrupt` sets the mask to 6 on entry which
+            // stops it re-firing until the next V-blank re-latches VIP.
+            if self.vdp.vint_pending()
+                && self.vdp.read_register(1) & 0x20 != 0
+                && self.cpu.sr.interrupt_mask() < 6
+            {
+                self.vdp.clear_vint_pending();
+                let cpu_master_tick =
+                    scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
+                let mut bus = CoreBus {
+                    rom: &self.rom,
+                    sram: &mut self.sram,
+                    work_ram: &mut self.work_ram,
+                    vdp: &mut self.vdp,
+                    port1: &mut self.port1,
+                    port2: &mut self.port2,
+                    z80_ram: &mut self.z80_ram,
+                    z80_bus_requested: &mut self.z80_bus_requested,
+                    z80_reset: &mut self.z80_reset,
+                    z80_reset_pending: &mut self.z80_reset_pending,
+                    z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
+                    ym2612: &mut self.ym2612,
+                    psg: &mut self.psg,
+                    z80_cmd_trace: &mut self.z80_cmd_trace,
+                    z80_driver_write_count: &mut self.z80_driver_write_count,
+                    z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
+                    ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+                    psg_timed_write_trace: &mut self.psg_timed_write_trace,
+                    frame_count: self.frame_count,
+                    scanline,
+                    master_tick: cpu_master_tick,
+                };
+                let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
+                self.cpu.cycles += u64::from(cycles);
+                self.scheduler.advance_cpu(u64::from(cycles));
             }
 
             let ym_writes = self.ym2612_timed_write_trace[ym_trace_start..].to_vec();
@@ -5224,5 +5266,175 @@ mod tests {
 
         assert!(delta_bytes > 0);
         assert!((delta_bytes as u64) < naive_bytes);
+    }
+
+    // ---- VInt-latch + CPU-stall-on-DMA integration tests (regression coverage
+    //      for the SGDK-black-screen fix). These drive the real step_frame /
+    //      step_scanline paths, not the individual VDP helpers. ----
+
+    /// A V-interrupt raised while the 68000 is masked (SR I-mask = 7) is not
+    /// dropped: the VDP latches the pending flag and delivery is attempted on
+    /// every subsequent scanline. Status bit 7 (VIP) reflects the latch.
+    #[test]
+    fn vint_pending_latches_across_masked_frames() {
+        let mut core = GenesisCore::new();
+        // Small ROM whose CPU code doesn't matter: we drive the VDP directly and
+        // step frames. `LoadRom` resets the CPU and installs the reset SR
+        // (currently mask 0), so raise the mask to 7 up front to simulate the
+        // real SGDK boot behaviour (interrupts disabled during setup).
+        core.execute(Command::LoadRom(vec![0u8; 0x8000]));
+        core.cpu.sr.set_interrupt_mask(7);
+        // Enable V-interrupts on the VDP (reg 1 bit 5).
+        core.vdp.write_control(0x8120);
+
+        // Advance a single frame — VBlank hits and the VIP flag must latch.
+        core.execute(Command::StepFrame);
+        let vdp_after_frame = core.vdp_snapshot();
+        assert!(
+            vdp_after_frame.vint_pending,
+            "V-interrupt raised while the CPU mask=7 must be latched, not dropped"
+        );
+        assert_ne!(
+            core.vdp.read_status() & 0x0080,
+            0,
+            "status bit 7 (VIP) is set while the interrupt is latched"
+        );
+    }
+
+    /// Dropping the CPU mask below 6 lets the previously-latched V-interrupt
+    /// fire: after delivery the CPU is at the V-blank handler's vector target
+    /// (auto-vector 0x78) and the VIP latch is cleared. Without the latch, a
+    /// VInt raised while mask = 7 would be lost forever — this is the exact
+    /// hardware behavior SGDK's V-blank-driven tilemap flush relies on.
+    #[test]
+    fn latched_vint_fires_when_cpu_mask_drops() {
+        // A minimal hand-assembled ROM whose reset vector points at a NOP and
+        // whose level-6 auto-vector points at a known "handler" PC.  The
+        // handler body is one NOP followed by `bra.s *` so the CPU parks there
+        // once the interrupt is taken and we can identify delivery by checking
+        // core.cpu.pc.
+        const HANDLER_PC: u32 = 0x00_0400;
+        let mut rom = vec![0u8; 0x8000];
+        // Reset vectors: SSP = 0x00FF0000, PC = 0x00000200.
+        rom[0x0000..0x0004].copy_from_slice(&[0x00, 0xFF, 0x00, 0x00]);
+        rom[0x0004..0x0008].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]);
+        // Level-6 (V-blank) auto-vector at byte offset 0x60 + 6*4 = 0x78.
+        rom[0x0078..0x007C].copy_from_slice(&HANDLER_PC.to_be_bytes());
+        // Handler @ HANDLER_PC: NOP; BRA.S *  → the CPU sits at HANDLER_PC + 2.
+        rom[HANDLER_PC as usize..HANDLER_PC as usize + 4].copy_from_slice(&[
+            0x4E, 0x71, // NOP
+            0x60, 0xFE, // BRA.S *
+        ]);
+        // Reset entry @ 0x200: BRA.S *  → CPU sits at 0x200 while ints are
+        // masked (executes an infinite branch to self, one instruction per
+        // scanline, never touches memory).
+        rom[0x0200..0x0204].copy_from_slice(&[0x60, 0xFE, 0x4E, 0x71]);
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+
+        // Force the CPU into mask-7 state and enable V-interrupts on the VDP
+        // (reg 1 bit 5 = 0x20). Setting the mask BEFORE StepFrame is
+        // load-bearing: the SGDK boot path holds mask 7 through V-blank and
+        // the fix must latch the VInt across that window rather than dropping
+        // it.
+        core.cpu.sr.set_interrupt_mask(7);
+        core.vdp.write_control(0x8120);
+
+        // Step one frame at mask 7: the VInt is raised at V-blank, cannot be
+        // taken, and must be latched. Neither PC nor the VIP latch may change
+        // as a result of the CPU executing masked code.
+        core.execute(Command::StepFrame);
+        assert!(
+            core.vdp_snapshot().vint_pending,
+            "V-int raised at mask 7 must be latched (VIP flag set), not dropped"
+        );
+        assert_ne!(
+            core.cpu.pc, HANDLER_PC + 2,
+            "handler must NOT have been entered while the CPU mask is 7"
+        );
+
+        // Drop the mask so the latched VInt becomes deliverable, then step
+        // another frame.  Delivery fires within the first few scanlines: once
+        // taken, deliver_interrupt raises the mask to 6, the handler runs its
+        // NOP, and the CPU parks at HANDLER_PC + 2 for the rest of the frame.
+        // The observable end state is `PC = HANDLER_PC + 2` (the BRA.S self
+        // loop).  Note that this same frame will *also* re-latch VIP at its
+        // own V-blank; that later latch is a separate event and is not what
+        // this test observes.
+        core.cpu.sr.set_interrupt_mask(0);
+        core.execute(Command::StepFrame);
+        assert_eq!(
+            core.cpu.pc,
+            HANDLER_PC + 2,
+            "CPU should now be parked at the V-blank handler's BRA.S self-loop"
+        );
+    }
+
+    /// While the VDP holds the bus for a DMA transfer the 68000 must be
+    /// stalled — it advances scheduler cycles but does not execute any
+    /// instructions until the DMA-busy countdown drains.
+    #[test]
+    fn cpu_stalls_while_dma_holds_the_bus() {
+        let mut core = GenesisCore::new();
+        // Ordinary short ROM; the reset vector's stop word makes the CPU sit
+        // at CODE_START so it isn't wandering during the stall.
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x0000] = 0x00;
+        rom[0x0001] = 0xFF;
+        rom[0x0002] = 0x00;
+        rom[0x0003] = 0x00;
+        rom[0x0004] = 0x00;
+        rom[0x0005] = 0x00;
+        rom[0x0006] = 0x02;
+        rom[0x0007] = 0x00;
+        rom[0x0200] = 0x4E; // NOP
+        rom[0x0201] = 0x71;
+        rom[0x0202] = 0x60; // bra.s *
+        rom[0x0203] = 0xFC;
+        core.execute(Command::LoadRom(rom));
+
+        // Program a large 68K→VRAM DMA via the VDP's public control interface
+        // and execute it, so the DMA-busy cycle countdown is charged. The
+        // transfer is bigger than any single scanline could burn, so the stall
+        // remains asserted across a StepScanline call.
+        core.vdp.write_control(0x8F02); // autoinc = 2
+        core.vdp.write_control(0x9300); // DMA length low  = 0x00
+        core.vdp.write_control(0x9440); // DMA length high = 0x40  → length = 0x4000 words
+        core.vdp.write_control(0x9500); // DMA src low  = 0x00
+        core.vdp.write_control(0x9600); // DMA src mid  = 0x00
+        core.vdp.write_control(0x9700); // DMA src high = 0x00 (mode 68K→VRAM)
+        core.vdp.write_control(0x8154); // reg 1 = 0x54: DMA enable + VInt (display off)
+        // Command word pair: VRAM write + DMA at address 0xE000.
+        core.vdp.write_control(0x4000); // hi word: CD1..0 = 01 (VRAM), addr[13..0] = 0x0000
+        core.vdp.write_control(0x0083); // lo word: CD5 = 1 (DMA), addr[15..14] = 3 → 0xE000
+        // The DMA runs synchronously via the core's execute path; step a couple
+        // of instructions to trigger it (LoadRom placed a NOP/bra.s at 0x200).
+        let cpu_cycles_before_trigger = core.cpu.cycles;
+        // Manually drive the DMA (the core normally does this from step_cpu when
+        // dma_pending is observed after an instruction; here we short-circuit).
+        core.execute_vdp_dma();
+        let cycles_charged = core.vdp.dma_busy_cpu_cycles();
+        assert!(cycles_charged > 0, "run_dma must have charged the DMA-busy cycle budget");
+        let _ = cpu_cycles_before_trigger;
+
+        let pc_before = core.cpu.pc;
+        let cpu_cycles_before = core.cpu.cycles;
+        // Step one scanline's worth of frame progression.
+        core.execute(Command::StepScanline);
+        // The CPU is stalled: PC unchanged, but CPU cycles advanced.
+        assert_eq!(
+            core.cpu.pc, pc_before,
+            "68000 must not advance PC while DMA holds the bus"
+        );
+        assert!(
+            core.cpu.cycles > cpu_cycles_before,
+            "the scheduler still advances by the stall's cycle budget"
+        );
+        // DMA-busy drains as those cycles are burned.
+        assert!(
+            core.vdp.dma_busy_cpu_cycles() < cycles_charged,
+            "advance_dma_busy must decrement the countdown as the stall consumes cycles"
+        );
     }
 }
