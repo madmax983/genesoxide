@@ -3898,7 +3898,22 @@ impl Bus for CoreBus<'_> {
                 match vdp_addr {
                     0x00 | 0x02 => self.vdp.read_data(),
                     0x04 | 0x06 => self.vdp.read_status(),
-                    0x08 | 0x0A | 0x0C | 0x0E => self.vdp.read_hv_counter(),
+                    0x08 | 0x0A | 0x0C | 0x0E => {
+                        // Beam position within the current scanline, in master
+                        // ticks. `master_tick` runs on the audio/master-tick
+                        // timeline whose per-line start (`scanline_start_tick =
+                        // audio_master_tick`) is always an exact multiple of
+                        // MASTER_TICKS_PER_LINE_H40, so `master_tick % line`
+                        // yields the intra-line offset (0..line-1). HV reads
+                        // happen at 68000 instruction boundaries while the
+                        // scheduler is still below the line boundary, so the
+                        // offset is always in range — no clamp is needed here
+                        // (read_hv_counter clamps defensively regardless).
+                        // Granularity is therefore per-instruction, which is
+                        // acceptable for HV-based RNG / raster timing.
+                        let line_offset = self.master_tick % MASTER_TICKS_PER_LINE_H40;
+                        self.vdp.read_hv_counter(line_offset)
+                    }
                     _ => 0,
                 }
             }
@@ -5567,7 +5582,10 @@ mod tests {
         assert!(fresh.is_pal());
         assert_eq!(fresh.version_register_byte(), 0xE0);
         assert_eq!(fresh.frame_dimensions(), (320, 240));
-        assert_eq!(fresh.vdp.read_hv_counter() & 0xFF00, core.vdp.read_hv_counter() & 0xFF00);
+        assert_eq!(
+            fresh.vdp.read_hv_counter(0) & 0xFF00,
+            core.vdp.read_hv_counter(0) & 0xFF00
+        );
     }
 
     #[test]

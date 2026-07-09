@@ -16,11 +16,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{FRAME_RGBA_BYTES_MAX, FRAME_WIDTH};
 use crate::scheduler::Region;
+use crate::timing::MASTER_TICKS_PER_LINE_H40;
 
 /// Active display height in V28 mode (NTSC and PAL default).
 const ACTIVE_HEIGHT_V28: usize = 224;
 /// Active display height in V30 mode (PAL only, reg 0x01 bit 3 set).
 const ACTIVE_HEIGHT_V30: usize = 240;
+
+/// Number of distinct 8-bit HCounter values across one H40 (320px) line.
+///
+/// The counter runs `0x00..=0xB6` (183 values) then jumps to `0xE4..=0xFF`
+/// (28 values): 183 + 28 = 211. Source: Charles MacDonald, "Sega Genesis VDP
+/// documentation" (genvdp.txt), and the Kabuto hardware notes mirrored at
+/// <https://plutiedev.com/mirror/kabuto-hardware-notes> (both give H40 HCounter
+/// `0x00-0xB6, 0xE4-0xFF`).
+const HCOUNTER_STEPS_H40: u64 = 211;
+
+/// Number of distinct 8-bit HCounter values across one H32 (256px) line.
+///
+/// The counter runs `0x00..=0x93` (148 values) then jumps to `0xE9..=0xFF`
+/// (23 values): 148 + 23 = 171. Same sources as [`HCOUNTER_STEPS_H40`] (H32
+/// HCounter `0x00-0x93, 0xE9-0xFF`).
+const HCOUNTER_STEPS_H32: u64 = 171;
+
+/// Maps an intra-line master-tick offset to the documented 8-bit HCounter value.
+///
+/// `offset_ticks` is the beam's position within the current scanline, measured
+/// in master-clock ticks from the line's start (`0..MASTER_TICKS_PER_LINE_H40`).
+/// The returned value follows the hardware HCounter progression with its
+/// mid-line jump:
+/// - H40: `0x00..=0xB6` then `0xE4..=0xFF`
+/// - H32: `0x00..=0x93` then `0xE9..=0xFF`
+///
+/// Source: Charles MacDonald "Sega Genesis VDP documentation" (genvdp.txt) and
+/// the Kabuto hardware notes (plutiedev.com/mirror/kabuto-hardware-notes).
+///
+/// Granularity note: on this emulator the offset is sampled at 68000
+/// instruction boundaries (the CPU steps whole instructions), so the returned H
+/// value advances in per-instruction steps rather than per-dot. That is
+/// sufficient to represent the counter's monotonic rise and the mid-line jump
+/// for HV-based RNG / raster timing.
+fn hcounter_from_offset(offset_ticks: u64, h40: bool) -> u8 {
+    let (steps, visible_max, jump_start): (u64, u64, u64) = if h40 {
+        (HCOUNTER_STEPS_H40, 0xB6, 0xE4)
+    } else {
+        (HCOUNTER_STEPS_H32, 0x93, 0xE9)
+    };
+    // Clamp so an offset exactly at (or past) the line length maps to the final
+    // dot (0xFF) rather than overflowing into the next line's range.
+    let clamped = offset_ticks.min(MASTER_TICKS_PER_LINE_H40 - 1);
+    // Linear map: dot index 0..steps across the whole line.
+    let dot = (clamped * steps) / MASTER_TICKS_PER_LINE_H40; // 0..=steps-1
+    if dot <= visible_max {
+        dot as u8
+    } else {
+        // Past the jump: continue from `jump_start` up through 0xFF.
+        (dot - visible_max - 1 + jump_start) as u8
+    }
+}
 
 /// VRAM size in bytes.
 pub const VRAM_SIZE: usize = 0x10000; // 64KB
@@ -488,11 +541,30 @@ impl Vdp {
         status
     }
 
-    /// Returns the current HV counter value.
-    /// High byte = V counter (scanline number).
-    /// Low byte = H counter (horizontal position, approximated).
+    /// Returns the current HV counter value for a given intra-line beam position.
+    ///
+    /// High byte = V counter (scanline number, with the NTSC mid-frame jump).
+    /// Low byte = H counter (horizontal beam position, with the mid-line jump).
+    ///
+    /// `line_offset_ticks` is the beam's position within the current scanline,
+    /// in master-clock ticks measured from the line's start
+    /// (`0..MASTER_TICKS_PER_LINE_H40`). The caller derives it from the
+    /// scheduler/master-tick timeline at the instant of the read, giving a real
+    /// (per-instruction-granular) intra-line H value rather than a two-valued
+    /// hblank stub.
+    ///
+    /// # HV counter tables (source)
+    ///
+    /// - H40: HCounter `0x00..=0xB6` then `0xE4..=0xFF`.
+    /// - H32: HCounter `0x00..=0x93` then `0xE9..=0xFF`.
+    /// - NTSC V (262-line): VCounter `0x00..=0xEA` then `0xE5..=0xFF`.
+    /// - PAL V (313-line): VCounter `0x00..=0x102` then `0xCA..=0xFF` (the V
+    ///   counter is region-aware, from PR #12's region model).
+    ///
+    /// From Charles MacDonald "Sega Genesis VDP documentation" (genvdp.txt) and
+    /// the Kabuto hardware notes (plutiedev.com/mirror/kabuto-hardware-notes).
     #[must_use]
-    pub fn read_hv_counter(&self) -> u16 {
+    pub fn read_hv_counter(&self, line_offset_ticks: u64) -> u16 {
         // The 8-bit V counter cannot represent every line of a >256-line frame,
         // so hardware repeats a value range mid-frame. The wrap point differs by
         // region.
@@ -515,10 +587,12 @@ impl Vdp {
             }
         };
 
-        // H counter: approximate based on hblank state
-        // During H-blank (start of scanline processing), counter is near end of line
-        // During active display, it's early/mid line
-        let h: u8 = if self.in_hblank { 0xE4 } else { 0x08 };
+        // H counter: real intra-line beam position with the documented mid-line
+        // jump, chosen by the current H40/H32 mode. Use `is_h40()` — the single
+        // source of truth for horizontal resolution (reg 0x0C RS0|RS1) — so the
+        // HCounter mode selection matches the same width detection that drives
+        // per-frame width latching and rendering.
+        let h = hcounter_from_offset(line_offset_ticks, self.is_h40());
 
         (u16::from(v) << 8) | u16::from(h)
     }
@@ -776,14 +850,28 @@ impl Vdp {
         self.scanline = line;
         self.in_hblank = true;
 
-        if line == 0 {
-            // Reload counter at start of frame
+        // H-interrupt counter (reg 0x0A) behaviour, per the Genesis Software
+        // Manual / Charles MacDonald VDP notes: the counter is reloaded from
+        // reg 0x0A at the top of the frame (line 0) AND on every VBlank line.
+        // On each active display line it decrements; when it underflows past
+        // zero it reloads and, if H-interrupts are enabled (reg 0 bit 4),
+        // latches an H-interrupt.
+        //
+        // The active/blanking boundary is region-aware via `active_height()`
+        // (224 in NTSC/V28, 240 in PAL V30, from PR #12's region model), so the
+        // VBlank reload window is `line >= active_height()` — the correct region's
+        // vertical blanking. Reloading throughout VBlank (not only at line 0) is
+        // what makes the first HINT of the next frame land on the correct line:
+        // the counter always re-arms to its programmed period before active
+        // display resumes.
+        let active_height = self.active_height() as u16;
+        if line == 0 || line >= active_height {
             self.h_interrupt_counter = i16::from(self.registers[0x0A]);
-        } else if (line as usize) < self.active_height() {
-            // Active scanlines: decrement counter
+        } else {
+            // Active scanlines (1..active_height): decrement counter.
             self.h_interrupt_counter -= 1;
             if self.h_interrupt_counter < 0 {
-                // Counter expired — reload and fire interrupt if enabled
+                // Counter expired — reload and fire interrupt if enabled.
                 self.h_interrupt_counter = i16::from(self.registers[0x0A]);
                 if self.registers[0] & 0x10 != 0 {
                     self.h_interrupt_pending = true;
@@ -1434,6 +1522,9 @@ impl Default for Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // NTSC nominal active-scanline count, used by the H-interrupt VBlank-reload
+    // test. Non-test code uses the region-aware `active_height()` instead.
+    use crate::timing::ACTIVE_SCANLINES;
 
     #[test]
     fn register_write() {
@@ -2179,7 +2270,7 @@ mod tests {
     fn hv_counter_reflects_scanline() {
         let mut vdp = Vdp::new();
         vdp.begin_scanline(42);
-        let hv = vdp.read_hv_counter();
+        let hv = vdp.read_hv_counter(0);
         assert_eq!((hv >> 8) as u8, 42, "V counter should be scanline number");
     }
 
@@ -2188,8 +2279,87 @@ mod tests {
         let mut vdp = Vdp::new();
         // Scanline 0xEB (235) should wrap: 235 - 6 = 229 = 0xE5
         vdp.scanline = 0xEB;
-        let hv = vdp.read_hv_counter();
+        let hv = vdp.read_hv_counter(0);
         assert_eq!((hv >> 8) as u8, 0xE5);
+    }
+
+    #[test]
+    fn hv_counter_h_increases_across_line_h40() {
+        let mut vdp = Vdp::new();
+        // H40 mode (reg 0x0C bit 0/7 set) — 320px.
+        vdp.registers[0x0C] = 0x81;
+        vdp.begin_scanline(10);
+
+        let line = MASTER_TICKS_PER_LINE_H40;
+        let h_start = (vdp.read_hv_counter(0) & 0xFF) as u8;
+        let h_quarter = (vdp.read_hv_counter(line / 4) & 0xFF) as u8;
+        let h_mid = (vdp.read_hv_counter(line / 2) & 0xFF) as u8;
+        let h_end = (vdp.read_hv_counter(line - 1) & 0xFF) as u8;
+
+        // Start of line is the low end of the counter.
+        assert_eq!(h_start, 0x00, "H counter starts at 0x00");
+        // H rises monotonically through the visible portion.
+        assert!(
+            h_start < h_quarter && h_quarter < h_mid,
+            "H counter should increase across the line: {h_start:#x} < {h_quarter:#x} < {h_mid:#x}"
+        );
+        // By end of line the beam is past the mid-line jump, in the 0xE4..=0xFF
+        // range (H40), and strictly higher than the pre-jump visible maximum.
+        assert!(
+            h_end >= 0xE4,
+            "H counter at end of H40 line should be in the post-jump 0xE4..=0xFF range, got {h_end:#x}"
+        );
+        // The documented visible maximum for H40 is 0xB6; the post-jump value
+        // exceeds it, and the just-before-jump region should reach up near 0xB6.
+        assert!(h_end > 0xB6, "post-jump H exceeds visible max 0xB6");
+    }
+
+    #[test]
+    fn hv_counter_h_jump_h32() {
+        let mut vdp = Vdp::new();
+        // H32 mode (reg 0x0C bits clear) — 256px.
+        vdp.registers[0x0C] = 0x00;
+        vdp.begin_scanline(10);
+        let h_end = (vdp.read_hv_counter(MASTER_TICKS_PER_LINE_H40 - 1) & 0xFF) as u8;
+        // H32 post-jump range is 0xE9..=0xFF.
+        assert!(
+            h_end >= 0xE9,
+            "H counter at end of H32 line should be in 0xE9..=0xFF, got {h_end:#x}"
+        );
+    }
+
+    #[test]
+    fn h_interrupt_counter_reloads_during_vblank() {
+        let mut vdp = Vdp::new();
+        vdp.registers[0x0A] = 0x05; // HINT period
+        vdp.registers[0] = 0x10; // enable H-interrupt
+
+        // Run through several active lines so the counter is mid-count (not at
+        // its reload value).
+        vdp.begin_scanline(0); // reload -> 5
+        vdp.begin_scanline(1); // -> 4
+        vdp.begin_scanline(2); // -> 3
+        assert_eq!(
+            vdp.h_interrupt_counter, 3,
+            "counter should be decremented mid-frame"
+        );
+
+        // Enter VBlank (line >= ACTIVE_SCANLINES): the counter must reload from
+        // reg 0x0A even though we never hit line 0.
+        vdp.begin_scanline(ACTIVE_SCANLINES);
+        assert_eq!(
+            vdp.h_interrupt_counter,
+            i16::from(vdp.registers[0x0A]),
+            "H-interrupt counter should reload from reg 0x0A during VBlank"
+        );
+
+        // A change to reg 0x0A during VBlank takes effect on the next VBlank line.
+        vdp.registers[0x0A] = 0x07;
+        vdp.begin_scanline(ACTIVE_SCANLINES + 10);
+        assert_eq!(
+            vdp.h_interrupt_counter, 0x07,
+            "reload during VBlank tracks the current reg 0x0A value"
+        );
     }
 
     // ---- Status register completeness tests ----
