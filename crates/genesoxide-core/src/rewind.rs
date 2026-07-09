@@ -28,7 +28,9 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::GenesisCoreSnapshot;
+use crate::api::{GenesisCoreSnapshot, Mapper};
+use crate::rom::SramLayout;
+use crate::scheduler::Region;
 use crate::vdp::{AccessType, ControlState, VdpSnapshot};
 
 /// NTSC frames per second, used to convert history seconds to a frame budget.
@@ -127,6 +129,9 @@ pub struct VdpMeta {
     pub h_interrupt_pending: bool,
     pub control_code: u8,
     pub odd_frame: bool,
+    pub vint_pending: bool,
+    pub dma_busy_cpu_cycles: u32,
+    pub region: Region,
 }
 
 impl VdpMeta {
@@ -149,6 +154,9 @@ impl VdpMeta {
             h_interrupt_pending: v.h_interrupt_pending,
             control_code: v.control_code,
             odd_frame: v.odd_frame,
+            vint_pending: v.vint_pending,
+            dma_busy_cpu_cycles: v.dma_busy_cpu_cycles,
+            region: v.region,
         }
     }
 
@@ -170,6 +178,9 @@ impl VdpMeta {
         v.h_interrupt_pending = self.h_interrupt_pending;
         v.control_code = self.control_code;
         v.odd_frame = self.odd_frame;
+        v.vint_pending = self.vint_pending;
+        v.dma_busy_cpu_cycles = self.dma_busy_cpu_cycles;
+        v.region = self.region;
     }
 
     fn estimated_bytes(&self) -> usize {
@@ -190,6 +201,18 @@ pub struct ScalarState {
     pub frame_count: u64,
     pub speed_permille: u16,
     pub paused: bool,
+    pub region: Region,
+    pub overseas: bool,
+    pub region_override: Option<Region>,
+    // Cartridge SRAM scalar flags (the `data` buffer is byte-diffed separately).
+    pub sram_enabled: bool,
+    pub sram_has_battery: bool,
+    pub sram_header_declared: bool,
+    pub sram_touched: bool,
+    pub sram_dirty: bool,
+    pub sram_start: u32,
+    pub sram_end: u32,
+    pub sram_layout: SramLayout,
 }
 
 impl ScalarState {
@@ -203,6 +226,17 @@ impl ScalarState {
             frame_count: s.frame_count,
             speed_permille: s.speed_permille,
             paused: s.paused,
+            region: s.region,
+            overseas: s.overseas,
+            region_override: s.region_override,
+            sram_enabled: s.sram.enabled,
+            sram_has_battery: s.sram.has_battery,
+            sram_header_declared: s.sram.header_declared,
+            sram_touched: s.sram.touched,
+            sram_dirty: s.sram.dirty,
+            sram_start: s.sram.start,
+            sram_end: s.sram.end,
+            sram_layout: s.sram.layout,
         }
     }
 
@@ -215,6 +249,17 @@ impl ScalarState {
         s.frame_count = self.frame_count;
         s.speed_permille = self.speed_permille;
         s.paused = self.paused;
+        s.region = self.region;
+        s.overseas = self.overseas;
+        s.region_override = self.region_override;
+        s.sram.enabled = self.sram_enabled;
+        s.sram.has_battery = self.sram_has_battery;
+        s.sram.header_declared = self.sram_header_declared;
+        s.sram.touched = self.sram_touched;
+        s.sram.dirty = self.sram_dirty;
+        s.sram.start = self.sram_start;
+        s.sram.end = self.sram_end;
+        s.sram.layout = self.sram_layout;
     }
 }
 
@@ -233,12 +278,14 @@ pub struct FieldDelta {
     pub port2: Option<crate::io::ControllerPort>,
     pub vdp_meta: Option<VdpMeta>,
     pub scalars: Option<ScalarState>,
+    pub mapper: Option<Mapper>,
 }
 
 impl FieldDelta {
     fn compute(before: &GenesisCoreSnapshot, after: &GenesisCoreSnapshot) -> Self {
         Self {
             cpu: (before.cpu != after.cpu).then(|| after.cpu.clone()),
+            mapper: (before.mapper != after.mapper).then(|| after.mapper.clone()),
             scheduler: (before.scheduler != after.scheduler).then(|| after.scheduler.clone()),
             z80: (before.z80 != after.z80).then(|| after.z80.clone()),
             psg: (before.psg != after.psg).then(|| after.psg.clone()),
@@ -261,6 +308,9 @@ impl FieldDelta {
     fn apply(&self, target: &mut GenesisCoreSnapshot) {
         if let Some(v) = &self.cpu {
             target.cpu = v.clone();
+        }
+        if let Some(v) = &self.mapper {
+            target.mapper = v.clone();
         }
         if let Some(v) = &self.scheduler {
             target.scheduler = v.clone();
@@ -292,6 +342,9 @@ impl FieldDelta {
         let mut n = 0;
         if self.cpu.is_some() {
             n += 64;
+        }
+        if self.mapper.is_some() {
+            n += 16;
         }
         if self.scheduler.is_some() {
             n += 24;
@@ -341,6 +394,14 @@ pub struct FrameDelta {
     pub work_ram_deltas: Vec<ArrayDelta>,
     pub vram_deltas: Vec<ArrayDelta>,
     pub z80_ram_deltas: Vec<ArrayDelta>,
+    /// Byte diff of the cartridge SRAM backing buffer (`sram.data`). Empty when
+    /// SRAM is absent/unchanged; a full run is emitted when the buffer length
+    /// changes (e.g. a different ROM's SRAM window) so the target is resized.
+    pub sram_deltas: Vec<ArrayDelta>,
+    /// Target length of `sram.data` after this frame. Lets `apply` resize the
+    /// buffer before writing the byte runs so a length change (or an
+    /// initially-empty SRAM) reconstructs exactly rather than being clamped.
+    pub sram_len: u32,
     pub fields: FieldDelta,
     pub input: FrameInput,
     /// Sum of changed-byte-run lengths across all buffers; drives the keyframe
@@ -359,18 +420,22 @@ impl FrameDelta {
         let work_ram_deltas = diff_array(&before.work_ram, &after.work_ram);
         let vram_deltas = diff_array(&before.vdp.vram, &after.vdp.vram);
         let z80_ram_deltas = diff_array(&before.z80_ram, &after.z80_ram);
+        let sram_deltas = diff_array(&before.sram.data, &after.sram.data);
         let fields = FieldDelta::compute(before, after);
 
         let run_bytes = |ds: &[ArrayDelta]| ds.iter().map(|d| d.data.len()).sum::<usize>();
         let compressed_size = (run_bytes(&work_ram_deltas)
             + run_bytes(&vram_deltas)
-            + run_bytes(&z80_ram_deltas)) as u32;
+            + run_bytes(&z80_ram_deltas)
+            + run_bytes(&sram_deltas)) as u32;
 
         Self {
             frame_id: after.frame_count,
             work_ram_deltas,
             vram_deltas,
             z80_ram_deltas,
+            sram_deltas,
+            sram_len: after.sram.data.len() as u32,
             fields,
             input,
             compressed_size,
@@ -382,6 +447,11 @@ impl FrameDelta {
         apply_deltas(&mut target.work_ram, &self.work_ram_deltas);
         apply_deltas(&mut target.vdp.vram, &self.vram_deltas);
         apply_deltas(&mut target.z80_ram, &self.z80_ram_deltas);
+        // Resize the SRAM buffer to this frame's length before applying the
+        // byte runs so growth/shrink (and an initially-empty buffer) reconstruct
+        // exactly instead of being clamped by `apply_deltas`' bounds check.
+        target.sram.data.resize(self.sram_len as usize, 0);
+        apply_deltas(&mut target.sram.data, &self.sram_deltas);
         self.fields.apply(target);
     }
 
@@ -874,6 +944,68 @@ mod tests {
         let mut target = before.clone();
         delta.apply(&mut target);
         assert!(target == *after, "FrameDelta apply did not reproduce state");
+    }
+
+    /// Regression guard for PRs #7–#13: the hand-written delta encoder must
+    /// carry the newly-added persistent state (SRAM, SSF2 mapper banks,
+    /// VInt-pending, DMA-busy cycles, region/overseas/region_override). Before
+    /// the fix these fields had no representation in the delta path, so a delta
+    /// frame reconstructed them at stale keyframe values.
+    #[test]
+    fn delta_carries_new_persistent_state() {
+        // Start from a real, internally-consistent snapshot.
+        let seq = snapshot_sequence(1);
+        let keyframe = seq[0].1.clone();
+
+        // Build a target frame in which every one of the new fields differs
+        // from the keyframe.
+        let mut target = keyframe.clone();
+        target.vdp.vint_pending = true;
+        target.vdp.dma_busy_cpu_cycles = 12_345;
+        target.vdp.region = Region::Pal;
+        target.region = Region::Pal;
+        target.overseas = false;
+        target.region_override = Some(Region::Pal);
+        target.mapper = Mapper::Ssf2 {
+            banks: [7, 6, 5, 4, 3, 2, 1, 0],
+        };
+        // SRAM: flip the scalar flags and mutate a backing byte.
+        assert!(
+            !target.sram.data.is_empty(),
+            "test setup expects a non-empty SRAM buffer",
+        );
+        target.sram.enabled = true;
+        target.sram.touched = true;
+        target.sram.dirty = true;
+        let sram_idx = target.sram.data.len() / 2;
+        target.sram.data[sram_idx] ^= 0xAB;
+
+        // Sanity: the keyframe really does differ (otherwise the test is vacuous).
+        assert_ne!(keyframe.vdp.vint_pending, target.vdp.vint_pending);
+        assert_ne!(keyframe.mapper, target.mapper);
+        assert_ne!(keyframe.sram.data, target.sram.data);
+
+        // Compute the delta and replay it exactly as `reconstruct` does.
+        let delta = FrameDelta::compute(&keyframe, &target, FrameInput::default());
+        let mut recon = keyframe.clone();
+        delta.apply(&mut recon);
+
+        // Every new field must reconstruct to the target value, not the stale
+        // keyframe value.
+        assert_eq!(recon.vdp.vint_pending, target.vdp.vint_pending);
+        assert_eq!(recon.vdp.dma_busy_cpu_cycles, target.vdp.dma_busy_cpu_cycles);
+        assert_eq!(recon.vdp.region, target.vdp.region);
+        assert_eq!(recon.region, target.region);
+        assert_eq!(recon.overseas, target.overseas);
+        assert_eq!(recon.region_override, target.region_override);
+        assert_eq!(recon.mapper, target.mapper);
+        assert_eq!(recon.sram.enabled, target.sram.enabled);
+        assert_eq!(recon.sram.touched, target.sram.touched);
+        assert_eq!(recon.sram.dirty, target.sram.dirty);
+        assert_eq!(recon.sram.data, target.sram.data);
+
+        // And the whole snapshot round-trips, proving nothing else drifted.
+        assert!(recon == target, "full snapshot mismatch after delta replay");
     }
 
     #[test]
