@@ -757,3 +757,372 @@ fn hint_raster_bands() {
 
     check_golden("hint_raster_bands", &fb);
 }
+
+// ---------------------------------------------------------------------------
+// Scenes 8-10: TRUE MID-LINE raster splits (within a single scanline)
+// ---------------------------------------------------------------------------
+//
+// Unlike `hint_raster_bands` (strictly per-scanline bands driven from a HINT
+// handler), these scenes drive a color/scroll change from MAINLINE 68000 code
+// running at interrupt mask 0 (< 4). A VDP write issued mid-active-line by the
+// mainline is recorded by the VDP at the beam dot where it landed, so the line
+// is rendered in spans and a single scanline shows two-or-more states. This is
+// the capability that per-line HINT delivery cannot express.
+//
+// Why mainline and not a HINT handler: mid-line register/CRAM/VSRAM writes are
+// recorded ONLY when the 68000 interrupt mask is < 4. Writes at mask >= 4
+// (inside a level-4 HINT / level-6 VINT handler) are treated as whole-line by
+// design, so that `hint_raster_bands` stays byte-identical. On reset the 68000
+// mask is 0, and these ROMs enable no interrupts, so their mainline write loops
+// run at mask 0 throughout — every write carries a real beam dot.
+//
+// Each ROM ends in an INFINITE write loop (not a `bra.s *` spin): the loop runs
+// across every scanline of every frame, so the captured frame (FRAMES-1) shows
+// the split on its active lines. The loop is cycle-counted only implicitly (by
+// instruction timing); the exact split dots depend on that timing, so the
+// assertions never hard-code a split x — they scan an active line for an
+// INTERIOR color transition (a boundary strictly inside the display, not at
+// x=0 or x=width-1) and require the line to carry >= 2 distinct colors. The
+// blessed golden then locks the exact pixels.
+
+/// Appends `body` as an infinite loop: the body words are emitted verbatim and
+/// followed by a `bra.s` back to the first body word. `body` must not itself
+/// transfer control out of the loop. The branch displacement is measured from
+/// the PC after the branch word (`addr + 2`) back to the loop top, i.e.
+/// `-2 * (body.len() + 1)`, and must fit a signed byte (body < 63 words).
+fn emit_loop(b: &mut RomBuilder, body: &[u16]) {
+    b.emit(body);
+    let total_words = body.len() + 1; // include the bra.s word itself
+    let disp = -(2 * total_words as isize);
+    let d8 = i8::try_from(disp).expect("mid-line loop body too long for bra.s");
+    b.emit(&[0x6000 | u16::from(d8 as u8)]);
+}
+
+/// Scans row `y` (native `width`) for color transitions whose boundary lies
+/// strictly inside the display — a transition between pixel `x-1` and `x` with
+/// `2 <= x <= width-2`, so neither adjacent pixel is the extreme left/right
+/// edge. Returns the interior boundary x positions. A non-empty result proves a
+/// WITHIN-line split (the effect changed part-way across the scanline), which a
+/// strictly per-line effect can never produce on an otherwise-uniform line.
+fn interior_transitions(fb: &[u8], y: usize, width: usize) -> Vec<usize> {
+    let mut xs = Vec::new();
+    for x in 2..width - 1 {
+        if pixel_w(fb, x, y, width) != pixel_w(fb, x - 1, y, width) {
+            xs.push(x);
+        }
+    }
+    xs
+}
+
+/// Counts the distinct RGBA colors present on row `y`.
+fn distinct_colors_on_row(fb: &[u8], y: usize, width: usize) -> usize {
+    let mut seen: Vec<[u8; 4]> = Vec::new();
+    for x in 0..width {
+        let p = pixel_w(fb, x, y, width);
+        if !seen.contains(&p) {
+            seen.push(p);
+        }
+    }
+    seen.len()
+}
+
+/// Asserts that active line `y` carries a genuine within-line split: at least
+/// one interior color transition and at least two distinct colors.
+fn assert_midline_split(fb: &[u8], y: usize, width: usize, scene: &str) {
+    let transitions = interior_transitions(fb, y, width);
+    assert!(
+        !transitions.is_empty(),
+        "{scene}: no interior color transition on line y={y} — the split did not \
+         land mid-line (a per-line effect would leave the line uniform). \
+         distinct colors = {}",
+        distinct_colors_on_row(fb, y, width)
+    );
+    let distinct = distinct_colors_on_row(fb, y, width);
+    assert!(
+        distinct >= 2,
+        "{scene}: line y={y} has only {distinct} color(s); a mid-line split must \
+         show >= 2"
+    );
+    // The interior transition definitionally means the pixel left of the split
+    // differs from the pixel right of it — the essence of "mid-line".
+    let x = transitions[0];
+    assert_ne!(
+        pixel_w(fb, x - 1, y, width),
+        pixel_w(fb, x, y, width),
+        "{scene}: interior boundary at x={x} must separate two colors"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scene 8: mid-line BACKDROP split (reg 0x07 rewritten as the beam sweeps)
+// ---------------------------------------------------------------------------
+
+/// Distinct backdrop colors preloaded into CRAM 0..7. The mainline loop cycles
+/// reg 0x07 through indices 0..7 as the beam advances, so a single scanline
+/// shows a horizontal sweep through these colors (a "barber pole" that shears
+/// diagonally frame-wide because the color counter carries across lines).
+const BACKDROP_COLORS: [u16; 8] = [
+    0x000E, // red
+    0x00E0, // green
+    0x0E00, // blue
+    0x00EE, // yellow
+    0x0E0E, // magenta
+    0x0EE0, // cyan
+    0x0EEE, // white
+    0x0080, // dim green
+];
+
+fn build_midline_backdrop_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // H40, backdrop starts at index 0. Display on, no interrupts.
+    base_registers(&mut b, 0x81, 0x00);
+
+    // Preload the backdrop palette (CRAM 0..7). No tiles/sprites are written, so
+    // every plane pixel is transparent and the backdrop fills the whole screen —
+    // reg 0x07 is exactly what is visible.
+    for (i, &color) in BACKDROP_COLORS.iter().enumerate() {
+        b.set_cram_color(i as u16, color);
+    }
+
+    // Seed d0 with the reg-0x07 write command for backdrop index 0 (0x8700).
+    b.emit(&[0x303C, 0x8700]); // move.w #0x8700, d0
+
+    // Infinite mainline loop (mask 0): write reg 0x07 = (d0 & 7), then advance
+    // the index, wrapping 0..7. Each iteration lands at a later beam dot, so the
+    // backdrop color changes several times within every active scanline. a0 is
+    // still the VDP control port from the prologue.
+    //
+    //   move.w d0, (a0)        ; reg 0x07 = current backdrop index
+    //   addq.w #1, d0          ; next index
+    //   andi.w #0x8707, d0     ; keep it a 0x8700..0x8707 reg-write command
+    //   bra.s  loop
+    emit_loop(
+        &mut b,
+        &[
+            0x3080, // move.w d0, (a0)
+            0x5240, // addq.w #1, d0
+            0x0240, 0x8707, // andi.w #0x8707, d0
+        ],
+    );
+
+    b.finish()
+}
+
+#[test]
+fn midline_backdrop_split() {
+    let rom = build_midline_backdrop_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    // The frame is H40 -> 320 wide.
+    assert_eq!(fb.len(), FRAME_W * FRAME_H * 4, "H40 backdrop scene is 320x224");
+
+    // Prove a genuine within-line backdrop split on several active lines: each
+    // must show an interior transition and multiple backdrop colors. (A per-line
+    // effect could only ever paint each line one solid backdrop color.)
+    for &y in &[40usize, 100, 160] {
+        assert_midline_split(&fb, y, FRAME_W, "midline_backdrop_split");
+    }
+    // Every color on the line must be one of the preloaded backdrop entries
+    // (nothing else is drawn), confirming reg 0x07 is what split.
+    let allowed: Vec<[u8; 4]> = BACKDROP_COLORS.iter().map(|&c| normal_rgba(c)).collect();
+    for x in 0..FRAME_W {
+        let p = pixel(&fb, x, 100);
+        assert!(
+            allowed.contains(&p),
+            "x={x},y=100 backdrop color {p:?} is not a preloaded entry"
+        );
+    }
+
+    check_golden("midline_backdrop_split", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 9: mid-line CRAM palette swap (a plane tile changes color mid-scanline)
+// ---------------------------------------------------------------------------
+
+/// Two colors the CRAM entry is toggled between: red and blue.
+const CRAM_SWAP_A: u16 = 0x000E; // red
+const CRAM_SWAP_B: u16 = 0x0E00; // blue
+
+fn build_midline_cram_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // H40, backdrop black. Display on, no interrupts.
+    base_registers(&mut b, 0x81, 0x00);
+
+    // CRAM index 1 starts red; the loop rewrites it live. Tile 1 is solid color
+    // index 1, and Scroll A is filled with tile 1 everywhere, so the whole plane
+    // shows CRAM[1] — whatever the beam sees it as at each dot.
+    b.set_cram_color(1, CRAM_SWAP_A);
+    b.write_solid_tile(1, 1);
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    // Seed d0 = red; the loop writes it to CRAM[1] then toggles red<->blue.
+    b.emit(&[0x303C, CRAM_SWAP_A]); // move.w #CRAM_SWAP_A, d0
+
+    // Infinite mainline loop (mask 0). Each iteration reprograms the CRAM write
+    // address to entry 1 (byte 2), writes the current color via the data port,
+    // then toggles the color. Because the color changes as the beam advances,
+    // the solid plane tile shows red on the left of each write dot and blue on
+    // the right (and back), i.e. a within-line palette swap. a0 = control port,
+    // a1 = data port (from the prologue).
+    //
+    //   move.w #0xC002, (a0)   ; CRAM write addr, high command word (index 1)
+    //   move.w #0x0000, (a0)   ; ... low command word
+    //   move.w d0, (a1)        ; CRAM[1] = current color
+    //   eori.w #0x0E0E, d0     ; toggle red (0x000E) <-> blue (0x0E00)
+    //   bra.s  loop
+    emit_loop(
+        &mut b,
+        &[
+            0x30BC, 0xC002, // move.w #0xC002, (a0)
+            0x30BC, 0x0000, // move.w #0x0000, (a0)
+            0x3280, // move.w d0, (a1)
+            0x0A40, 0x0E0E, // eori.w #0x0E0E, d0
+        ],
+    );
+
+    b.finish()
+}
+
+#[test]
+fn midline_cram_swap() {
+    let rom = build_midline_cram_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    let red = normal_rgba(CRAM_SWAP_A); // [255,0,0,255]
+    let blue = normal_rgba(CRAM_SWAP_B); // [0,0,255,255]
+    assert_eq!(red, [255, 0, 0, 255]);
+    assert_eq!(blue, [0, 0, 255, 255]);
+
+    // The plane tile row must show BOTH colors split at interior x on active
+    // lines: a mid-line CRAM rewrite changed the palette entry the solid tile
+    // resolves through, part-way across the scanline.
+    for &y in &[40usize, 100, 160] {
+        assert_midline_split(&fb, y, FRAME_W, "midline_cram_swap");
+    }
+    // Only the two toggled colors appear (the plane is a single solid tile).
+    for x in 0..FRAME_W {
+        let p = pixel(&fb, x, 100);
+        assert!(
+            p == red || p == blue,
+            "x={x},y=100 color {p:?} must be red or blue (the toggled CRAM entry)"
+        );
+    }
+    // Both colors are actually present on the line.
+    assert!(
+        (0..FRAME_W).any(|x| pixel(&fb, x, 100) == red),
+        "line y=100 must contain red"
+    );
+    assert!(
+        (0..FRAME_W).any(|x| pixel(&fb, x, 100) == blue),
+        "line y=100 must contain blue"
+    );
+
+    check_golden("midline_cram_swap", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 10: mid-line VERTICAL-SCROLL split (VSRAM rewritten mid-scanline)
+// ---------------------------------------------------------------------------
+//
+// MECHANISM CHOICE: this is a scroll split driven by a mid-line VSRAM write
+// (recorded as `LineChange::Vsram`), not an HSCROLL-table write. Stage 1 does
+// record a VRAM write that lands on the current line's HSCROLL slot, but an
+// HSCROLL split on a horizontally-striped plane produces stripe transitions
+// everywhere, which cannot be distinguished from the split itself. A VERTICAL
+// scroll change instead re-selects the horizontal band the beam samples: on a
+// plane of 8px horizontal color bands, each span between VSRAM writes is a
+// single uniform color, so the split shows as ONE clean interior transition
+// with uniform regions on either side — an unambiguous, programmatically
+// verifiable within-line scroll split. VSRAM writes are recorded cleanly for
+// any full-screen-scroll ROM, so this needs no HSCROLL-slot address matching.
+
+/// Colors for the two alternating horizontal bands of the scroll plane.
+const VSCROLL_BAND_A: u16 = 0x000E; // red  (even tile rows)
+const VSCROLL_BAND_B: u16 = 0x0E00; // blue (odd tile rows)
+
+fn build_midline_vscroll_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // H40, backdrop black. reg 0x0B = 0x00 -> full-screen vertical scroll (a
+    // single VSRAM[0] value drives all of Scroll A). Display on, no interrupts.
+    base_registers(&mut b, 0x81, 0x00);
+
+    b.set_cram_color(1, VSCROLL_BAND_A); // red
+    b.set_cram_color(2, VSCROLL_BAND_B); // blue
+    b.write_solid_tile(1, 1); // red tile
+    b.write_solid_tile(2, 2); // blue tile
+
+    // Scroll A nametable: 8px horizontal bands — even tile rows red (tile 1),
+    // odd tile rows blue (tile 2). A vertical-scroll change of one tile (8px)
+    // flips the band a given screen line samples.
+    let mut entries = Vec::with_capacity(32 * 32);
+    for row in 0..32u16 {
+        let tile = if row % 2 == 0 { 0x0001u16 } else { 0x0002u16 };
+        for _ in 0..32 {
+            entries.push(tile);
+        }
+    }
+    b.write_vram(SCROLL_A_NT, &entries);
+
+    // Seed d0 = 0 (vertical scroll of 0 lines).
+    b.emit(&[0x303C, 0x0000]); // move.w #0, d0
+
+    // Infinite mainline loop (mask 0). Each iteration reprograms the VSRAM write
+    // address to entry 0, writes the current vertical scroll, then toggles it by
+    // 8 lines (one band). Columns the beam has not yet rendered pick up the new
+    // scroll, so the sampled band — and thus the color — flips part-way across
+    // the scanline. a0 = control port, a1 = data port.
+    //
+    //   move.w #0x4000, (a0)   ; VSRAM write addr, high command word (index 0)
+    //   move.w #0x0010, (a0)   ; ... low command word
+    //   move.w d0, (a1)        ; VSRAM[0] = current vertical scroll
+    //   eori.w #0x0008, d0     ; toggle scroll 0 <-> 8 (one 8px band)
+    //   bra.s  loop
+    emit_loop(
+        &mut b,
+        &[
+            0x30BC, 0x4000, // move.w #0x4000, (a0)
+            0x30BC, 0x0010, // move.w #0x0010, (a0)
+            0x3280, // move.w d0, (a1)
+            0x0A40, 0x0008, // eori.w #0x0008, d0
+        ],
+    );
+
+    b.finish()
+}
+
+#[test]
+fn midline_vscroll_split() {
+    let rom = build_midline_vscroll_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    let red = normal_rgba(VSCROLL_BAND_A); // [255,0,0,255]
+    let blue = normal_rgba(VSCROLL_BAND_B); // [0,0,255,255]
+    assert_eq!(red, [255, 0, 0, 255]);
+    assert_eq!(blue, [0, 0, 255, 255]);
+
+    // A mid-line vertical-scroll change re-selects the horizontal band sampled,
+    // so the scanline splits into uniform red/blue regions at interior x.
+    for &y in &[40usize, 100, 160] {
+        assert_midline_split(&fb, y, FRAME_W, "midline_vscroll_split");
+    }
+    // Only the two band colors appear, and both are present on the line.
+    for x in 0..FRAME_W {
+        let p = pixel(&fb, x, 100);
+        assert!(
+            p == red || p == blue,
+            "x={x},y=100 color {p:?} must be a band color (red or blue)"
+        );
+    }
+    assert!(
+        (0..FRAME_W).any(|x| pixel(&fb, x, 100) == red),
+        "line y=100 must contain the red band"
+    );
+    assert!(
+        (0..FRAME_W).any(|x| pixel(&fb, x, 100) == blue),
+        "line y=100 must contain the blue band"
+    );
+
+    check_golden("midline_vscroll_split", &fb);
+}
