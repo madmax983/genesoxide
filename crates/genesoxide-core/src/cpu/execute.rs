@@ -3567,4 +3567,167 @@ mod tests {
         assert!(!cpu.sr.flag(StatusRegister::Z));
         assert!(cpu.sr.flag(StatusRegister::N));
     }
+
+    // ── Cycle-timing (MC68000UM) ─────────────────────────────────────
+    //
+    // Each assertion is annotated with the published rule it verifies.
+    // Only values taken directly from the MC68000UM tables are asserted.
+
+    /// EA calculation-time table spot checks (MC68000UM Table 8-1/8-2:
+    /// byte/word column, then long column).
+    #[test]
+    fn ea_calc_table_spot_checks() {
+        use AddressingMode::*;
+        // Register direct costs nothing at either size.
+        assert_eq!(ea_calc_cycles(DataDirect(0), InstructionSize::Word), 0);
+        assert_eq!(ea_calc_cycles(AddrDirect(0), InstructionSize::Long), 0);
+        // (An)/(An)+: 4 (byte/word), 8 (long).
+        assert_eq!(ea_calc_cycles(AddrIndirect(0), InstructionSize::Word), 4);
+        assert_eq!(ea_calc_cycles(AddrIndirect(0), InstructionSize::Long), 8);
+        assert_eq!(ea_calc_cycles(AddrPostInc(0), InstructionSize::Byte), 4);
+        // -(An): 6 / 10.
+        assert_eq!(ea_calc_cycles(AddrPreDec(0), InstructionSize::Word), 6);
+        assert_eq!(ea_calc_cycles(AddrPreDec(0), InstructionSize::Long), 10);
+        // (d16,An): 8 / 12.
+        assert_eq!(ea_calc_cycles(AddrDisp(0), InstructionSize::Word), 8);
+        assert_eq!(ea_calc_cycles(AddrDisp(0), InstructionSize::Long), 12);
+        // (d8,An,Xn): 10 / 14.
+        assert_eq!(ea_calc_cycles(AddrIndex(0), InstructionSize::Word), 10);
+        assert_eq!(ea_calc_cycles(AddrIndex(0), InstructionSize::Long), 14);
+        // (xxx).W: 8 / 12.
+        assert_eq!(ea_calc_cycles(AbsShort, InstructionSize::Word), 8);
+        assert_eq!(ea_calc_cycles(AbsShort, InstructionSize::Long), 12);
+        // (xxx).L: 12 / 16.
+        assert_eq!(ea_calc_cycles(AbsLong, InstructionSize::Word), 12);
+        assert_eq!(ea_calc_cycles(AbsLong, InstructionSize::Long), 16);
+        // #imm: 4 / 8.
+        assert_eq!(ea_calc_cycles(Immediate, InstructionSize::Word), 4);
+        assert_eq!(ea_calc_cycles(Immediate, InstructionSize::Long), 8);
+    }
+
+    /// MOVE total = 4 + src EA + dst EA. VERIFIED MC68000UM MOVE table.
+    #[test]
+    fn move_word_reg_to_reg_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // MOVE.W D0,D1 = 0x3200 → 4 + 0 + 0 = 4.
+        assert_eq!(execute_instruction(&mut cpu, 0x3200, &mut bus), 4);
+    }
+
+    #[test]
+    fn move_long_imm_to_dn_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        bus.poke_long(0x1000, 0xDEAD_BEEF);
+        // MOVE.L #imm,D0 = 0x203C → 4 + ea(imm,L)=8 + 0 = 12.
+        assert_eq!(execute_instruction(&mut cpu, 0x203C, &mut bus), 12);
+    }
+
+    #[test]
+    fn move_long_indirect_to_indirect_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        cpu.write_a(1, 0x3000);
+        // MOVE.L (A0),(A1) = 0x2290 → 4 + 8 + 8 = 20.
+        assert_eq!(execute_instruction(&mut cpu, 0x2290, &mut bus), 20);
+    }
+
+    #[test]
+    fn move_word_abslong_to_abslong_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        bus.poke_long(0x1000, 0x2000); // source absolute address
+        bus.poke_long(0x1004, 0x3000); // destination absolute address
+        // MOVE.W (xxx).L,(xxx).L = 0x33F9 → 4 + 12 + 12 = 28.
+        assert_eq!(execute_instruction(&mut cpu, 0x33F9, &mut bus), 28);
+    }
+
+    /// CLR.L (An) = 12 + ea(An,L)=8 = 20. VERIFIED MC68000UM.
+    #[test]
+    fn clr_long_indirect_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // CLR.L (A0) = 0x4290.
+        assert_eq!(execute_instruction(&mut cpu, 0x4290, &mut bus), 20);
+    }
+
+    /// Standard ALU <ea>,Dn: long reg source = 8, long memory source = 6+ea.
+    #[test]
+    fn add_long_dn_to_dn_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // ADD.L D0,D1 = 0xD280 → 6 + 2 (reg src) + 0 = 8.
+        assert_eq!(execute_instruction(&mut cpu, 0xD280, &mut bus), 8);
+    }
+
+    #[test]
+    fn add_long_indirect_to_dn_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // ADD.L (A0),D1 = 0xD290 → 6 + ea(An,L)=8 = 14 (no +2, memory source).
+        assert_eq!(execute_instruction(&mut cpu, 0xD290, &mut bus), 14);
+    }
+
+    /// MOVEM.L reglist,-(An) = 8 + 8n. VERIFIED.
+    #[test]
+    fn movem_long_store_predec_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x3000);
+        // MOVEM.L D0/D1,-(A0) = 0x48E0, mask 0xC000 (D0,D1 in predec order).
+        bus.poke_word(0x1000, 0xC000);
+        // n = 2 → 8 + 8*2 = 24.
+        assert_eq!(execute_instruction(&mut cpu, 0x48E0, &mut bus), 24);
+    }
+
+    /// MOVEM.L (An)+,reglist = 12 + 8n. VERIFIED.
+    #[test]
+    fn movem_long_load_postinc_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // MOVEM.L (A0)+,D0/D1 = 0x4CD8, mask 0x0003 (D0,D1).
+        bus.poke_word(0x1000, 0x0003);
+        // n = 2 → 12 + 8*2 = 28.
+        assert_eq!(execute_instruction(&mut cpu, 0x4CD8, &mut bus), 28);
+    }
+
+    /// Register shift/rotate: byte/word = 6 + 2n, long = 8 + 2n.
+    #[test]
+    fn shift_word_register_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // ASL.W #1,D0 = 0xE340 → count 1, word → 6 + 2 = 8.
+        assert_eq!(execute_instruction(&mut cpu, 0xE340, &mut bus), 8);
+    }
+
+    #[test]
+    fn shift_long_register_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // LSL.L #1,D0 = 0xE388 → count 1, long → 8 + 2 = 10.
+        assert_eq!(execute_instruction(&mut cpu, 0xE388, &mut bus), 10);
+    }
+
+    /// Bcc not taken: byte displacement = 8, word displacement = 12.
+    #[test]
+    fn bcc_not_taken_word_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.sr.set_flag(StatusRegister::Z, true); // make BNE fail
+        bus.poke_word(0x1000, 0x0010); // 16-bit displacement word
+        // BNE.W (disp8 == 0 selects word) = 0x6600 → not taken, word = 12.
+        assert_eq!(execute_instruction(&mut cpu, 0x6600, &mut bus), 12);
+    }
+
+    /// NOP = 4.
+    #[test]
+    fn nop_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        assert_eq!(execute_instruction(&mut cpu, 0x4E71, &mut bus), 4);
+    }
 }
