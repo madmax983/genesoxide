@@ -53,6 +53,7 @@ const MAX_POST_DELAY_SAMPLES: usize = 4;
 
 /// Genesis controller button (re-exported from io module).
 pub use crate::io::Button;
+pub use crate::io::PadType;
 
 /// Post-mix analog/capture profile applied after raw YM2612/PSG synthesis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1011,6 +1012,9 @@ pub enum Command {
     PressButton { port: u8, button: Button },
     /// Release a single button.
     ReleaseButton { port: u8, button: Button },
+    /// Select the physical pad type on a port (`true` = 6-button, `false` =
+    /// 3-button).
+    SetPadType { port: u8, six_button: bool },
     /// Set emulation speed in permille (1000 = normal).
     SetSpeed(u16),
     /// Set audio output sample rate in Hz (e.g. 44100, 48000).
@@ -1906,6 +1910,14 @@ impl GenesisCore {
             Command::ReleaseButton { port, button } => {
                 self.controller_port_mut(port).release(button);
             }
+            Command::SetPadType { port, six_button } => {
+                let pad_type = if six_button {
+                    PadType::SixButton
+                } else {
+                    PadType::ThreeButton
+                };
+                self.controller_port_mut(port).set_pad_type(pad_type);
+            }
             Command::SetSpeed(s) => self.speed_permille = s,
             Command::SetAudioSampleRate(rate) => {
                 self.audio_sample_rate = f64::from(rate);
@@ -2339,6 +2351,10 @@ impl GenesisCore {
         let cycles_u64 = u64::from(cycles);
         self.cpu.cycles += cycles_u64;
         self.scheduler.advance_cpu(cycles_u64);
+        // Advance the controllers' 6-button idle timers so a stalled TH poll
+        // resets its phase counter after ~1.5 ms of no TH activity.
+        self.port1.advance_cycles(cycles);
+        self.port2.advance_cycles(cycles);
     }
 
     fn step_cpu(&mut self) {
