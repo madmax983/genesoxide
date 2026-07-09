@@ -533,8 +533,10 @@ fn mode_switch_sequence() {
 /// the 224-line V28 boundary into the V30-only band (lines 224..239).
 fn build_pal_v30_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
-    // reg 0x0C = H40 only (S/H off). Backdrop black.
-    base_registers(&mut b, 0x01, 0x00);
+    // reg 0x0C = H40 (RS0|RS1 = 0x81), S/H off. Backdrop black. Both resolution
+    // bits are required for the 320px H40 width; only RS0 (0x01) would select
+    // H32 (256px).
+    base_registers(&mut b, 0x81, 0x00);
     // Enable V30: reg 0x01 = display on (0x40) + M2/V30 (0x08).
     b.set_register(0x01, 0x48);
 

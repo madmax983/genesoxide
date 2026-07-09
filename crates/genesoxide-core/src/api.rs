@@ -5212,6 +5212,10 @@ mod tests {
         core.execute(Command::SetRegionOverride(Some(Region::Pal)));
         core.execute(Command::LoadRom(rom_with_region("E")));
         core.vdp.write_control(0x8100 | 0x48); // V30
+        // Force H40 (RS0|RS1) so the native display width is a deterministic 320
+        // that survives the snapshot/restore of the horizontal-mode register
+        // (reg 0x0C); the V30 assertion below is about the 240-line height.
+        core.vdp.write_control(0x8C00 | 0x81); // reg 0x0C = H40
         assert_eq!(core.frame_dimensions(), (320, 240));
 
         let snap = core.snapshot();
