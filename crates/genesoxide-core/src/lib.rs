@@ -17,7 +17,7 @@ pub mod z80;
 
 pub use api::{
     AudioEqKind, AudioEqStage, AudioOutputConfig, AudioOutputProfile, Button, Command, CoreQuery,
-    GenesisCore, GenesisCoreSnapshot,
+    GenesisCore, GenesisCoreSnapshot, PadType,
 };
 pub use api::{FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_RGBA_BYTES, FRAME_WIDTH};
 pub use rewind::{
