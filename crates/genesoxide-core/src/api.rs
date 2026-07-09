@@ -10,7 +10,7 @@ use crate::cpu::{self, Cpu};
 use crate::io::ControllerPort;
 use crate::psg;
 use crate::rewind;
-use crate::rom::{self, RomHeader};
+use crate::rom::{self, RomHeader, SramLayout};
 use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Scheduler};
 use crate::vdp::Vdp;
 use crate::ym2612;
@@ -1062,6 +1062,168 @@ pub enum CoreQuery {
 ///   do not affect CPU/VDP/frame determinism and are rebuilt on `restore`.
 ///
 /// Used both for save states and for the time-travel rewind timeline.
+/// Cartridge backup RAM (SRAM / battery save) state.
+///
+/// The SRAM window overlaps the cartridge-ROM address region (typically
+/// 0x200000-0x20FFFF). Reads/writes in `[start, end]` are routed here when
+/// `enabled`; otherwise the underlying ROM is seen. `enabled` is toggled by the
+/// SSF SRAM-enable register at 0xA130F1 (bit 0). A header that declares
+/// battery-backed SRAM leaves this permanently enabled by default; for ROMs
+/// with no header descriptor a default 32KB buffer is allocated but stays
+/// disabled until the first write into the standard 0x200000 window (mirroring
+/// Genesis Plus GX's header-less fallback), at which point it enables itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CartSram {
+    /// Backing bytes. Length is the number of addressable SRAM bytes.
+    pub data: Vec<u8>,
+    /// Whether SRAM is currently mapped over the ROM window.
+    pub enabled: bool,
+    /// True if the ROM header declared battery-backed SRAM.
+    pub has_battery: bool,
+    /// True if the header declared an SRAM descriptor (vs. header-less default).
+    pub header_declared: bool,
+    /// True once a header-less default buffer has actually been written.
+    pub touched: bool,
+    /// SRAM window start address (68000 space).
+    pub start: u32,
+    /// SRAM window end address (68000 space).
+    pub end: u32,
+    /// Byte-lane layout (Both / EvenOnly / OddOnly).
+    pub layout: SramLayout,
+    /// Set on every SRAM write; cleared by the host after flushing to disk.
+    pub dirty: bool,
+}
+
+/// Default header-less SRAM window (Genesis Plus GX convention).
+const DEFAULT_SRAM_START: u32 = 0x20_0000;
+const DEFAULT_SRAM_END: u32 = 0x20_FFFF;
+/// Default header-less SRAM size (32KB).
+const DEFAULT_SRAM_SIZE: usize = 0x8000;
+/// SSF SRAM write-enable register (odd byte of the 0xA130F0 word).
+const SSF_SRAM_ENABLE_ADDR: u32 = 0x00A1_30F1;
+
+impl CartSram {
+    /// A disabled, empty SRAM (used before a ROM is loaded).
+    fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            enabled: false,
+            has_battery: false,
+            header_declared: false,
+            touched: false,
+            start: DEFAULT_SRAM_START,
+            end: DEFAULT_SRAM_END,
+            layout: SramLayout::Both,
+            dirty: false,
+        }
+    }
+
+    /// Builds SRAM state for a freshly loaded ROM from its parsed header.
+    fn from_header(header: Option<&RomHeader>) -> Self {
+        match header {
+            Some(h) if h.has_sram && h.sram_end >= h.sram_start => {
+                let span = (h.sram_end - h.sram_start) as usize;
+                let byte_count = match h.sram_layout {
+                    SramLayout::Both => span + 1,
+                    SramLayout::EvenOnly | SramLayout::OddOnly => span / 2 + 1,
+                };
+                Self {
+                    data: vec![0; byte_count.max(1)],
+                    // Header-declared SRAM is mapped from power-on so it works
+                    // without an explicit 0xA130F1 enable write.
+                    enabled: true,
+                    has_battery: true,
+                    header_declared: true,
+                    touched: false,
+                    start: h.sram_start,
+                    end: h.sram_end,
+                    layout: h.sram_layout,
+                    dirty: false,
+                }
+            }
+            _ => Self {
+                // Header-less fallback: allocate a default 32KB buffer at the
+                // standard window but keep it disabled until first accessed.
+                data: vec![0; DEFAULT_SRAM_SIZE],
+                enabled: false,
+                has_battery: false,
+                header_declared: false,
+                touched: false,
+                start: DEFAULT_SRAM_START,
+                end: DEFAULT_SRAM_END,
+                layout: SramLayout::Both,
+                dirty: false,
+            },
+        }
+    }
+
+    /// Maps a 68000 address in the SRAM window to a backing-byte index,
+    /// honoring the byte-lane layout. Returns `None` if the address is outside
+    /// the window or on a lane the SRAM does not back.
+    fn index_of(&self, addr: u32) -> Option<usize> {
+        if addr < self.start || addr > self.end {
+            return None;
+        }
+        let off = addr - self.start;
+        let idx = match self.layout {
+            SramLayout::Both => off as usize,
+            SramLayout::EvenOnly => {
+                if addr & 1 != 0 {
+                    return None;
+                }
+                (off >> 1) as usize
+            }
+            SramLayout::OddOnly => {
+                if addr & 1 == 0 {
+                    return None;
+                }
+                (off >> 1) as usize
+            }
+        };
+        (idx < self.data.len()).then_some(idx)
+    }
+
+    /// Returns the SRAM byte at `addr` if it is enabled and in range.
+    fn read(&self, addr: u32) -> Option<u8> {
+        if !self.enabled {
+            return None;
+        }
+        self.index_of(addr).map(|i| self.data[i])
+    }
+
+    /// Attempts a byte write. Enables a header-less buffer on first touch.
+    /// Returns true if the write landed in SRAM (and it should not fall
+    /// through to the dropped-ROM-write path).
+    fn write(&mut self, addr: u32, val: u8) -> bool {
+        if addr < self.start || addr > self.end {
+            return false;
+        }
+        // Header-less SRAM enables itself on first write into the window.
+        if !self.enabled {
+            if self.header_declared {
+                // Explicitly banked out via 0xA130F1 — ignore ROM-window writes.
+                return false;
+            }
+            self.enabled = true;
+        }
+        if !self.header_declared {
+            self.touched = true;
+        }
+        if let Some(i) = self.index_of(addr) {
+            self.data[i] = val;
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if this SRAM holds data worth persisting to a `.srm` file.
+    fn worth_saving(&self) -> bool {
+        self.has_battery || self.touched
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenesisCoreSnapshot {
     /// 68000 CPU register state.
@@ -1076,6 +1238,8 @@ pub struct GenesisCoreSnapshot {
     pub work_ram: Vec<u8>,
     /// 8KB Z80 RAM.
     pub z80_ram: Vec<u8>,
+    /// Cartridge backup RAM (battery save) state.
+    pub sram: CartSram,
     /// 68K ROM bank register.
     pub z80_bank: u32,
     /// 68K has requested the Z80 bus.
@@ -1374,6 +1538,8 @@ pub struct GenesisCore {
     rom: Vec<u8>,
     /// Parsed ROM header (if loaded).
     rom_header: Option<RomHeader>,
+    /// Cartridge backup RAM (battery save) state.
+    sram: CartSram,
     /// 64KB work RAM.
     work_ram: Box<[u8; 0x10000]>,
     /// Z80 CPU.
@@ -1637,6 +1803,7 @@ impl GenesisCore {
             port2: ControllerPort::new(),
             rom: Vec::new(),
             rom_header: None,
+            sram: CartSram::empty(),
             work_ram: Box::new([0; 0x10000]),
             z80: z80::Z80::new(),
             z80_ram: Box::new([0; 0x2000]),
@@ -1815,6 +1982,47 @@ impl GenesisCore {
         self.paused
     }
 
+    /// Returns the cartridge SRAM (battery save) contents.
+    #[must_use]
+    pub fn sram(&self) -> &[u8] {
+        &self.sram.data
+    }
+
+    /// Returns true if the loaded ROM declares battery-backed SRAM.
+    #[must_use]
+    pub fn has_battery_sram(&self) -> bool {
+        self.sram.has_battery
+    }
+
+    /// Returns true if the SRAM should be persisted to disk (battery-backed,
+    /// or a header-less buffer that has actually been written).
+    #[must_use]
+    pub fn sram_worth_saving(&self) -> bool {
+        self.sram.worth_saving()
+    }
+
+    /// Returns true if SRAM has been written since the last `clear_sram_dirty`.
+    #[must_use]
+    pub fn sram_is_dirty(&self) -> bool {
+        self.sram.dirty
+    }
+
+    /// Clears the SRAM dirty flag (call after flushing the save to disk).
+    pub fn clear_sram_dirty(&mut self) {
+        self.sram.dirty = false;
+    }
+
+    /// Loads persisted SRAM bytes into the cartridge backup RAM.
+    ///
+    /// Copies up to the allocated SRAM length; extra bytes are ignored and a
+    /// short buffer leaves the remaining bytes zeroed. Does not mark the SRAM
+    /// dirty (the on-disk copy is already current).
+    pub fn load_sram(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.sram.data.len());
+        self.sram.data[..n].copy_from_slice(&bytes[..n]);
+        self.sram.dirty = false;
+    }
+
     /// Returns the CPU program counter (debug).
     #[must_use]
     pub fn cpu_pc(&self) -> u32 {
@@ -1936,6 +2144,7 @@ impl GenesisCore {
             z80: self.z80.snapshot(),
             work_ram: self.work_ram.to_vec(),
             z80_ram: self.z80_ram.to_vec(),
+            sram: self.sram.clone(),
             z80_bank: self.z80_bank,
             z80_bus_requested: self.z80_bus_requested,
             z80_reset: self.z80_reset,
@@ -1963,6 +2172,7 @@ impl GenesisCore {
         self.z80.restore(&snap.z80);
         self.work_ram.copy_from_slice(&snap.work_ram);
         self.z80_ram.copy_from_slice(&snap.z80_ram);
+        self.sram = snap.sram.clone();
         self.z80_bank = snap.z80_bank;
         self.z80_bus_requested = snap.z80_bus_requested;
         self.z80_reset = snap.z80_reset;
@@ -2039,6 +2249,10 @@ impl GenesisCore {
 
     fn load_rom(&mut self, data: Vec<u8>) {
         self.rom_header = rom::parse_header(&data).ok();
+        // Allocate/size cartridge SRAM from the header (or a header-less
+        // default). A newly loaded ROM starts with a fresh, empty save; the
+        // host may repopulate it afterwards via `load_sram`.
+        self.sram = CartSram::from_header(self.rom_header.as_ref());
         self.rom = data;
         self.power_cycle();
     }
@@ -2099,6 +2313,7 @@ impl GenesisCore {
         // Build a bus wrapper that borrows the non-CPU fields.
         let mut bus = CoreBus {
             rom: &self.rom,
+            sram: &mut self.sram,
             work_ram: &mut self.work_ram,
             vdp: &mut self.vdp,
             port1: &mut self.port1,
@@ -2265,6 +2480,7 @@ impl GenesisCore {
                     scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                 let mut bus = CoreBus {
                     rom: &self.rom,
+                    sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
                     port1: &mut self.port1,
@@ -2310,6 +2526,7 @@ impl GenesisCore {
                         scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                     let mut bus = CoreBus {
                         rom: &self.rom,
+                        sram: &mut self.sram,
                         work_ram: &mut self.work_ram,
                         vdp: &mut self.vdp,
                         port1: &mut self.port1,
@@ -2384,6 +2601,7 @@ impl GenesisCore {
                 let mut bus = Z80Bus {
                     z80_ram: &mut self.z80_ram,
                     rom: &self.rom,
+                    sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &self.vdp,
                     port1: &mut self.port1,
@@ -2420,6 +2638,7 @@ impl GenesisCore {
             let mut bus = Z80Bus {
                 z80_ram: &mut self.z80_ram,
                 rom: &self.rom,
+                sram: &mut self.sram,
                 work_ram: &mut self.work_ram,
                 vdp: &self.vdp,
                 port1: &mut self.port1,
@@ -2716,6 +2935,9 @@ impl GenesisCore {
     fn read_byte(&self, addr: u32) -> u8 {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
+                if let Some(b) = self.sram.read(addr) {
+                    return b;
+                }
                 let offset = (addr & 0x3FFFFF) as usize;
                 self.rom.get(offset).copied().unwrap_or(0)
             }
@@ -2762,7 +2984,14 @@ impl GenesisCore {
     /// Writes a byte to the bus.
     #[allow(dead_code)]
     fn write_byte_bus(&mut self, addr: u32, val: u8) {
+        if addr == SSF_SRAM_ENABLE_ADDR {
+            self.sram.enabled = val & 0x01 != 0;
+            return;
+        }
         match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                let _ = self.sram.write(addr, val);
+            }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = val;
@@ -2787,7 +3016,15 @@ impl GenesisCore {
     /// Writes a big-endian u16 to the bus.
     #[allow(dead_code)]
     fn write_word_bus(&mut self, addr: u32, val: u16) {
+        if addr == SSF_SRAM_ENABLE_ADDR & !1 || addr == SSF_SRAM_ENABLE_ADDR {
+            self.sram.enabled = (val as u8) & 0x01 != 0;
+            return;
+        }
         match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                let _ = self.sram.write(addr, (val >> 8) as u8);
+                let _ = self.sram.write(addr.wrapping_add(1), val as u8);
+            }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = (val >> 8) as u8;
@@ -2870,6 +3107,7 @@ impl AudioTraceCtx<'_> {
 fn read_68k_byte(
     addr: u32,
     rom: &[u8],
+    sram: &CartSram,
     work_ram: &[u8; 0x10000],
     vdp: &Vdp,
     port1: &ControllerPort,
@@ -2880,6 +3118,10 @@ fn read_68k_byte(
 ) -> u8 {
     match bus::map_region(addr) {
         bus::BusRegion::CartridgeRom => {
+            // SRAM overlaps the cartridge-ROM region; when mapped in, it wins.
+            if let Some(b) = sram.read(addr) {
+                return b;
+            }
             let offset = (addr & 0x3FFFFF) as usize;
             rom.get(offset).copied().unwrap_or(0)
         }
@@ -2945,6 +3187,7 @@ fn read_68k_byte(
 fn write_68k_byte(
     addr: u32,
     val: u8,
+    sram: &mut CartSram,
     work_ram: &mut [u8; 0x10000],
     port1: &mut ControllerPort,
     port2: &mut ControllerPort,
@@ -2960,7 +3203,18 @@ fn write_68k_byte(
     z80_driver_last_write_frame: &mut u64,
     trace: &mut AudioTraceCtx,
 ) {
+    // SSF SRAM-enable register at 0xA130F1 (bit 0). Maps to `Unmapped` in
+    // `bus::map_region`, so special-case it before the region match.
+    if addr == SSF_SRAM_ENABLE_ADDR {
+        sram.enabled = val & 0x01 != 0;
+        return;
+    }
     match bus::map_region(addr) {
+        bus::BusRegion::CartridgeRom => {
+            // Route writes that land in the SRAM window into backup RAM;
+            // anything else in the cartridge-ROM region is a dropped ROM write.
+            let _ = sram.write(addr, val);
+        }
         bus::BusRegion::WorkRam => {
             let offset = (addr & 0xFFFF) as usize;
             work_ram[offset] = val;
@@ -3032,6 +3286,7 @@ fn write_68k_byte(
 /// with the mutable borrow of the CPU.
 struct CoreBus<'a> {
     rom: &'a [u8],
+    sram: &'a mut CartSram,
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a mut Vdp,
     port1: &'a mut ControllerPort,
@@ -3073,6 +3328,7 @@ impl Bus for CoreBus<'_> {
         read_68k_byte(
             addr,
             self.rom,
+            self.sram,
             &**self.work_ram,
             self.vdp,
             self.port1,
@@ -3086,10 +3342,14 @@ impl Bus for CoreBus<'_> {
     fn read_word(&mut self, addr: u32) -> u16 {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
-                let offset = (addr & 0x3FFFFF) as usize;
-                let hi = u16::from(*self.rom.get(offset).unwrap_or(&0));
-                let lo = u16::from(*self.rom.get(offset + 1).unwrap_or(&0));
-                (hi << 8) | lo
+                // Each byte lane may be backed by SRAM (when mapped in) or ROM.
+                let hi = self.sram.read(addr).unwrap_or_else(|| {
+                    *self.rom.get((addr & 0x3FFFFF) as usize).unwrap_or(&0)
+                });
+                let lo = self.sram.read(addr.wrapping_add(1)).unwrap_or_else(|| {
+                    *self.rom.get(((addr & 0x3FFFFF) + 1) as usize).unwrap_or(&0)
+                });
+                (u16::from(hi) << 8) | u16::from(lo)
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -3166,6 +3426,7 @@ impl Bus for CoreBus<'_> {
         write_68k_byte(
             addr,
             val,
+            self.sram,
             &mut **self.work_ram,
             self.port1,
             self.port2,
@@ -3184,7 +3445,20 @@ impl Bus for CoreBus<'_> {
     }
 
     fn write_word(&mut self, addr: u32, val: u16) {
+        // SSF SRAM-enable register: a word write to 0xA130F0 delivers the
+        // control bit in its low byte (0xA130F1). Handle before the region match.
+        if addr == SSF_SRAM_ENABLE_ADDR & !1 || addr == SSF_SRAM_ENABLE_ADDR {
+            self.sram.enabled = (val as u8) & 0x01 != 0;
+            return;
+        }
         match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                // Route SRAM-window word writes into backup RAM (per byte lane).
+                let hi = (val >> 8) as u8;
+                let lo = val as u8;
+                let _ = self.sram.write(addr, hi);
+                let _ = self.sram.write(addr.wrapping_add(1), lo);
+            }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = (val >> 8) as u8;
@@ -3275,6 +3549,7 @@ impl Bus for CoreBus<'_> {
 struct Z80Bus<'a> {
     z80_ram: &'a mut Box<[u8; 0x2000]>,
     rom: &'a [u8],
+    sram: &'a mut CartSram,
     // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a Vdp,
@@ -3337,6 +3612,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 read_68k_byte(
                     bus_addr,
                     self.rom,
+                    self.sram,
                     &**self.work_ram,
                     self.vdp,
                     self.port1,
@@ -3381,6 +3657,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 write_68k_byte(
                     bus_addr,
                     val,
+                    self.sram,
                     &mut **self.work_ram,
                     self.port1,
                     self.port2,
@@ -3423,6 +3700,7 @@ mod tests {
         let scanline = core.vdp.scanline();
         CoreBus {
             rom: &core.rom,
+            sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &mut core.vdp,
             port1: &mut core.port1,
@@ -3450,6 +3728,7 @@ mod tests {
         Z80Bus {
             z80_ram: &mut core.z80_ram,
             rom: &core.rom,
+            sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &core.vdp,
             port1: &mut core.port1,
@@ -4223,6 +4502,114 @@ mod tests {
 
         assert_eq!(core.cpu.ssp, 0x00FF_FFF0);
         assert_eq!(core.cpu.pc, 0x0000_0200);
+    }
+
+    /// Builds a valid 68000-bootable ROM whose header declares battery SRAM.
+    fn rom_with_sram(type_byte: u8, start: u32, end: u32) -> Vec<u8> {
+        let mut rom = vec![0u8; 1024];
+        rom[0..4].copy_from_slice(&0x00FF_FFF0u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        rom[0x1B0..0x1B2].copy_from_slice(&0x5241u16.to_be_bytes()); // 'RA'
+        rom[0x1B2] = type_byte;
+        rom[0x1B4..0x1B8].copy_from_slice(&start.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&end.to_be_bytes());
+        rom
+    }
+
+    #[test]
+    fn sram_mapping_round_trip() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        assert!(core.has_battery_sram());
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        // Byte path
+        bus.write_byte(0x200001, 0xAB);
+        bus.write_byte(0x200003, 0xCD);
+        assert_eq!(bus.read_byte(0x200001), 0xAB);
+        assert_eq!(bus.read_byte(0x200003), 0xCD);
+        // Word path
+        bus.write_word(0x200010, 0x1234);
+        assert_eq!(bus.read_word(0x200010), 0x1234);
+        assert_eq!(bus.read_byte(0x200010), 0x12);
+        assert_eq!(bus.read_byte(0x200011), 0x34);
+    }
+
+    #[test]
+    fn sram_odd_only_layout_masks_even_lane() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        // 0xB0 = backup-RAM pattern + bit4 (odd-only).
+        core.execute(Command::LoadRom(rom_with_sram(0xB0, 0x200000, 0x20FFFF)));
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        bus.write_byte(0x200001, 0xAB); // odd address → backed by SRAM
+        bus.write_byte(0x200000, 0xCD); // even address → not backed (dropped)
+        assert_eq!(bus.read_byte(0x200001), 0xAB);
+        assert_eq!(bus.read_byte(0x200000), 0x00); // even lane reads ROM (0)
+    }
+
+    #[test]
+    fn sram_a130f1_banking_toggle() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        bus.write_byte(0x200001, 0xAB);
+        assert_eq!(bus.read_byte(0x200001), 0xAB); // enabled by default (header)
+        bus.write_byte(0xA130F1, 0x00); // disable SRAM banking
+        assert_eq!(bus.read_byte(0x200001), 0x00); // now sees ROM (zeros)
+        bus.write_byte(0xA130F1, 0x01); // re-enable
+        assert_eq!(bus.read_byte(0x200001), 0xAB); // SRAM contents preserved
+    }
+
+    #[test]
+    fn sram_included_in_snapshot() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x200001, 0x42);
+        }
+        let snap = core.snapshot();
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x200001, 0x99);
+        }
+        assert_eq!(core.sram()[1], 0x99);
+        core.restore(&snap);
+        assert_eq!(core.sram()[1], 0x42);
+    }
+
+    #[test]
+    fn headerless_sram_enables_on_first_write() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        let mut rom = vec![0u8; 1024];
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        core.execute(Command::LoadRom(rom));
+        assert!(!core.has_battery_sram());
+        assert!(!core.sram_worth_saving());
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x200000, 0x77);
+            assert_eq!(bus.read_byte(0x200000), 0x77); // enabled on first write
+        }
+        assert!(core.sram_worth_saving());
+        assert!(core.sram_is_dirty());
+        core.clear_sram_dirty();
+        assert!(!core.sram_is_dirty());
+    }
+
+    #[test]
+    fn load_sram_restores_saved_bytes() {
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        let saved: Vec<u8> = (0..core.sram().len()).map(|i| (i & 0xFF) as u8).collect();
+        core.load_sram(&saved);
+        assert_eq!(core.sram(), &saved[..]);
+        assert!(!core.sram_is_dirty()); // loading is not a dirtying write
     }
 
     #[test]
