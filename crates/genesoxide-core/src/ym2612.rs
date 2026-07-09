@@ -473,20 +473,40 @@ impl Operator {
     /// frequency used for detune key_code lookup — on real hardware, detune
     /// is indexed by the stored fnum, not the vibrato-modulated one.
     fn phase_increment(&self, fnum: u16, block: u8, dt_fnum: u16, dt_block: u8) -> u32 {
-        let base_freq = ((fnum as u32) << (block as u32)) >> 1;
-        let mult = MULTIPLY_TABLE[self.multiply as usize] as u32;
-        let phase_inc = (base_freq * mult) >> 1;
+        // Compute the phase step in ymfm's doubled-fnum domain (see
+        // `ymfm_opn.cpp::compute_phase_step`): double the 11-bit fnum, apply the
+        // block shift, then `>> 2`. This base step is numerically identical to
+        // the naive `(fnum << block) >> 1`, but it is the domain in which detune
+        // must be folded. The PM path already adds its offset to `fnum` at
+        // 11-bit resolution (with the matching `>> 1` compensation in
+        // `lfo_pm_offset`), so doubling here leaves the base step and vibrato
+        // depth unchanged.
+        let fnum_doubled = (fnum as u32) << 1;
+        let base_step = (fnum_doubled << (block as u32)) >> 2;
 
-        // Detune uses the ORIGINAL fnum/block (not PM-modulated) for key_code
+        // Detune offset, keyed off the ORIGINAL (non-PM) fnum/block key_code.
         let dt_mag = (self.detune & 3) as usize;
         let kc = Self::key_code(dt_fnum, dt_block) as usize;
         let dt_offset = DETUNE_TABLE[dt_mag][kc.min(31)] as u32;
 
-        if self.detune & 4 != 0 {
-            phase_inc.saturating_sub(dt_offset)
+        // Fold detune into the base step *before* the multiply, matching ymfm's
+        // `phase_step += detune; phase_step &= 0x1ffff`. Two's-complement wrap
+        // plus the 17-bit mask reproduces ymfm's signed add-then-mask. Doing
+        // this before the multiply makes the detune displacement scale with MUL
+        // (as on real hardware / Nuked-OPN2); the previous code added detune
+        // after the multiply, leaving detuned high-MUL notes up to ~2.5 cents
+        // sharp/flat of ymfm while detune-free and MUL=1 notes were unaffected.
+        let detuned = if self.detune & 4 != 0 {
+            base_step.wrapping_sub(dt_offset)
         } else {
-            phase_inc + dt_offset
-        }
+            base_step.wrapping_add(dt_offset)
+        } & 0x1_FFFF;
+
+        // Apply the frequency multiple. MULTIPLY_TABLE is pre-doubled (MUL=0 is
+        // stored as 1 for the 0.5x case), so this is ymfm's
+        // `(phase_step * multiple) >> 1`.
+        let mult = MULTIPLY_TABLE[self.multiply as usize] as u32;
+        (detuned * mult) >> 1
     }
 
     /// Produce the output sample for this operator, given optional modulation
