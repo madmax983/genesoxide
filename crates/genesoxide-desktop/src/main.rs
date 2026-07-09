@@ -98,11 +98,6 @@ fn frame_dims_u32(core: &GenesisCore) -> (u32, u32) {
     (w as u32, h as u32)
 }
 
-/// Returns the effective region's nominal frame period in nanoseconds.
-fn app_frame_period_ns(core: &GenesisCore) -> u64 {
-    core.frame_period_ns()
-}
-
 /// How often (in frames) to flush dirty SRAM to disk during play, so a crash
 /// or forced kill does not lose recent progress. ~3 seconds at 60 Hz.
 const SRAM_FLUSH_INTERVAL: u32 = 180;
@@ -221,7 +216,7 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
 
     // Pace at the effective region's frame period (NTSC ~16.69 ms, PAL ~20.12 ms)
     // and size the surface from the core's active dimensions (224 or 240 lines).
-    let frame_duration = Duration::from_nanos(app_frame_period_ns(&core));
+    let frame_duration = Duration::from_nanos(core.frame_period_ns());
     let frame_dims = frame_dims_u32(&core);
 
     let mut app = App {

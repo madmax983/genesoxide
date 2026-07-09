@@ -3472,39 +3472,36 @@ fn region_and_overseas_from_header(header: Option<&RomHeader>) -> (Region, bool)
         return (Region::Ntsc, true);
     }
 
+    // Shared rule: a machine that can run NTSC (Japan or Americas present) is
+    // NTSC and overseas unless Japan-only; a Europe-only cart is PAL; anything
+    // else defaults to overseas NTSC.
+    let classify = |japan: bool, americas: bool, europe: bool| -> (Region, bool) {
+        if japan || americas {
+            (Region::Ntsc, !(japan && !americas && !europe))
+        } else if europe {
+            (Region::Pal, true)
+        } else {
+            (Region::Ntsc, true)
+        }
+    };
+
     // A lone hex digit that is not one of the J/U/E region letters is the modern
     // bitfield form.
     if code.len() == 1 {
         let c = code.as_bytes()[0] as char;
         if !matches!(c, 'J' | 'U' | 'E') {
             if let Some(bits) = c.to_digit(16) {
-                let japan = bits & 0b0001 != 0;
-                let americas = bits & 0b0100 != 0;
-                let europe = bits & 0b1000 != 0;
-                if japan || americas {
-                    // NTSC-capable; overseas unless Japan-only.
-                    return (Region::Ntsc, !(japan && !americas && !europe));
-                }
-                if europe {
-                    return (Region::Pal, true);
-                }
-                return (Region::Ntsc, true);
+                return classify(bits & 0b0001 != 0, bits & 0b0100 != 0, bits & 0b1000 != 0);
             }
         }
     }
 
-    // Letter-set form (possibly combined). Prefer NTSC when an NTSC region is
-    // present; otherwise Europe-only → PAL.
-    let has_japan = code.contains('J');
-    let has_americas = code.contains('U') || code.contains('A');
-    let has_europe = code.contains('E');
-    if has_japan || has_americas {
-        (Region::Ntsc, !(has_japan && !has_americas && !has_europe))
-    } else if has_europe {
-        (Region::Pal, true)
-    } else {
-        (Region::Ntsc, true)
-    }
+    // Letter-set form (possibly combined).
+    classify(
+        code.contains('J'),
+        code.contains('U') || code.contains('A'),
+        code.contains('E'),
+    )
 }
 
 /// Reads one byte of the 68000's 24-bit address space.
