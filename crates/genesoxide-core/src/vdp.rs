@@ -389,6 +389,27 @@ impl Vdp {
         [r * 36 + r / 2, g * 36 + g / 2, b * 36 + b / 2, 0xFF]
     }
 
+    /// Applies a shadow/highlight intensity to an already-Normal RGBA pixel.
+    ///
+    /// Because Shadow = Normal/2 and Highlight = 128 + Normal/2 are both linear
+    /// in the 8-bit Normal value, the transform is applied directly to the
+    /// stored RGBA rather than re-derived from CRAM. Only RGB is modified; the
+    /// alpha channel is preserved. `intensity`: 0 = Shadow, 1 = Normal,
+    /// 2 = Highlight.
+    #[must_use]
+    fn apply_intensity(rgba: [u8; 4], intensity: u8) -> [u8; 4] {
+        match intensity {
+            0 => [rgba[0] >> 1, rgba[1] >> 1, rgba[2] >> 1, rgba[3]], // shadow
+            2 => [
+                128 + (rgba[0] >> 1),
+                128 + (rgba[1] >> 1),
+                128 + (rgba[2] >> 1),
+                rgba[3],
+            ], // highlight
+            _ => rgba, // normal
+        }
+    }
+
     /// Returns the background color (palette 0, color 0).
     #[must_use]
     pub fn background_color(&self) -> [u8; 4] {
@@ -602,7 +623,8 @@ impl Vdp {
     fn window_h_range(&self, screen_width: u16) -> (u16, u16) {
         let reg = self.registers[0x11];
         let cells = u16::from(reg & 0x1F);
-        let pixels = cells * 8;
+        // WHP (reg 0x11) is in units of 2 cells = 16 px on hardware.
+        let pixels = cells * 16;
         if reg & 0x80 != 0 {
             // Window on the right side
             (pixels.min(screen_width), screen_width)
@@ -798,6 +820,14 @@ impl Vdp {
         let mut pixel_color = [[0u8; 4]; 320];
         let mut pixel_priority = [0u8; 320];
 
+        // Shadow/highlight mode gate (reg 0x0C bit 3). When disabled, rendering
+        // is byte-identical to a build without S/H support (no operator
+        // special-casing, plain framebuffer copy at writeback).
+        let sh = self.registers[0x0C] & 0x08 != 0;
+        // Per-pixel operator-sprite modifier: 0 = none, 1 = shadow op, 2 = highlight op.
+        // Only populated by render_sprites_on_line when `sh` is true.
+        let mut sh_op = [0u8; 320];
+
         // Step 1: Background fill
         for pixel in pixel_color.iter_mut().take(width as usize) {
             *pixel = bg_color;
@@ -886,7 +916,14 @@ impl Vdp {
         }
 
         // Step 4: Sprites
-        self.render_sprites_on_line(line, width, &mut pixel_color, &mut pixel_priority);
+        self.render_sprites_on_line(
+            line,
+            width,
+            &mut pixel_color,
+            &mut pixel_priority,
+            sh,
+            &mut sh_op,
+        );
 
         // Step 5: Left column blank (register 0, bit 5)
         if self.registers[0] & 0x20 != 0 {
@@ -896,9 +933,31 @@ impl Vdp {
         }
 
         // Write final pixel data to framebuffer
-        for (x, color) in pixel_color.iter().enumerate() {
-            let offset = (y * 320 + x) * 4;
-            self.framebuffer[offset..offset + 4].copy_from_slice(color);
+        if sh {
+            // Shadow/highlight: derive per-pixel base intensity from the winning
+            // pixel's priority, fold in any operator-sprite modifier, then apply.
+            for (x, color) in pixel_color.iter().enumerate() {
+                // Base: high-priority winners are Normal, everything else Shadow.
+                let base: u8 = if pixel_priority[x] == 2 { 1 } else { 0 };
+                let intensity = match (base, sh_op[x]) {
+                    (_, 0) => base,                    // no operator
+                    (0, 2) => 1,                       // Shadow  + Highlight op -> Normal
+                    (1, 2) => 2,                       // Normal  + Highlight op -> Highlight
+                    (2, 2) => 2,                       // Highlight + Highlight op -> Highlight
+                    (2, 1) => 1,                       // Highlight + Shadow op -> Normal
+                    (1, 1) => 0,                       // Normal  + Shadow op -> Shadow
+                    (0, 1) => 0,                       // Shadow  + Shadow op -> Shadow
+                    _ => base,
+                };
+                let out = Self::apply_intensity(*color, intensity);
+                let offset = (y * 320 + x) * 4;
+                self.framebuffer[offset..offset + 4].copy_from_slice(&out);
+            }
+        } else {
+            for (x, color) in pixel_color.iter().enumerate() {
+                let offset = (y * 320 + x) * 4;
+                self.framebuffer[offset..offset + 4].copy_from_slice(color);
+            }
         }
 
         self.in_hblank = false;
@@ -911,6 +970,8 @@ impl Vdp {
         width: u16,
         pixel_color: &mut [[u8; 4]; 320],
         pixel_priority: &mut [u8; 320],
+        sh: bool,
+        sh_op: &mut [u8; 320],
     ) {
         let sat_base = self.sprite_table_addr();
         let mut sprites_on_line: usize = 0;
@@ -991,6 +1052,20 @@ impl Vdp {
                         }
 
                         let xi = screen_x as usize;
+
+                        // Shadow/highlight operator sprites: palette 3, color
+                        // index 14 (highlight) or 15 (shadow). They do NOT draw
+                        // color or set priority; they record a modifier for the
+                        // pixel behind them, but only if no color sprite has
+                        // already drawn in front (front-to-back order) and no
+                        // nearer operator was already recorded.
+                        if sh && palette == 3 && (color_index == 14 || color_index == 15) {
+                            if !pixel_has_sprite[xi] && sh_op[xi] == 0 {
+                                sh_op[xi] = if color_index == 15 { 1 } else { 2 };
+                            }
+                            continue;
+                        }
+
                         let pri_level = if priority { 2 } else { 1 };
 
                         // Sprite compositing rules:
@@ -1664,9 +1739,10 @@ mod tests {
             vram_write_word(&mut vdp, nt_win + col as usize * 2, 0x0002);
         }
 
-        // Configure window: left 20 cells (160 pixels), full vertical
-        // Register 0x11: left side (bit 7 = 0), cell count = 20 (0x14)
-        vdp.registers[0x11] = 0x14;
+        // Configure window: left boundary at 160 px (10 cells * 16 px/unit = 160 px),
+        // full vertical.
+        // Register 0x11: left side (bit 7 = 0), count = 10 (0x0A)
+        vdp.registers[0x11] = 0x0A;
         // Register 0x12: full vertical (bit 7 = 0), cell count = 31 (0x1F) -> 248 lines, covers 224
         vdp.registers[0x12] = 0x1F;
 
@@ -1751,9 +1827,10 @@ mod tests {
             vram_write_word(&mut vdp, nt_win + col as usize * 2, 0x0002);
         }
 
-        // Configure window on right side from cell 20 rightward, full vertical
-        // Register 0x11: right side (bit 7 = 1), cell count = 20 -> 0x80 | 0x14 = 0x94
-        vdp.registers[0x11] = 0x94;
+        // Configure window on right side from x=160 rightward, full vertical
+        // (10 cells * 16 px/unit = 160 px boundary).
+        // Register 0x11: right side (bit 7 = 1), count = 10 -> 0x80 | 0x0A = 0x8A
+        vdp.registers[0x11] = 0x8A;
         // Register 0x12: full vertical coverage
         vdp.registers[0x12] = 0x1F;
 
@@ -1855,6 +1932,255 @@ mod tests {
             status1 & 0x0010,
             status2 & 0x0010,
             "odd frame bit should toggle"
+        );
+    }
+
+    // ---- Shadow / highlight tests ----
+
+    /// A distinctive mid-gray (all three 3-bit components = 4).
+    /// Normal = [146,146,146,255], Shadow = [73,73,73,255], Highlight = [201,201,201,255].
+    const SH_GRAY: u16 = 0x0888;
+
+    /// Enable shadow/highlight mode (reg 0x0C bit 3) while keeping H40.
+    fn enable_shadow_highlight(vdp: &mut Vdp) {
+        vdp.registers[0x0C] |= 0x08;
+    }
+
+    /// Write a 1x1 sprite as the sole entry of the sprite attribute table,
+    /// positioned at screen (0,0). The sprite tile is filled with `color_index`.
+    fn write_single_sprite(vdp: &mut Vdp, tile: u16, palette: u8, priority: bool, color_index: u8) {
+        write_tile_pattern(vdp, tile, &[[color_index; 8]; 8]);
+        let sat = vdp.sprite_table_addr();
+        // word0: Y raw 128 -> screen Y 0
+        vram_write_word(vdp, sat, 0x0080);
+        // word1: v_size=1, h_size=1, link=0 (end of list)
+        vram_write_word(vdp, sat + 2, 0x0000);
+        // word2: priority | palette | tile
+        let pri_bit = if priority { 0x8000 } else { 0x0000 };
+        let pal_bits = (u16::from(palette) & 0x03) << 13;
+        vram_write_word(vdp, sat + 4, pri_bit | pal_bits | (tile & 0x07FF));
+        // word3: X raw 128 -> screen X 0
+        vram_write_word(vdp, sat + 6, 0x0080);
+    }
+
+    #[test]
+    fn shadow_highlight_disabled_is_unchanged() {
+        let mut vdp = setup_vdp_for_rendering();
+        // reg 0x0C bit 3 stays 0 (S/H disabled).
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        // Scroll A: low-priority tile 1.
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &normal,
+            "S/H disabled: low-priority plane must render at full normal color"
+        );
+    }
+
+    #[test]
+    fn shadow_highlight_low_priority_plane_is_shadowed() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001); // low priority
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(shadow[0], normal[0] >> 1, "shadow halves the component");
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "S/H on: low-priority plane pixel must be shadowed (halved)"
+        );
+    }
+
+    #[test]
+    fn shadow_highlight_high_priority_plane_is_normal() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x8001); // HIGH priority
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &normal,
+            "S/H on: high-priority plane pixel stays at full normal color"
+        );
+    }
+
+    #[test]
+    fn shadow_highlight_backdrop_is_shadowed() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        // Backdrop = palette 0 color 0; give it a visible value.
+        vdp.cram[0] = SH_GRAY;
+        vdp.registers[0x07] = 0x00; // background = CRAM index 0
+
+        // No tiles anywhere -> whole scanline is backdrop (priority 0).
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "S/H on: backdrop (priority 0) must be shadowed"
+        );
+    }
+
+    #[test]
+    fn shadow_operator_sprite_darkens() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        // High-priority (Normal) plane pixel behind the operator.
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x8001); // high priority -> Normal base
+
+        // Sentinel: if the operator wrongly drew its own color it would show red.
+        vdp.cram[63] = 0x000E; // palette 3 color 15 -> red
+        // Operator sprite: palette 3, color index 15 (shadow operator).
+        write_single_sprite(&mut vdp, 3, 3, false, 15);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "shadow operator over a Normal pixel yields Shadow"
+        );
+        // Prove the operator did NOT draw its own (red) color.
+        let sentinel = Vdp::color_to_rgba(0x000E);
+        assert_ne!(
+            &vdp.framebuffer[0..4],
+            &sentinel,
+            "operator sprite must not draw its own color"
+        );
+    }
+
+    #[test]
+    fn highlight_operator_sprite_brightens() {
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+
+        // Case (a): highlight operator over a SHADOWED (low-priority) pixel -> Normal.
+        {
+            let mut vdp = setup_vdp_for_rendering();
+            enable_shadow_highlight(&mut vdp);
+            vdp.cram[1] = SH_GRAY;
+            write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+            let nt_a = vdp.scroll_a_nametable_addr();
+            vram_write_word(&mut vdp, nt_a, 0x0001); // low priority -> Shadow base
+            // Operator sprite: palette 3, color index 14 (highlight operator).
+            write_single_sprite(&mut vdp, 3, 3, false, 14);
+
+            vdp.render_scanline(0);
+            assert_eq!(
+                &vdp.framebuffer[0..4],
+                &normal,
+                "highlight operator over a Shadow pixel yields Normal"
+            );
+        }
+
+        // Case (b): highlight operator over a NORMAL (high-priority) pixel -> Highlight.
+        {
+            let mut vdp = setup_vdp_for_rendering();
+            enable_shadow_highlight(&mut vdp);
+            vdp.cram[1] = SH_GRAY;
+            write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+            let nt_a = vdp.scroll_a_nametable_addr();
+            vram_write_word(&mut vdp, nt_a, 0x8001); // high priority -> Normal base
+            write_single_sprite(&mut vdp, 3, 3, false, 14);
+
+            vdp.render_scanline(0);
+            let highlight = Vdp::apply_intensity(normal, 2);
+            assert_eq!(
+                &vdp.framebuffer[0..4],
+                &highlight,
+                "highlight operator over a Normal pixel yields Highlight"
+            );
+            assert!(
+                vdp.framebuffer[0] > normal[0],
+                "highlight must increase brightness"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_sprite_draws_as_color_when_sh_disabled() {
+        let mut vdp = setup_vdp_for_rendering();
+        // S/H DISABLED (bit 3 left at 0).
+        // palette 3 color 15 = a distinct color.
+        vdp.cram[63] = 0x000E; // red
+        write_single_sprite(&mut vdp, 3, 3, false, 15);
+
+        vdp.render_scanline(0);
+
+        let red = Vdp::color_to_rgba(0x000E);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &red,
+            "with S/H disabled, a palette-3 index-15 sprite draws its actual color"
+        );
+    }
+
+    #[test]
+    fn normal_low_priority_sprite_over_low_bg_is_shadowed() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        // Low-priority plane behind (red), distinct from sprite color.
+        vdp.cram[1] = 0x000E; // red
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001); // low priority
+
+        // Normal (non-operator) low-priority sprite, palette 0 color 2 = gray.
+        vdp.cram[2] = SH_GRAY;
+        write_single_sprite(&mut vdp, 3, 0, false, 2);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "low-priority sprite over low-priority bg: winning pixel is shadowed"
+        );
+    }
+
+    #[test]
+    fn high_priority_sprite_is_normal() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        vdp.cram[2] = SH_GRAY;
+        // High-priority, non-operator sprite (palette 0 color 2).
+        write_single_sprite(&mut vdp, 3, 0, true, 2);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &normal,
+            "high-priority sprite renders at full normal color"
         );
     }
 }
