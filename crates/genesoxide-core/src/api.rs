@@ -7,6 +7,7 @@
 use crate::bus;
 use crate::cpu::execute::Bus;
 use crate::cpu::{self, Cpu};
+use crate::eeprom::Eeprom;
 use crate::io::ControllerPort;
 use crate::psg;
 use crate::rewind;
@@ -1375,6 +1376,10 @@ pub struct GenesisCoreSnapshot {
     pub z80_ram: Vec<u8>,
     /// Cartridge backup RAM (battery save) state.
     pub sram: CartSram,
+    /// Serial EEPROM (I2C 24Cxx) save state. Defaults to absent for save states
+    /// written before EEPROM support existed.
+    #[serde(default)]
+    pub eeprom: Eeprom,
     /// 68K ROM bank register.
     pub z80_bank: u32,
     /// 68K has requested the Z80 bus.
@@ -1697,6 +1702,8 @@ pub struct GenesisCore {
     rom_header: Option<RomHeader>,
     /// Cartridge backup RAM (battery save) state.
     sram: CartSram,
+    /// Serial EEPROM (I2C 24Cxx) save state, if the cart uses one.
+    eeprom: Eeprom,
     /// 64KB work RAM.
     work_ram: Box<[u8; 0x10000]>,
     /// Z80 CPU.
@@ -1974,6 +1981,7 @@ impl GenesisCore {
             mapper: Mapper::Flat,
             rom_header: None,
             sram: CartSram::empty(),
+            eeprom: Eeprom::empty(),
             work_ram: Box::new([0; 0x10000]),
             z80: z80::Z80::new(),
             z80_ram: Box::new([0; 0x2000]),
@@ -2226,6 +2234,40 @@ impl GenesisCore {
         self.sram.dirty = false;
     }
 
+    /// Returns the serial-EEPROM contents (empty when the cart has no EEPROM).
+    #[must_use]
+    pub fn eeprom_data(&self) -> &[u8] {
+        self.eeprom.data()
+    }
+
+    /// Returns true if the loaded ROM uses a serial EEPROM.
+    #[must_use]
+    pub fn has_eeprom(&self) -> bool {
+        self.eeprom.is_present()
+    }
+
+    /// Returns true if the EEPROM should be persisted to disk.
+    #[must_use]
+    pub fn eeprom_worth_saving(&self) -> bool {
+        self.eeprom.worth_saving()
+    }
+
+    /// Returns true if the EEPROM has been written since the last clear.
+    #[must_use]
+    pub fn eeprom_is_dirty(&self) -> bool {
+        self.eeprom.is_dirty()
+    }
+
+    /// Clears the EEPROM dirty flag (call after flushing the save to disk).
+    pub fn clear_eeprom_dirty(&mut self) {
+        self.eeprom.clear_dirty();
+    }
+
+    /// Loads persisted EEPROM bytes into the cartridge. Does not mark dirty.
+    pub fn load_eeprom(&mut self, bytes: &[u8]) {
+        self.eeprom.load(bytes);
+    }
+
     /// Returns the CPU program counter (debug).
     #[must_use]
     pub fn cpu_pc(&self) -> u32 {
@@ -2348,6 +2390,7 @@ impl GenesisCore {
             work_ram: self.work_ram.to_vec(),
             z80_ram: self.z80_ram.to_vec(),
             sram: self.sram.clone(),
+            eeprom: self.eeprom.clone(),
             z80_bank: self.z80_bank,
             z80_bus_requested: self.z80_bus_requested,
             z80_reset: self.z80_reset,
@@ -2380,6 +2423,7 @@ impl GenesisCore {
         self.work_ram.copy_from_slice(&snap.work_ram);
         self.z80_ram.copy_from_slice(&snap.z80_ram);
         self.sram = snap.sram.clone();
+        self.eeprom = snap.eeprom.clone();
         self.z80_bank = snap.z80_bank;
         self.z80_bus_requested = snap.z80_bus_requested;
         self.z80_reset = snap.z80_reset;
@@ -2467,6 +2511,13 @@ impl GenesisCore {
         // default). A newly loaded ROM starts with a fresh, empty save; the
         // host may repopulate it afterwards via `load_sram`.
         self.sram = CartSram::from_header(self.rom_header.as_ref());
+        // Serial EEPROM is matched from the ROM serial (mutually exclusive with
+        // SRAM per cart, but harmless if both are constructed — absent ones
+        // never claim a bus access).
+        self.eeprom = self
+            .rom_header
+            .as_ref()
+            .map_or_else(Eeprom::empty, Eeprom::for_rom);
         self.mapper = Mapper::for_rom(data.len());
         self.rom = data;
         // Derive the effective region (header, unless overridden) before the
@@ -2599,6 +2650,7 @@ impl GenesisCore {
             rom: &self.rom,
             mapper: &mut self.mapper,
             sram: &mut self.sram,
+            eeprom: &mut self.eeprom,
             work_ram: &mut self.work_ram,
             vdp: &mut self.vdp,
             port1: &mut self.port1,
@@ -2871,6 +2923,7 @@ impl GenesisCore {
                     rom: &self.rom,
                     mapper: &mut self.mapper,
                     sram: &mut self.sram,
+                    eeprom: &mut self.eeprom,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
                     port1: &mut self.port1,
@@ -2940,6 +2993,7 @@ impl GenesisCore {
                     rom: &self.rom,
                     mapper: &mut self.mapper,
                     sram: &mut self.sram,
+                    eeprom: &mut self.eeprom,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
                     port1: &mut self.port1,
@@ -3017,6 +3071,7 @@ impl GenesisCore {
                     rom: &self.rom,
                     mapper: &mut self.mapper,
                     sram: &mut self.sram,
+                    eeprom: &mut self.eeprom,
                     work_ram: &mut self.work_ram,
                     vdp: &self.vdp,
                     port1: &mut self.port1,
@@ -3056,6 +3111,7 @@ impl GenesisCore {
                 rom: &self.rom,
                 mapper: &mut self.mapper,
                 sram: &mut self.sram,
+                eeprom: &mut self.eeprom,
                 work_ram: &mut self.work_ram,
                 vdp: &self.vdp,
                 port1: &mut self.port1,
@@ -3354,6 +3410,9 @@ impl GenesisCore {
     fn read_byte(&self, addr: u32) -> u8 {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
+                if let Some(b) = self.eeprom.read(addr) {
+                    return b;
+                }
                 if let Some(b) = self.sram.read(addr) {
                     return b;
                 }
@@ -3417,7 +3476,9 @@ impl GenesisCore {
         }
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
-                let _ = self.sram.write(addr, val);
+                if !self.eeprom.write(addr, val) {
+                    let _ = self.sram.write(addr, val);
+                }
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -3452,8 +3513,12 @@ impl GenesisCore {
         }
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
-                let _ = self.sram.write(addr, (val >> 8) as u8);
-                let _ = self.sram.write(addr.wrapping_add(1), val as u8);
+                if !self.eeprom.write(addr, (val >> 8) as u8) {
+                    let _ = self.sram.write(addr, (val >> 8) as u8);
+                }
+                if !self.eeprom.write(addr.wrapping_add(1), val as u8) {
+                    let _ = self.sram.write(addr.wrapping_add(1), val as u8);
+                }
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -3594,6 +3659,7 @@ fn read_68k_byte(
     rom: &[u8],
     mapper: &Mapper,
     sram: &CartSram,
+    eeprom: &Eeprom,
     work_ram: &[u8; 0x10000],
     vdp: &Vdp,
     port1: &ControllerPort,
@@ -3605,6 +3671,11 @@ fn read_68k_byte(
 ) -> u8 {
     match bus::map_region(addr) {
         bus::BusRegion::CartridgeRom => {
+            // A serial EEPROM's SDA-out line overlaps the cartridge-ROM region;
+            // when the address decodes to it, the EEPROM wins.
+            if let Some(b) = eeprom.read(addr) {
+                return b;
+            }
             // SRAM overlaps the cartridge-ROM region; when mapped in, it wins.
             if let Some(b) = sram.read(addr) {
                 return b;
@@ -3683,6 +3754,7 @@ fn write_68k_byte(
     val: u8,
     mapper: &mut Mapper,
     sram: &mut CartSram,
+    eeprom: &mut Eeprom,
     work_ram: &mut [u8; 0x10000],
     port1: &mut ControllerPort,
     port2: &mut ControllerPort,
@@ -3712,8 +3784,12 @@ fn write_68k_byte(
     }
     match bus::map_region(addr) {
         bus::BusRegion::CartridgeRom => {
-            // Route writes that land in the SRAM window into backup RAM;
-            // anything else in the cartridge-ROM region is a dropped ROM write.
+            // A serial-EEPROM write (I2C bit-bang) takes priority when the
+            // address decodes to an EEPROM line; otherwise route into SRAM.
+            // Anything else in the cartridge-ROM region is a dropped ROM write.
+            if eeprom.write(addr, val) {
+                return;
+            }
             let _ = sram.write(addr, val);
         }
         bus::BusRegion::WorkRam => {
@@ -3789,6 +3865,7 @@ struct CoreBus<'a> {
     rom: &'a [u8],
     mapper: &'a mut Mapper,
     sram: &'a mut CartSram,
+    eeprom: &'a mut Eeprom,
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a mut Vdp,
     port1: &'a mut ControllerPort,
@@ -3834,6 +3911,7 @@ impl Bus for CoreBus<'_> {
             self.rom,
             self.mapper,
             self.sram,
+            self.eeprom,
             &**self.work_ram,
             self.vdp,
             self.port1,
@@ -3848,14 +3926,20 @@ impl Bus for CoreBus<'_> {
     fn read_word(&mut self, addr: u32) -> u16 {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
-                // Each byte lane may be backed by SRAM (when mapped in) or ROM.
+                // Each byte lane may be backed by the EEPROM SDA-out line, SRAM
+                // (when mapped in), or ROM.
                 let hi = self
-                    .sram
+                    .eeprom
                     .read(addr)
+                    .or_else(|| self.sram.read(addr))
                     .unwrap_or_else(|| rom_read_byte(self.rom, self.mapper, addr));
-                let lo = self.sram.read(addr.wrapping_add(1)).unwrap_or_else(|| {
-                    rom_read_byte(self.rom, self.mapper, addr.wrapping_add(1))
-                });
+                let lo = self
+                    .eeprom
+                    .read(addr.wrapping_add(1))
+                    .or_else(|| self.sram.read(addr.wrapping_add(1)))
+                    .unwrap_or_else(|| {
+                        rom_read_byte(self.rom, self.mapper, addr.wrapping_add(1))
+                    });
                 (u16::from(hi) << 8) | u16::from(lo)
             }
             bus::BusRegion::WorkRam => {
@@ -3955,6 +4039,7 @@ impl Bus for CoreBus<'_> {
             val,
             self.mapper,
             self.sram,
+            self.eeprom,
             &mut **self.work_ram,
             self.port1,
             self.port2,
@@ -3987,11 +4072,16 @@ impl Bus for CoreBus<'_> {
         }
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
-                // Route SRAM-window word writes into backup RAM (per byte lane).
+                // Route word writes to the EEPROM (I2C bit-bang) when the lane
+                // decodes to it, else into SRAM (per byte lane).
                 let hi = (val >> 8) as u8;
                 let lo = val as u8;
-                let _ = self.sram.write(addr, hi);
-                let _ = self.sram.write(addr.wrapping_add(1), lo);
+                if !self.eeprom.write(addr, hi) {
+                    let _ = self.sram.write(addr, hi);
+                }
+                if !self.eeprom.write(addr.wrapping_add(1), lo) {
+                    let _ = self.sram.write(addr.wrapping_add(1), lo);
+                }
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -4085,6 +4175,7 @@ struct Z80Bus<'a> {
     rom: &'a [u8],
     mapper: &'a mut Mapper,
     sram: &'a mut CartSram,
+    eeprom: &'a mut Eeprom,
     // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a Vdp,
@@ -4151,6 +4242,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                     self.rom,
                     self.mapper,
                     self.sram,
+                    self.eeprom,
                     &**self.work_ram,
                     self.vdp,
                     self.port1,
@@ -4198,6 +4290,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                     val,
                     self.mapper,
                     self.sram,
+                    self.eeprom,
                     &mut **self.work_ram,
                     self.port1,
                     self.port2,
@@ -4243,6 +4336,7 @@ mod tests {
             rom: &core.rom,
             mapper: &mut core.mapper,
             sram: &mut core.sram,
+            eeprom: &mut core.eeprom,
             work_ram: &mut core.work_ram,
             vdp: &mut core.vdp,
             port1: &mut core.port1,
@@ -4274,6 +4368,7 @@ mod tests {
             rom: &core.rom,
             mapper: &mut core.mapper,
             sram: &mut core.sram,
+            eeprom: &mut core.eeprom,
             work_ram: &mut core.work_ram,
             vdp: &core.vdp,
             port1: &mut core.port1,
