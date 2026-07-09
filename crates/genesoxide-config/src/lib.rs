@@ -82,6 +82,19 @@ pub struct DesktopConfig {
     /// Step mode: "frame", "cpu", or "scanline".
     #[serde(default = "default_step_mode")]
     pub step_mode: String,
+    /// Directory for cartridge battery saves (`.srm`). When `None`, the save
+    /// file is written next to the ROM.
+    #[serde(default)]
+    pub saves_dir: Option<String>,
+    /// Whether controller port 1 has a 6-button pad (`false` = 3-button).
+    /// Mirrors the core's pad-type notion locally so this crate does not depend
+    /// on `genesoxide-core`; the desktop frontend maps it into
+    /// `Command::SetPadType`.
+    #[serde(default = "default_true")]
+    pub pad1_six_button: bool,
+    /// Whether controller port 2 has a 6-button pad (`false` = 3-button).
+    #[serde(default = "default_true")]
+    pub pad2_six_button: bool,
 }
 
 impl Default for DesktopConfig {
@@ -91,12 +104,19 @@ impl Default for DesktopConfig {
             window_scale: default_scale(),
             audio_enabled: false,
             step_mode: default_step_mode(),
+            saves_dir: None,
+            pad1_six_button: default_true(),
+            pad2_six_button: default_true(),
         }
     }
 }
 
 fn default_scale() -> u32 {
     3
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_step_mode() -> String {
@@ -186,6 +206,35 @@ mod tests {
         assert_eq!(config.rewind.max_history_seconds, 10);
         // Unspecified fields fall back to defaults.
         assert_eq!(config.rewind.keyframe_base_interval, 60);
+    }
+
+    #[test]
+    fn saves_dir_defaults_to_none_and_parses() {
+        let config = GenesisConfig::default();
+        assert_eq!(config.desktop.saves_dir, None);
+
+        let toml = r#"
+            [desktop]
+            saves_dir = "/saves"
+        "#;
+        let config: GenesisConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.desktop.saves_dir.as_deref(), Some("/saves"));
+    }
+
+    #[test]
+    fn pad_type_defaults_to_six_button_and_parses() {
+        let config = GenesisConfig::default();
+        assert!(config.desktop.pad1_six_button);
+        assert!(config.desktop.pad2_six_button);
+
+        let toml = r#"
+            [desktop]
+            pad1_six_button = false
+        "#;
+        let config: GenesisConfig = toml::from_str(toml).unwrap();
+        assert!(!config.desktop.pad1_six_button);
+        // Unspecified port keeps the six-button default.
+        assert!(config.desktop.pad2_six_button);
     }
 
     #[test]

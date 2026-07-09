@@ -10,18 +10,27 @@ use crate::cpu::{self, Cpu};
 use crate::io::ControllerPort;
 use crate::psg;
 use crate::rewind;
-use crate::rom::{self, RomHeader};
+use crate::rom::{self, RomHeader, SramLayout};
 use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Scheduler};
 use crate::vdp::Vdp;
 use crate::ym2612;
 use crate::z80;
 use serde::{Deserialize, Serialize};
 
-/// Genesis visible frame width in pixels (H40 mode).
+/// Genesis visible frame width in pixels — the H40 maximum/default.
+///
+/// This is the widest mode (H40 = 320px) and is used for the physical
+/// framebuffer allocation and initial window sizing. The RUNTIME display width
+/// can be narrower (H32 = 256px); query it via
+/// [`CoreQuery::FramebufferDimensions`] / [`GenesisCore::framebuffer_dimensions`].
 pub const FRAME_WIDTH: usize = 320;
-/// Genesis visible frame height in pixels (NTSC).
+/// Genesis visible frame height in pixels (NTSC). Constant across H32/H40.
 pub const FRAME_HEIGHT: usize = 224;
-/// Framebuffer byte count for RGBA8 format.
+/// Framebuffer byte count for RGBA8 format at the H40 maximum (320x224x4).
+///
+/// This is the size of the physical backing buffer. The slice returned by
+/// [`GenesisCore::framebuffer_rgba`] is this length in H40 but shorter (256x224x4)
+/// in H32 — do not assume a fixed length; use the dimension query.
 pub const FRAME_RGBA_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
 /// NTSC frame rate in millihertz (59.92 Hz * 1000).
 pub const FPS_MILLI: u32 = 59_920;
@@ -53,6 +62,7 @@ const MAX_POST_DELAY_SAMPLES: usize = 4;
 
 /// Genesis controller button (re-exported from io module).
 pub use crate::io::Button;
+pub use crate::io::PadType;
 
 /// Post-mix analog/capture profile applied after raw YM2612/PSG synthesis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1016,6 +1026,9 @@ pub enum Command {
     PressButton { port: u8, button: Button },
     /// Release a single button.
     ReleaseButton { port: u8, button: Button },
+    /// Select the physical pad type on a port (`true` = 6-button, `false` =
+    /// 3-button).
+    SetPadType { port: u8, six_button: bool },
     /// Set emulation speed in permille (1000 = normal).
     SetSpeed(u16),
     /// Set audio output sample rate in Hz (e.g. 44100, 48000).
@@ -1051,6 +1064,9 @@ pub enum CoreQuery {
     FrameCounter,
     /// Rewind buffer status (frames available, memory used, window bounds).
     RewindStatus,
+    /// Current framebuffer dimensions `(width, height)` in pixels. Width tracks
+    /// the horizontal mode (320 in H40, 256 in H32); height is always 224.
+    FramebufferDimensions,
 }
 
 /// A complete, serializable snapshot of the deterministic emulation state.
@@ -1067,6 +1083,168 @@ pub enum CoreQuery {
 ///   do not affect CPU/VDP/frame determinism and are rebuilt on `restore`.
 ///
 /// Used both for save states and for the time-travel rewind timeline.
+/// Cartridge backup RAM (SRAM / battery save) state.
+///
+/// The SRAM window overlaps the cartridge-ROM address region (typically
+/// 0x200000-0x20FFFF). Reads/writes in `[start, end]` are routed here when
+/// `enabled`; otherwise the underlying ROM is seen. `enabled` is toggled by the
+/// SSF SRAM-enable register at 0xA130F1 (bit 0). A header that declares
+/// battery-backed SRAM leaves this permanently enabled by default; for ROMs
+/// with no header descriptor a default 32KB buffer is allocated but stays
+/// disabled until the first write into the standard 0x200000 window (mirroring
+/// Genesis Plus GX's header-less fallback), at which point it enables itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CartSram {
+    /// Backing bytes. Length is the number of addressable SRAM bytes.
+    pub data: Vec<u8>,
+    /// Whether SRAM is currently mapped over the ROM window.
+    pub enabled: bool,
+    /// True if the ROM header declared battery-backed SRAM.
+    pub has_battery: bool,
+    /// True if the header declared an SRAM descriptor (vs. header-less default).
+    pub header_declared: bool,
+    /// True once a header-less default buffer has actually been written.
+    pub touched: bool,
+    /// SRAM window start address (68000 space).
+    pub start: u32,
+    /// SRAM window end address (68000 space).
+    pub end: u32,
+    /// Byte-lane layout (Both / EvenOnly / OddOnly).
+    pub layout: SramLayout,
+    /// Set on every SRAM write; cleared by the host after flushing to disk.
+    pub dirty: bool,
+}
+
+/// Default header-less SRAM window (Genesis Plus GX convention).
+const DEFAULT_SRAM_START: u32 = 0x20_0000;
+const DEFAULT_SRAM_END: u32 = 0x20_FFFF;
+/// Default header-less SRAM size (32KB).
+const DEFAULT_SRAM_SIZE: usize = 0x8000;
+/// SSF SRAM write-enable register (odd byte of the 0xA130F0 word).
+const SSF_SRAM_ENABLE_ADDR: u32 = 0x00A1_30F1;
+
+impl CartSram {
+    /// A disabled, empty SRAM (used before a ROM is loaded).
+    fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            enabled: false,
+            has_battery: false,
+            header_declared: false,
+            touched: false,
+            start: DEFAULT_SRAM_START,
+            end: DEFAULT_SRAM_END,
+            layout: SramLayout::Both,
+            dirty: false,
+        }
+    }
+
+    /// Builds SRAM state for a freshly loaded ROM from its parsed header.
+    fn from_header(header: Option<&RomHeader>) -> Self {
+        match header {
+            Some(h) if h.has_sram && h.sram_end >= h.sram_start => {
+                let span = (h.sram_end - h.sram_start) as usize;
+                let byte_count = match h.sram_layout {
+                    SramLayout::Both => span + 1,
+                    SramLayout::EvenOnly | SramLayout::OddOnly => span / 2 + 1,
+                };
+                Self {
+                    data: vec![0; byte_count.max(1)],
+                    // Header-declared SRAM is mapped from power-on so it works
+                    // without an explicit 0xA130F1 enable write.
+                    enabled: true,
+                    has_battery: true,
+                    header_declared: true,
+                    touched: false,
+                    start: h.sram_start,
+                    end: h.sram_end,
+                    layout: h.sram_layout,
+                    dirty: false,
+                }
+            }
+            _ => Self {
+                // Header-less fallback: allocate a default 32KB buffer at the
+                // standard window but keep it disabled until first accessed.
+                data: vec![0; DEFAULT_SRAM_SIZE],
+                enabled: false,
+                has_battery: false,
+                header_declared: false,
+                touched: false,
+                start: DEFAULT_SRAM_START,
+                end: DEFAULT_SRAM_END,
+                layout: SramLayout::Both,
+                dirty: false,
+            },
+        }
+    }
+
+    /// Maps a 68000 address in the SRAM window to a backing-byte index,
+    /// honoring the byte-lane layout. Returns `None` if the address is outside
+    /// the window or on a lane the SRAM does not back.
+    fn index_of(&self, addr: u32) -> Option<usize> {
+        if addr < self.start || addr > self.end {
+            return None;
+        }
+        let off = addr - self.start;
+        let idx = match self.layout {
+            SramLayout::Both => off as usize,
+            SramLayout::EvenOnly => {
+                if addr & 1 != 0 {
+                    return None;
+                }
+                (off >> 1) as usize
+            }
+            SramLayout::OddOnly => {
+                if addr & 1 == 0 {
+                    return None;
+                }
+                (off >> 1) as usize
+            }
+        };
+        (idx < self.data.len()).then_some(idx)
+    }
+
+    /// Returns the SRAM byte at `addr` if it is enabled and in range.
+    fn read(&self, addr: u32) -> Option<u8> {
+        if !self.enabled {
+            return None;
+        }
+        self.index_of(addr).map(|i| self.data[i])
+    }
+
+    /// Attempts a byte write. Enables a header-less buffer on first touch.
+    /// Returns true if the write landed in SRAM (and it should not fall
+    /// through to the dropped-ROM-write path).
+    fn write(&mut self, addr: u32, val: u8) -> bool {
+        if addr < self.start || addr > self.end {
+            return false;
+        }
+        // Header-less SRAM enables itself on first write into the window.
+        if !self.enabled {
+            if self.header_declared {
+                // Explicitly banked out via 0xA130F1 — ignore ROM-window writes.
+                return false;
+            }
+            self.enabled = true;
+        }
+        if !self.header_declared {
+            self.touched = true;
+        }
+        if let Some(i) = self.index_of(addr) {
+            self.data[i] = val;
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if this SRAM holds data worth persisting to a `.srm` file.
+    fn worth_saving(&self) -> bool {
+        self.has_battery || self.touched
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenesisCoreSnapshot {
     /// 68000 CPU register state.
@@ -1081,6 +1259,8 @@ pub struct GenesisCoreSnapshot {
     pub work_ram: Vec<u8>,
     /// 8KB Z80 RAM.
     pub z80_ram: Vec<u8>,
+    /// Cartridge backup RAM (battery save) state.
+    pub sram: CartSram,
     /// 68K ROM bank register.
     pub z80_bank: u32,
     /// 68K has requested the Z80 bus.
@@ -1379,6 +1559,8 @@ pub struct GenesisCore {
     rom: Vec<u8>,
     /// Parsed ROM header (if loaded).
     rom_header: Option<RomHeader>,
+    /// Cartridge backup RAM (battery save) state.
+    sram: CartSram,
     /// 64KB work RAM.
     work_ram: Box<[u8; 0x10000]>,
     /// Z80 CPU.
@@ -1642,6 +1824,7 @@ impl GenesisCore {
             port2: ControllerPort::new(),
             rom: Vec::new(),
             rom_header: None,
+            sram: CartSram::empty(),
             work_ram: Box::new([0; 0x10000]),
             z80: z80::Z80::new(),
             z80_ram: Box::new([0; 0x2000]),
@@ -1744,6 +1927,14 @@ impl GenesisCore {
             Command::ReleaseButton { port, button } => {
                 self.controller_port_mut(port).release(button);
             }
+            Command::SetPadType { port, six_button } => {
+                let pad_type = if six_button {
+                    PadType::SixButton
+                } else {
+                    PadType::ThreeButton
+                };
+                self.controller_port_mut(port).set_pad_type(pad_type);
+            }
             Command::SetSpeed(s) => self.speed_permille = s,
             Command::SetAudioSampleRate(rate) => {
                 self.audio_sample_rate = f64::from(rate);
@@ -1773,9 +1964,23 @@ impl GenesisCore {
     }
 
     /// Returns a reference to the RGBA framebuffer.
+    ///
+    /// The slice is the native display width for the current mode: 320x224 in
+    /// H40, 256x224 in H32 (packed with a row stride equal to the active width).
+    /// Frontends should query [`GenesisCore::framebuffer_dimensions`] to learn
+    /// the current dimensions rather than assuming a fixed width.
     #[must_use]
     pub fn framebuffer_rgba(&self) -> &[u8] {
         self.vdp.framebuffer()
+    }
+
+    /// Returns the current framebuffer dimensions `(width, height)` in pixels.
+    ///
+    /// Width follows the VDP horizontal mode (320 in H40, 256 in H32); height
+    /// is always 224 (NTSC). Answers [`CoreQuery::FramebufferDimensions`].
+    #[must_use]
+    pub fn framebuffer_dimensions(&self) -> (u32, u32) {
+        (u32::from(self.vdp.display_width()), FRAME_HEIGHT as u32)
     }
 
     /// Returns the frame counter.
@@ -1818,6 +2023,47 @@ impl GenesisCore {
     #[must_use]
     pub fn paused(&self) -> bool {
         self.paused
+    }
+
+    /// Returns the cartridge SRAM (battery save) contents.
+    #[must_use]
+    pub fn sram(&self) -> &[u8] {
+        &self.sram.data
+    }
+
+    /// Returns true if the loaded ROM declares battery-backed SRAM.
+    #[must_use]
+    pub fn has_battery_sram(&self) -> bool {
+        self.sram.has_battery
+    }
+
+    /// Returns true if the SRAM should be persisted to disk (battery-backed,
+    /// or a header-less buffer that has actually been written).
+    #[must_use]
+    pub fn sram_worth_saving(&self) -> bool {
+        self.sram.worth_saving()
+    }
+
+    /// Returns true if SRAM has been written since the last `clear_sram_dirty`.
+    #[must_use]
+    pub fn sram_is_dirty(&self) -> bool {
+        self.sram.dirty
+    }
+
+    /// Clears the SRAM dirty flag (call after flushing the save to disk).
+    pub fn clear_sram_dirty(&mut self) {
+        self.sram.dirty = false;
+    }
+
+    /// Loads persisted SRAM bytes into the cartridge backup RAM.
+    ///
+    /// Copies up to the allocated SRAM length; extra bytes are ignored and a
+    /// short buffer leaves the remaining bytes zeroed. Does not mark the SRAM
+    /// dirty (the on-disk copy is already current).
+    pub fn load_sram(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.sram.data.len());
+        self.sram.data[..n].copy_from_slice(&bytes[..n]);
+        self.sram.dirty = false;
     }
 
     /// Returns the CPU program counter (debug).
@@ -1941,6 +2187,7 @@ impl GenesisCore {
             z80: self.z80.snapshot(),
             work_ram: self.work_ram.to_vec(),
             z80_ram: self.z80_ram.to_vec(),
+            sram: self.sram.clone(),
             z80_bank: self.z80_bank,
             z80_bus_requested: self.z80_bus_requested,
             z80_reset: self.z80_reset,
@@ -1968,6 +2215,7 @@ impl GenesisCore {
         self.z80.restore(&snap.z80);
         self.work_ram.copy_from_slice(&snap.work_ram);
         self.z80_ram.copy_from_slice(&snap.z80_ram);
+        self.sram = snap.sram.clone();
         self.z80_bank = snap.z80_bank;
         self.z80_bus_requested = snap.z80_bus_requested;
         self.z80_reset = snap.z80_reset;
@@ -2044,6 +2292,10 @@ impl GenesisCore {
 
     fn load_rom(&mut self, data: Vec<u8>) {
         self.rom_header = rom::parse_header(&data).ok();
+        // Allocate/size cartridge SRAM from the header (or a header-less
+        // default). A newly loaded ROM starts with a fresh, empty save; the
+        // host may repopulate it afterwards via `load_sram`.
+        self.sram = CartSram::from_header(self.rom_header.as_ref());
         self.rom = data;
         self.power_cycle();
     }
@@ -2104,6 +2356,7 @@ impl GenesisCore {
         // Build a bus wrapper that borrows the non-CPU fields.
         let mut bus = CoreBus {
             rom: &self.rom,
+            sram: &mut self.sram,
             work_ram: &mut self.work_ram,
             vdp: &mut self.vdp,
             port1: &mut self.port1,
@@ -2129,6 +2382,10 @@ impl GenesisCore {
         let cycles_u64 = u64::from(cycles);
         self.cpu.cycles += cycles_u64;
         self.scheduler.advance_cpu(cycles_u64);
+        // Advance the controllers' 6-button idle timers so a stalled TH poll
+        // resets its phase counter after ~1.5 ms of no TH activity.
+        self.port1.advance_cycles(cycles);
+        self.port2.advance_cycles(cycles);
     }
 
     fn step_cpu(&mut self) {
@@ -2140,6 +2397,20 @@ impl GenesisCore {
         // Run instructions until we've consumed enough cycles.
         let target = self.cpu.cycles + 488;
         while self.cpu.cycles < target {
+            // Stall the 68000 while the VDP holds the bus (DMA in flight):
+            // burn the remaining DMA-busy budget as CPU cycles rather than
+            // running an instruction. This matches hardware where a 68K→VRAM
+            // DMA / VRAM fill / VRAM copy freezes the CPU off the bus for the
+            // transfer's duration.
+            let busy = self.vdp.dma_busy_cpu_cycles();
+            if busy > 0 {
+                let remaining = target - self.cpu.cycles;
+                let stall = u64::from(busy).min(remaining);
+                self.cpu.cycles += stall;
+                self.scheduler.advance_cpu(stall);
+                self.vdp.advance_dma_busy(stall as u32);
+                continue;
+            }
             self.step_cpu();
             // After each instruction, check if DMA is pending
             if self.vdp.dma_pending() {
@@ -2155,6 +2426,16 @@ impl GenesisCore {
         let target = self.cpu.cycles + 488;
         let cpu_cycle_base = self.cpu.cycles;
         while self.cpu.cycles < target {
+            // See comment in `step_scanline` — stall the 68000 during DMA.
+            let busy = self.vdp.dma_busy_cpu_cycles();
+            if busy > 0 {
+                let remaining = target - self.cpu.cycles;
+                let stall = u64::from(busy).min(remaining);
+                self.cpu.cycles += stall;
+                self.scheduler.advance_cpu(stall);
+                self.vdp.advance_dma_busy(stall as u32);
+                continue;
+            }
             let instruction_tick =
                 scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
             self.step_cpu_at(scanline, instruction_tick);
@@ -2227,6 +2508,36 @@ impl GenesisCore {
             // This handles tight bus polling loops where the 68K requests/releases
             // the bus multiple times per scanline — the Z80 must get cycles in the
             // brief release windows or the SMPS sound driver handshake deadlocks.
+            //
+            // KNOWN LIMITATION (BUSREQ granularity — deferred, see below).
+            // Arbitration is sampled once per scanline: the 68000 runs the whole
+            // scanline first, then the Z80 runs a full 228 T-states in one shot if
+            // it got the bus at any point. The sticky `z80_bus_released_this_scanline`
+            // flag therefore over-grants Z80 time when the 68000 held BUSREQ for
+            // most of the scanline and released it only briefly — the Z80 still gets
+            // all 228 cycles, feeding the FM/PSG write timeline slightly too much
+            // Z80 time (flagged by PR #3). Finer, sub-scanline arbitration was
+            // assessed and intentionally deferred rather than implemented, because:
+            //
+            //   1. No available test exercises the real 68000<->Z80 SMPS handshake
+            //      this flag protects: the Sonic ROM (the designated end-to-end
+            //      guard) is absent here, so `sonic_boot` and `audio_golden` skip,
+            //      and `vgm_playback` feeds the sound chips directly, bypassing Z80
+            //      bus arbitration entirely. Changing this delicate code blind to
+            //      its guard risks silently reintroducing the documented deadlock.
+            //   2. Interleaving 68000/Z80 stepping per sub-scanline slice would
+            //      multiply the existing per-stream master_tick ordering violation
+            //      in the audio write trace. `synthesize_audio_interval` merges the
+            //      YM and PSG streams assuming each is monotonic in master_tick
+            //      within a scanline; finer interleaving of the CPU- and Z80-timed
+            //      writes would mis-order register writes and could DEGRADE audio —
+            //      the opposite of the intended payoff — and fixing it properly
+            //      reaches into the separately-owned audio-synthesis timeline.
+            //   3. The payoff is modest: more accurate sub-scanline FM/PSG write
+            //      timestamps, not game-logic correctness. The cost/risk (an
+            //      unvalidatable change to deadlock-sensitive, audio-timeline code)
+            //      outweighs it. Revisit once a real-driver regression guard (a
+            //      bootable Sonic/SMPS ROM through the Z80 path) is available.
             let z80_gets_cycles =
                 !self.z80_reset && (!self.z80_bus_requested || self.z80_bus_released_this_scanline);
             if z80_gets_cycles {
@@ -2240,6 +2551,7 @@ impl GenesisCore {
                     scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                 let mut bus = CoreBus {
                     rom: &self.rom,
+                    sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
                     port1: &mut self.port1,
@@ -2270,7 +2582,7 @@ impl GenesisCore {
                 self.vdp.render_scanline(scanline);
             }
 
-            // At scanline 224: enter V-blank and fire V-blank interrupt
+            // At scanline 224: enter V-blank and latch the V-blank interrupt.
             if scanline == ACTIVE_SCANLINES {
                 self.vdp.set_vblank(true);
                 // Assert Z80 INT — the Genesis directly connects this to V-blank.
@@ -2278,37 +2590,56 @@ impl GenesisCore {
                 // IFF1 is enabled (the SMPS driver relies on this for music updates).
                 self.z80.int_line = true;
 
-                // Fire level 6 interrupt if V-interrupt is enabled (reg 1, bit 5)
-                let vint_enabled = self.vdp.read_register(1) & 0x20 != 0;
-                if vint_enabled {
-                    let cpu_master_tick =
-                        scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
-                    let mut bus = CoreBus {
-                        rom: &self.rom,
-                        work_ram: &mut self.work_ram,
-                        vdp: &mut self.vdp,
-                        port1: &mut self.port1,
-                        port2: &mut self.port2,
-                        z80_ram: &mut self.z80_ram,
-                        z80_bus_requested: &mut self.z80_bus_requested,
-                        z80_reset: &mut self.z80_reset,
-                        z80_reset_pending: &mut self.z80_reset_pending,
-                        z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
-                        ym2612: &mut self.ym2612,
-                        psg: &mut self.psg,
-                        z80_cmd_trace: &mut self.z80_cmd_trace,
-                        z80_driver_write_count: &mut self.z80_driver_write_count,
-                        z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
-                        ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
-                        psg_timed_write_trace: &mut self.psg_timed_write_trace,
-                        frame_count: self.frame_count,
-                        scanline,
-                        master_tick: cpu_master_tick,
-                    };
-                    let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
-                    self.cpu.cycles += u64::from(cycles);
-                    self.scheduler.advance_cpu(u64::from(cycles));
+                // Latch the V-interrupt-pending (VIP) flag if the V-interrupt is
+                // enabled (reg 1, bit 5). Delivery is attempted below and on every
+                // subsequent scanline, so a VInt raised while the 68000 is inside a
+                // mask-7 critical section is taken the moment the mask drops rather
+                // than being silently lost. SGDK disables interrupts for several
+                // frames during boot; without this latch its V-blank-driven tilemap
+                // / DMA-queue flush never runs and the screen stays black.
+                if self.vdp.read_register(1) & 0x20 != 0 {
+                    self.vdp.set_vint_pending();
                 }
+            }
+
+            // Deliver a latched V-interrupt (level 6) as soon as the CPU's
+            // interrupt mask allows it. The IPL lines are level-triggered on
+            // hardware, so a pending VInt persists across scanlines (and frames)
+            // until taken; `deliver_interrupt` sets the mask to 6 on entry which
+            // stops it re-firing until the next V-blank re-latches VIP.
+            if self.vdp.vint_pending()
+                && self.vdp.read_register(1) & 0x20 != 0
+                && self.cpu.sr.interrupt_mask() < 6
+            {
+                self.vdp.clear_vint_pending();
+                let cpu_master_tick =
+                    scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
+                let mut bus = CoreBus {
+                    rom: &self.rom,
+                    sram: &mut self.sram,
+                    work_ram: &mut self.work_ram,
+                    vdp: &mut self.vdp,
+                    port1: &mut self.port1,
+                    port2: &mut self.port2,
+                    z80_ram: &mut self.z80_ram,
+                    z80_bus_requested: &mut self.z80_bus_requested,
+                    z80_reset: &mut self.z80_reset,
+                    z80_reset_pending: &mut self.z80_reset_pending,
+                    z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
+                    ym2612: &mut self.ym2612,
+                    psg: &mut self.psg,
+                    z80_cmd_trace: &mut self.z80_cmd_trace,
+                    z80_driver_write_count: &mut self.z80_driver_write_count,
+                    z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
+                    ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
+                    psg_timed_write_trace: &mut self.psg_timed_write_trace,
+                    frame_count: self.frame_count,
+                    scanline,
+                    master_tick: cpu_master_tick,
+                };
+                let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
+                self.cpu.cycles += u64::from(cycles);
+                self.scheduler.advance_cpu(u64::from(cycles));
             }
 
             let ym_writes = self.ym2612_timed_write_trace[ym_trace_start..].to_vec();
@@ -2359,9 +2690,21 @@ impl GenesisCore {
                 let mut bus = Z80Bus {
                     z80_ram: &mut self.z80_ram,
                     rom: &self.rom,
+                    sram: &mut self.sram,
+                    work_ram: &mut self.work_ram,
+                    vdp: &self.vdp,
+                    port1: &mut self.port1,
+                    port2: &mut self.port2,
                     z80_bank: &mut self.z80_bank,
+                    z80_bus_requested: &mut self.z80_bus_requested,
+                    z80_reset: &mut self.z80_reset,
+                    z80_reset_pending: &mut self.z80_reset_pending,
+                    z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                     ym2612: &mut self.ym2612,
                     psg: &mut self.psg,
+                    z80_cmd_trace: &mut self.z80_cmd_trace,
+                    z80_driver_write_count: &mut self.z80_driver_write_count,
+                    z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
                     ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
                     psg_timed_write_trace: &mut self.psg_timed_write_trace,
                     frame_count: self.frame_count,
@@ -2384,9 +2727,21 @@ impl GenesisCore {
             let mut bus = Z80Bus {
                 z80_ram: &mut self.z80_ram,
                 rom: &self.rom,
+                sram: &mut self.sram,
+                work_ram: &mut self.work_ram,
+                vdp: &self.vdp,
+                port1: &mut self.port1,
+                port2: &mut self.port2,
                 z80_bank: &mut self.z80_bank,
+                z80_bus_requested: &mut self.z80_bus_requested,
+                z80_reset: &mut self.z80_reset,
+                z80_reset_pending: &mut self.z80_reset_pending,
+                z80_bus_released_this_scanline: &mut self.z80_bus_released_this_scanline,
                 ym2612: &mut self.ym2612,
                 psg: &mut self.psg,
+                z80_cmd_trace: &mut self.z80_cmd_trace,
+                z80_driver_write_count: &mut self.z80_driver_write_count,
+                z80_driver_last_write_frame: &mut self.z80_driver_last_write_frame,
                 ym2612_timed_write_trace: &mut self.ym2612_timed_write_trace,
                 psg_timed_write_trace: &mut self.psg_timed_write_trace,
                 frame_count: self.frame_count,
@@ -2669,6 +3024,9 @@ impl GenesisCore {
     fn read_byte(&self, addr: u32) -> u8 {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
+                if let Some(b) = self.sram.read(addr) {
+                    return b;
+                }
                 let offset = (addr & 0x3FFFFF) as usize;
                 self.rom.get(offset).copied().unwrap_or(0)
             }
@@ -2688,9 +3046,18 @@ impl GenesisCore {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
-                // Since Z80 is not emulated, bus is always available.
-                0x00
+                // Z80 BUSREQ status at 0xA11100/0xA11101: bit 0 = 0 means the bus
+                // has been granted to the 68000, bit 0 = 1 means the Z80 still owns
+                // it. Mirror the live CoreBus read path (mask `& 0xFFFF`, register
+                // 0x1100..=0x1101) so this debug bus reports the real arbitration
+                // state instead of a fixed value.
+                let reg = addr & 0xFFFF;
+                match reg {
+                    0x1100..=0x1101 => {
+                        if self.z80_bus_requested { 0x00 } else { 0x01 }
+                    }
+                    _ => 0x00,
+                }
             }
             bus::BusRegion::Vdp => {
                 // VDP byte reads: return high or low byte of word read
@@ -2715,7 +3082,14 @@ impl GenesisCore {
     /// Writes a byte to the bus.
     #[allow(dead_code)]
     fn write_byte_bus(&mut self, addr: u32, val: u8) {
+        if addr == SSF_SRAM_ENABLE_ADDR {
+            self.sram.enabled = val & 0x01 != 0;
+            return;
+        }
         match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                let _ = self.sram.write(addr, val);
+            }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = val;
@@ -2740,7 +3114,15 @@ impl GenesisCore {
     /// Writes a big-endian u16 to the bus.
     #[allow(dead_code)]
     fn write_word_bus(&mut self, addr: u32, val: u16) {
+        if addr == SSF_SRAM_ENABLE_ADDR & !1 || addr == SSF_SRAM_ENABLE_ADDR {
+            self.sram.enabled = (val as u8) & 0x01 != 0;
+            return;
+        }
         match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                let _ = self.sram.write(addr, (val >> 8) as u8);
+                let _ = self.sram.write(addr.wrapping_add(1), val as u8);
+            }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = (val >> 8) as u8;
@@ -2773,11 +3155,244 @@ impl GenesisCore {
     }
 }
 
+/// Timing context needed to record FM/PSG writes into the audio write trace.
+///
+/// Bundled so the shared [`write_68k_byte`] helper can push accurately-timed
+/// YM2612/PSG writes regardless of whether the write came from the 68000 or
+/// the Z80's banked window.
+struct AudioTraceCtx<'a> {
+    ym2612_timed_write_trace: &'a mut Vec<TimedYm2612Write>,
+    psg_timed_write_trace: &'a mut Vec<TimedPsgWrite>,
+    frame_count: u64,
+    scanline: u16,
+    master_tick: u64,
+}
+
+impl AudioTraceCtx<'_> {
+    fn record_ym2612(&mut self, ym2612: &mut ym2612::Ym2612, port: u8, value: u8) {
+        let addr = ym2612.latched_address(port);
+        self.ym2612_timed_write_trace.push(TimedYm2612Write {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            port,
+            addr,
+            value,
+        });
+        ym2612.write_data(port, value);
+    }
+
+    fn record_psg(&mut self, psg: &mut psg::Psg, value: u8) {
+        self.psg_timed_write_trace.push(TimedPsgWrite {
+            master_tick: self.master_tick,
+            frame: self.frame_count,
+            scanline: self.scanline,
+            value,
+        });
+        psg.write(value);
+    }
+}
+
+/// Reads one byte of the 68000's 24-bit address space.
+///
+/// This is the single source of truth for 68000 byte-level memory mapping.
+/// It is shared by the 68000 CPU bus ([`CoreBus::read_byte`]) and the Z80's
+/// banked `0x8000-0xFFFF` window, so both observe an identical view of ROM,
+/// work RAM, the VDP, I/O and the sound chips. All references are read-only;
+/// the mapping performs no CPU re-entry, so routing the Z80 window here can
+/// never recurse into either CPU.
+#[allow(clippy::too_many_arguments)]
+fn read_68k_byte(
+    addr: u32,
+    rom: &[u8],
+    sram: &CartSram,
+    work_ram: &[u8; 0x10000],
+    vdp: &Vdp,
+    port1: &ControllerPort,
+    port2: &ControllerPort,
+    z80_ram: &[u8; 0x2000],
+    ym2612: &ym2612::Ym2612,
+    z80_bus_requested: bool,
+) -> u8 {
+    match bus::map_region(addr) {
+        bus::BusRegion::CartridgeRom => {
+            // SRAM overlaps the cartridge-ROM region; when mapped in, it wins.
+            if let Some(b) = sram.read(addr) {
+                return b;
+            }
+            let offset = (addr & 0x3FFFFF) as usize;
+            rom.get(offset).copied().unwrap_or(0)
+        }
+        bus::BusRegion::WorkRam => {
+            let offset = (addr & 0xFFFF) as usize;
+            work_ram[offset]
+        }
+        bus::BusRegion::IoRegisters => {
+            let reg = (addr & 0x1F) as u8;
+            match reg {
+                0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
+                0x02 | 0x03 => port1.read_data(),
+                0x04 | 0x05 => port2.read_data(),
+                0x08 | 0x09 => port1.read_ctrl(),
+                0x0A | 0x0B => port2.read_ctrl(),
+                _ => 0,
+            }
+        }
+        bus::BusRegion::Z80Area => {
+            let z80_addr = addr & 0xFFFF;
+            match z80_addr {
+                0x0000..=0x1FFF => z80_ram[z80_addr as usize],
+                0x2000..=0x3FFF => z80_ram[(z80_addr & 0x1FFF) as usize],
+                0x4000..=0x4003 => ym2612.read_status(),
+                _ => 0xFF,
+            }
+        }
+        bus::BusRegion::ControlRegisters => {
+            // Mask to the 0xA1xxxx register offset, matching the write path's
+            // `addr & 0xFFFF` convention. The Z80 BUSREQ register lives at
+            // 0xA11100/0xA11101, so a `& 0x01FF` mask (offset 0x100) does NOT
+            // land in 0x0000..=0x0001 — using it silently dropped every BUSREQ
+            // read to the fallback, so `Z80_isBusTaken()` always saw "taken" and
+            // SGDK's bus-release wait spun forever (black screen).
+            let reg = addr & 0xFFFF;
+            match reg {
+                // BUSREQ status (bit 0): 0 = bus granted to the 68000, 1 = Z80
+                // still owns the bus.
+                0x1100..=0x1101 => {
+                    if z80_bus_requested { 0x00 } else { 0x01 }
+                }
+                _ => 0x00,
+            }
+        }
+        bus::BusRegion::Vdp => {
+            let vdp_addr = addr & 0x1F;
+            match vdp_addr {
+                0x04 | 0x06 => {
+                    let status = vdp.read_status();
+                    if addr & 1 == 0 {
+                        (status >> 8) as u8
+                    } else {
+                        status as u8
+                    }
+                }
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Writes one byte to the 68000's 24-bit address space.
+///
+/// The write-side counterpart to [`read_68k_byte`] and the single source of
+/// truth for 68000 byte-level write mapping, shared by [`CoreBus::write_byte`]
+/// and the Z80's banked window. Like the read path it performs only flat field
+/// access (never re-enters a CPU), so the Z80 banking to its own area
+/// (`0xA00000`) or its control ports resolves sanely without recursion.
+#[allow(clippy::too_many_arguments)]
+fn write_68k_byte(
+    addr: u32,
+    val: u8,
+    sram: &mut CartSram,
+    work_ram: &mut [u8; 0x10000],
+    port1: &mut ControllerPort,
+    port2: &mut ControllerPort,
+    z80_ram: &mut [u8; 0x2000],
+    ym2612: &mut ym2612::Ym2612,
+    psg: &mut psg::Psg,
+    z80_bus_requested: &mut bool,
+    z80_reset: &mut bool,
+    z80_reset_pending: &mut bool,
+    z80_bus_released_this_scanline: &mut bool,
+    z80_cmd_trace: &mut Vec<(u64, u8)>,
+    z80_driver_write_count: &mut u32,
+    z80_driver_last_write_frame: &mut u64,
+    trace: &mut AudioTraceCtx,
+) {
+    // SSF SRAM-enable register at 0xA130F1 (bit 0). Maps to `Unmapped` in
+    // `bus::map_region`, so special-case it before the region match.
+    if addr == SSF_SRAM_ENABLE_ADDR {
+        sram.enabled = val & 0x01 != 0;
+        return;
+    }
+    match bus::map_region(addr) {
+        bus::BusRegion::CartridgeRom => {
+            // Route writes that land in the SRAM window into backup RAM;
+            // anything else in the cartridge-ROM region is a dropped ROM write.
+            let _ = sram.write(addr, val);
+        }
+        bus::BusRegion::WorkRam => {
+            let offset = (addr & 0xFFFF) as usize;
+            work_ram[offset] = val;
+        }
+        bus::BusRegion::IoRegisters => {
+            let reg = (addr & 0x1F) as u8;
+            match reg {
+                0x02 | 0x03 => port1.write_data(val),
+                0x04 | 0x05 => port2.write_data(val),
+                0x08 | 0x09 => port1.write_ctrl(val),
+                0x0A | 0x0B => port2.write_ctrl(val),
+                _ => {}
+            }
+        }
+        bus::BusRegion::Z80Area => {
+            let z80_addr = addr & 0xFFFF;
+            match z80_addr {
+                0x0000..=0x1FFF => {
+                    if z80_addr == 0x1FFF && z80_cmd_trace.len() < 100 {
+                        z80_cmd_trace.push((trace.frame_count, val));
+                    }
+                    if z80_addr <= 0x00FF {
+                        *z80_driver_write_count += 1;
+                        *z80_driver_last_write_frame = trace.frame_count;
+                    }
+                    z80_ram[z80_addr as usize] = val;
+                }
+                0x2000..=0x3FFF => z80_ram[(z80_addr & 0x1FFF) as usize] = val,
+                0x4000 => ym2612.write_address(0, val),
+                0x4001 => trace.record_ym2612(ym2612, 0, val),
+                0x4002 => ym2612.write_address(1, val),
+                0x4003 => trace.record_ym2612(ym2612, 1, val),
+                _ => {}
+            }
+        }
+        bus::BusRegion::ControlRegisters => {
+            let reg = addr & 0xFFFF;
+            match reg {
+                0x1100..=0x1101 => {
+                    let new_req = val & 0x01 != 0;
+                    if *z80_bus_requested && !new_req {
+                        *z80_bus_released_this_scanline = true;
+                    }
+                    *z80_bus_requested = new_req;
+                }
+                0x1200..=0x1201 => {
+                    let new_reset = val & 0x01 == 0;
+                    if *z80_reset && !new_reset {
+                        *z80_reset_pending = true;
+                    }
+                    *z80_reset = new_reset;
+                }
+                _ => {}
+            }
+        }
+        bus::BusRegion::Vdp => {
+            let vdp_addr = addr & 0x1F;
+            match vdp_addr {
+                0x11 | 0x13 | 0x15 | 0x17 => trace.record_psg(psg, val),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Bus wrapper that borrows non-CPU fields from [`GenesisCore`],
 /// allowing the CPU executor to access memory without conflicting
 /// with the mutable borrow of the CPU.
 struct CoreBus<'a> {
     rom: &'a [u8],
+    sram: &'a mut CartSram,
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a mut Vdp,
     port1: &'a mut ControllerPort,
@@ -2812,86 +3427,35 @@ impl CoreBus<'_> {
         });
         self.ym2612.write_data(port, value);
     }
-
-    fn write_psg(&mut self, value: u8) {
-        self.psg_timed_write_trace.push(TimedPsgWrite {
-            master_tick: self.master_tick,
-            frame: self.frame_count,
-            scanline: self.scanline,
-            value,
-        });
-        self.psg.write(value);
-    }
 }
 
 impl Bus for CoreBus<'_> {
     fn read_byte(&mut self, addr: u32) -> u8 {
-        match bus::map_region(addr) {
-            bus::BusRegion::CartridgeRom => {
-                let offset = (addr & 0x3FFFFF) as usize;
-                self.rom.get(offset).copied().unwrap_or(0)
-            }
-            bus::BusRegion::WorkRam => {
-                let offset = (addr & 0xFFFF) as usize;
-                self.work_ram[offset]
-            }
-            bus::BusRegion::IoRegisters => {
-                let reg = (addr & 0x1F) as u8;
-                match reg {
-                    0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
-                    0x02 | 0x03 => self.port1.read_data(),
-                    0x04 | 0x05 => self.port2.read_data(),
-                    0x08 | 0x09 => self.port1.read_ctrl(),
-                    0x0A | 0x0B => self.port2.read_ctrl(),
-                    _ => 0,
-                }
-            }
-            bus::BusRegion::Z80Area => {
-                let z80_addr = addr & 0xFFFF;
-                match z80_addr {
-                    0x0000..=0x1FFF => self.z80_ram[z80_addr as usize],
-                    0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize],
-                    0x4000..=0x4003 => self.ym2612.read_status(),
-                    _ => 0xFF,
-                }
-            }
-            bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
-                let offset = addr & 0x01FF;
-                match offset {
-                    0x0000..=0x0001 => {
-                        // Return bus status: if bus was requested and Z80 is idle,
-                        // bit 0 = 0 means bus granted
-                        if *self.z80_bus_requested { 0x00 } else { 0x01 }
-                    }
-                    _ => 0x00,
-                }
-            }
-            bus::BusRegion::Vdp => {
-                let vdp_addr = addr & 0x1F;
-                match vdp_addr {
-                    0x04 | 0x06 => {
-                        let status = self.vdp.read_status();
-                        if addr & 1 == 0 {
-                            (status >> 8) as u8
-                        } else {
-                            status as u8
-                        }
-                    }
-                    _ => 0,
-                }
-            }
-            _ => 0,
-        }
+        read_68k_byte(
+            addr,
+            self.rom,
+            self.sram,
+            &**self.work_ram,
+            self.vdp,
+            self.port1,
+            self.port2,
+            &**self.z80_ram,
+            self.ym2612,
+            *self.z80_bus_requested,
+        )
     }
 
     fn read_word(&mut self, addr: u32) -> u16 {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
-                let offset = (addr & 0x3FFFFF) as usize;
-                let hi = u16::from(*self.rom.get(offset).unwrap_or(&0));
-                let lo = u16::from(*self.rom.get(offset + 1).unwrap_or(&0));
-                (hi << 8) | lo
+                // Each byte lane may be backed by SRAM (when mapped in) or ROM.
+                let hi = self.sram.read(addr).unwrap_or_else(|| {
+                    *self.rom.get((addr & 0x3FFFFF) as usize).unwrap_or(&0)
+                });
+                let lo = self.sram.read(addr.wrapping_add(1)).unwrap_or_else(|| {
+                    *self.rom.get(((addr & 0x3FFFFF) + 1) as usize).unwrap_or(&0)
+                });
+                (u16::from(hi) << 8) | u16::from(lo)
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -2931,10 +3495,15 @@ impl Bus for CoreBus<'_> {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted
-                let offset = addr & 0x01FF;
-                match offset {
-                    0x0000..=0x0001 => {
+                // Z80 BUSREQ status word for 0xA11100. The status bit is the
+                // high byte's bit 0 (word bit 8, 0x0100): 0 = bus granted to the
+                // 68000, 1 = Z80 still owns the bus. Mask with `& 0xFFFF` to match
+                // the write path — a `& 0x01FF` mask maps 0xA11100 to offset 0x100
+                // (never 0x00), which used to drop the read to the fallback so the
+                // status always read "granted/taken" and SGDK hung on release.
+                let reg = addr & 0xFFFF;
+                match reg {
+                    0x1100..=0x1101 => {
                         if *self.z80_bus_requested {
                             0x0000
                         } else {
@@ -2958,78 +3527,49 @@ impl Bus for CoreBus<'_> {
     }
 
     fn write_byte(&mut self, addr: u32, val: u8) {
-        match bus::map_region(addr) {
-            bus::BusRegion::WorkRam => {
-                let offset = (addr & 0xFFFF) as usize;
-                self.work_ram[offset] = val;
-            }
-            bus::BusRegion::IoRegisters => {
-                let reg = (addr & 0x1F) as u8;
-                match reg {
-                    0x02 | 0x03 => self.port1.write_data(val),
-                    0x04 | 0x05 => self.port2.write_data(val),
-                    0x08 | 0x09 => self.port1.write_ctrl(val),
-                    0x0A | 0x0B => self.port2.write_ctrl(val),
-                    _ => {}
-                }
-            }
-            bus::BusRegion::Z80Area => {
-                let z80_addr = addr & 0xFFFF;
-                match z80_addr {
-                    0x0000..=0x1FFF => {
-                        if z80_addr == 0x1FFF && self.z80_cmd_trace.len() < 100 {
-                            self.z80_cmd_trace.push((self.frame_count, val));
-                        }
-                        if z80_addr <= 0x00FF {
-                            *self.z80_driver_write_count += 1;
-                            *self.z80_driver_last_write_frame = self.frame_count;
-                        }
-                        self.z80_ram[z80_addr as usize] = val;
-                    }
-                    0x2000..=0x3FFF => self.z80_ram[(z80_addr & 0x1FFF) as usize] = val,
-                    0x4000 => self.ym2612.write_address(0, val),
-                    0x4001 => self.write_ym2612_data(0, val),
-                    0x4002 => self.ym2612.write_address(1, val),
-                    0x4003 => self.write_ym2612_data(1, val),
-                    _ => {}
-                }
-            }
-            bus::BusRegion::ControlRegisters => {
-                // 0xA11100 = Z80 bus request, 0xA11200 = Z80 reset
-                let reg = addr & 0xFFFF;
-                match reg {
-                    0x1100..=0x1101 => {
-                        let new_req = val & 0x01 != 0;
-                        if *self.z80_bus_requested && !new_req {
-                            *self.z80_bus_released_this_scanline = true;
-                        }
-                        *self.z80_bus_requested = new_req;
-                    }
-                    0x1200..=0x1201 => {
-                        let new_reset = val & 0x01 == 0;
-                        if *self.z80_reset && !new_reset {
-                            *self.z80_reset_pending = true;
-                        }
-                        *self.z80_reset = new_reset;
-                    }
-                    _ => {}
-                }
-            }
-            bus::BusRegion::Vdp => {
-                let vdp_addr = addr & 0x1F;
-                match vdp_addr {
-                    0x11 | 0x13 | 0x15 | 0x17 => {
-                        self.write_psg(val);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+        let mut trace = AudioTraceCtx {
+            ym2612_timed_write_trace: &mut *self.ym2612_timed_write_trace,
+            psg_timed_write_trace: &mut *self.psg_timed_write_trace,
+            frame_count: self.frame_count,
+            scanline: self.scanline,
+            master_tick: self.master_tick,
+        };
+        write_68k_byte(
+            addr,
+            val,
+            self.sram,
+            &mut **self.work_ram,
+            self.port1,
+            self.port2,
+            &mut **self.z80_ram,
+            self.ym2612,
+            self.psg,
+            self.z80_bus_requested,
+            self.z80_reset,
+            self.z80_reset_pending,
+            self.z80_bus_released_this_scanline,
+            self.z80_cmd_trace,
+            self.z80_driver_write_count,
+            self.z80_driver_last_write_frame,
+            &mut trace,
+        );
     }
 
     fn write_word(&mut self, addr: u32, val: u16) {
+        // SSF SRAM-enable register: a word write to 0xA130F0 delivers the
+        // control bit in its low byte (0xA130F1). Handle before the region match.
+        if addr == SSF_SRAM_ENABLE_ADDR & !1 || addr == SSF_SRAM_ENABLE_ADDR {
+            self.sram.enabled = (val as u8) & 0x01 != 0;
+            return;
+        }
         match bus::map_region(addr) {
+            bus::BusRegion::CartridgeRom => {
+                // Route SRAM-window word writes into backup RAM (per byte lane).
+                let hi = (val >> 8) as u8;
+                let lo = val as u8;
+                let _ = self.sram.write(addr, hi);
+                let _ = self.sram.write(addr.wrapping_add(1), lo);
+            }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
                 self.work_ram[offset] = (val >> 8) as u8;
@@ -3120,9 +3660,22 @@ impl Bus for CoreBus<'_> {
 struct Z80Bus<'a> {
     z80_ram: &'a mut Box<[u8; 0x2000]>,
     rom: &'a [u8],
+    sram: &'a mut CartSram,
+    // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
+    work_ram: &'a mut Box<[u8; 0x10000]>,
+    vdp: &'a Vdp,
+    port1: &'a mut ControllerPort,
+    port2: &'a mut ControllerPort,
     z80_bank: &'a mut u32,
+    z80_bus_requested: &'a mut bool,
+    z80_reset: &'a mut bool,
+    z80_reset_pending: &'a mut bool,
+    z80_bus_released_this_scanline: &'a mut bool,
     ym2612: &'a mut ym2612::Ym2612,
     psg: &'a mut psg::Psg,
+    z80_cmd_trace: &'a mut Vec<(u64, u8)>,
+    z80_driver_write_count: &'a mut u32,
+    z80_driver_last_write_frame: &'a mut u64,
     ym2612_timed_write_trace: &'a mut Vec<TimedYm2612Write>,
     psg_timed_write_trace: &'a mut Vec<TimedPsgWrite>,
     frame_count: u64,
@@ -3162,9 +3715,23 @@ impl z80::execute::Bus for Z80Bus<'_> {
             0x2000..=0x3FFF => self.z80_ram[(addr & 0x1FFF) as usize],
             0x4000..=0x4003 => self.ym2612.read_status(),
             0x8000..=0xFFFF => {
-                // Banked 68K ROM window
-                let offset = *self.z80_bank + u32::from(addr & 0x7FFF);
-                self.rom.get(offset as usize).copied().unwrap_or(0)
+                // Banked window into the full 68000 24-bit address space.
+                // The bank register supplies bits 15-23; addr supplies bits 0-14.
+                // Real hardware routes this through the 68000 bus (ROM, work RAM,
+                // VDP, I/O, ...), not just cartridge ROM.
+                let bus_addr = (*self.z80_bank | u32::from(addr & 0x7FFF)) & 0x00FF_FFFF;
+                read_68k_byte(
+                    bus_addr,
+                    self.rom,
+                    self.sram,
+                    &**self.work_ram,
+                    self.vdp,
+                    self.port1,
+                    self.port2,
+                    &**self.z80_ram,
+                    self.ym2612,
+                    *self.z80_bus_requested,
+                )
             }
             _ => 0xFF,
         }
@@ -3184,6 +3751,40 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 *self.z80_bank = ((*self.z80_bank >> 1) | ((u32::from(val) & 1) << 23)) & 0xFF8000;
             }
             0x7F00..=0x7FFF => self.write_psg(val),
+            0x8000..=0xFFFF => {
+                // Banked window into the full 68000 24-bit address space. Writes
+                // reach work RAM, VDP/PSG, I/O and Z80 control regs just like a
+                // 68000 access (drivers that bank to work RAM were previously
+                // dropped). write_68k_byte only touches flat state, so banking to
+                // the Z80 area or control ports cannot recurse.
+                let bus_addr = (*self.z80_bank | u32::from(addr & 0x7FFF)) & 0x00FF_FFFF;
+                let mut trace = AudioTraceCtx {
+                    ym2612_timed_write_trace: &mut *self.ym2612_timed_write_trace,
+                    psg_timed_write_trace: &mut *self.psg_timed_write_trace,
+                    frame_count: self.frame_count,
+                    scanline: self.scanline,
+                    master_tick: self.master_tick,
+                };
+                write_68k_byte(
+                    bus_addr,
+                    val,
+                    self.sram,
+                    &mut **self.work_ram,
+                    self.port1,
+                    self.port2,
+                    &mut **self.z80_ram,
+                    self.ym2612,
+                    self.psg,
+                    self.z80_bus_requested,
+                    self.z80_reset,
+                    self.z80_reset_pending,
+                    self.z80_bus_released_this_scanline,
+                    self.z80_cmd_trace,
+                    self.z80_driver_write_count,
+                    self.z80_driver_last_write_frame,
+                    &mut trace,
+                );
+            }
             _ => {}
         }
     }
@@ -3210,6 +3811,7 @@ mod tests {
         let scanline = core.vdp.scanline();
         CoreBus {
             rom: &core.rom,
+            sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &mut core.vdp,
             port1: &mut core.port1,
@@ -3233,16 +3835,29 @@ mod tests {
     }
 
     fn z80_bus_with_master_tick<'a>(core: &'a mut GenesisCore, master_tick: u64) -> Z80Bus<'a> {
+        let scanline = core.vdp.scanline();
         Z80Bus {
             z80_ram: &mut core.z80_ram,
             rom: &core.rom,
+            sram: &mut core.sram,
+            work_ram: &mut core.work_ram,
+            vdp: &core.vdp,
+            port1: &mut core.port1,
+            port2: &mut core.port2,
             z80_bank: &mut core.z80_bank,
+            z80_bus_requested: &mut core.z80_bus_requested,
+            z80_reset: &mut core.z80_reset,
+            z80_reset_pending: &mut core.z80_reset_pending,
+            z80_bus_released_this_scanline: &mut core.z80_bus_released_this_scanline,
             ym2612: &mut core.ym2612,
             psg: &mut core.psg,
+            z80_cmd_trace: &mut core.z80_cmd_trace,
+            z80_driver_write_count: &mut core.z80_driver_write_count,
+            z80_driver_last_write_frame: &mut core.z80_driver_last_write_frame,
             ym2612_timed_write_trace: &mut core.ym2612_timed_write_trace,
             psg_timed_write_trace: &mut core.psg_timed_write_trace,
             frame_count: core.frame_count,
-            scanline: core.vdp.scanline(),
+            scanline,
             master_tick,
         }
     }
@@ -4284,6 +4899,114 @@ mod tests {
         assert_eq!(core.cpu.pc, 0x0000_0200);
     }
 
+    /// Builds a valid 68000-bootable ROM whose header declares battery SRAM.
+    fn rom_with_sram(type_byte: u8, start: u32, end: u32) -> Vec<u8> {
+        let mut rom = vec![0u8; 1024];
+        rom[0..4].copy_from_slice(&0x00FF_FFF0u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        rom[0x1B0..0x1B2].copy_from_slice(&0x5241u16.to_be_bytes()); // 'RA'
+        rom[0x1B2] = type_byte;
+        rom[0x1B4..0x1B8].copy_from_slice(&start.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&end.to_be_bytes());
+        rom
+    }
+
+    #[test]
+    fn sram_mapping_round_trip() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        assert!(core.has_battery_sram());
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        // Byte path
+        bus.write_byte(0x200001, 0xAB);
+        bus.write_byte(0x200003, 0xCD);
+        assert_eq!(bus.read_byte(0x200001), 0xAB);
+        assert_eq!(bus.read_byte(0x200003), 0xCD);
+        // Word path
+        bus.write_word(0x200010, 0x1234);
+        assert_eq!(bus.read_word(0x200010), 0x1234);
+        assert_eq!(bus.read_byte(0x200010), 0x12);
+        assert_eq!(bus.read_byte(0x200011), 0x34);
+    }
+
+    #[test]
+    fn sram_odd_only_layout_masks_even_lane() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        // 0xB0 = backup-RAM pattern + bit4 (odd-only).
+        core.execute(Command::LoadRom(rom_with_sram(0xB0, 0x200000, 0x20FFFF)));
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        bus.write_byte(0x200001, 0xAB); // odd address → backed by SRAM
+        bus.write_byte(0x200000, 0xCD); // even address → not backed (dropped)
+        assert_eq!(bus.read_byte(0x200001), 0xAB);
+        assert_eq!(bus.read_byte(0x200000), 0x00); // even lane reads ROM (0)
+    }
+
+    #[test]
+    fn sram_a130f1_banking_toggle() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        bus.write_byte(0x200001, 0xAB);
+        assert_eq!(bus.read_byte(0x200001), 0xAB); // enabled by default (header)
+        bus.write_byte(0xA130F1, 0x00); // disable SRAM banking
+        assert_eq!(bus.read_byte(0x200001), 0x00); // now sees ROM (zeros)
+        bus.write_byte(0xA130F1, 0x01); // re-enable
+        assert_eq!(bus.read_byte(0x200001), 0xAB); // SRAM contents preserved
+    }
+
+    #[test]
+    fn sram_included_in_snapshot() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x200001, 0x42);
+        }
+        let snap = core.snapshot();
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x200001, 0x99);
+        }
+        assert_eq!(core.sram()[1], 0x99);
+        core.restore(&snap);
+        assert_eq!(core.sram()[1], 0x42);
+    }
+
+    #[test]
+    fn headerless_sram_enables_on_first_write() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        let mut rom = vec![0u8; 1024];
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        core.execute(Command::LoadRom(rom));
+        assert!(!core.has_battery_sram());
+        assert!(!core.sram_worth_saving());
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x200000, 0x77);
+            assert_eq!(bus.read_byte(0x200000), 0x77); // enabled on first write
+        }
+        assert!(core.sram_worth_saving());
+        assert!(core.sram_is_dirty());
+        core.clear_sram_dirty();
+        assert!(!core.sram_is_dirty());
+    }
+
+    #[test]
+    fn load_sram_restores_saved_bytes() {
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_sram(0xA0, 0x200000, 0x20FFFF)));
+        let saved: Vec<u8> = (0..core.sram().len()).map(|i| (i & 0xFF) as u8).collect();
+        core.load_sram(&saved);
+        assert_eq!(core.sram(), &saved[..]);
+        assert!(!core.sram_is_dirty()); // loading is not a dirtying write
+    }
+
     #[test]
     fn step_frame_increments_counter() {
         let mut core = GenesisCore::new();
@@ -4317,11 +5040,84 @@ mod tests {
     }
 
     #[test]
-    fn z80_bus_request_grants_immediately() {
-        let core = GenesisCore::new();
-        // Z80 bus request: bit 0 = 0 means bus granted to 68K
-        let val = core.read_byte(0xA11100);
-        assert_eq!(val & 0x01, 0x00, "bit 0 should be 0 (bus granted)");
+    fn z80_busreq_read_reflects_grant_state() {
+        // The Z80 BUSREQ status register at 0xA11100 must reflect the actual
+        // arbitration state (bit 0: 0 = bus granted to the 68000, 1 = Z80 owns
+        // the bus). Regression guard for a mask bug where the read path used
+        // `addr & 0x01FF` (→ offset 0x100 for 0xA11100, never matching the
+        // 0x0000..=0x0001 arm) so BUSREQ reads always returned the 0 fallback.
+        // SGDK's `Z80_isBusTaken()` release-wait loop then spun forever and the
+        // screen stayed black.
+        let mut core = GenesisCore::new();
+
+        // Power-on: the 68000 has not requested the bus, so the Z80 owns it and
+        // bit 0 reads as 1.
+        assert_eq!(
+            core.read_byte(0xA11100) & 0x01,
+            0x01,
+            "at power-on the Z80 owns the bus (bit 0 = 1)"
+        );
+
+        // After the 68000 requests the bus, the read reports "granted" (bit 0 = 0).
+        core.z80_bus_requested = true;
+        assert_eq!(
+            core.read_byte(0xA11100) & 0x01,
+            0x00,
+            "after BUSREQ the bus is granted to the 68000 (bit 0 = 0)"
+        );
+
+        // After release, the status returns to Z80-owned (bit 0 = 1).
+        core.z80_bus_requested = false;
+        assert_eq!(
+            core.read_byte(0xA11100) & 0x01,
+            0x01,
+            "after release the Z80 owns the bus again (bit 0 = 1)"
+        );
+    }
+
+    /// End-to-end regression guard for the BUSREQ-read mask bug via the live
+    /// CoreBus path. A crafted 68000 program requests the Z80 bus, releases it,
+    /// then runs SGDK's `Z80_isBusTaken()` idiom
+    /// (`MOVE.W $A11100,D0; LSR.W #8; EORI #1; ANDI #1`) in a wait-for-release
+    /// loop. With the mask bug the read always reported "taken", the loop never
+    /// exited, and the sentinel store after the loop never ran. With the fix the
+    /// released bus reads as not-taken, the loop falls through and writes a
+    /// sentinel to work RAM within a single frame.
+    #[test]
+    fn busreq_release_wait_loop_terminates() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0..4].copy_from_slice(&0x00FF_0000u32.to_be_bytes()); // initial SSP
+        rom[4..8].copy_from_slice(&0x0000_0200u32.to_be_bytes()); // initial PC
+
+        // Program at 0x0200:
+        let prog: &[u8] = &[
+            // MOVE.W #$0100,($00A11100).L   ; request the Z80 bus
+            0x33, 0xFC, 0x01, 0x00, 0x00, 0xA1, 0x11, 0x00,
+            // MOVE.W #$0000,($00A11100).L   ; release the Z80 bus
+            0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x11, 0x00,
+            // loop: MOVE.W ($00A11100).L,D0 ; read BUSREQ status  (0x0210)
+            0x30, 0x39, 0x00, 0xA1, 0x11, 0x00, //
+            0xE0, 0x48, // LSR.W  #8,D0
+            0x0A, 0x40, 0x00, 0x01, // EORI.W #$0001,D0
+            0x02, 0x40, 0x00, 0x01, // ANDI.W #$0001,D0
+            0x66, 0xEE, // BNE.S  loop (-18 → back to 0x0210)
+            // MOVE.W #$BEEF,($00FF0000).L   ; sentinel proving the loop exited
+            0x33, 0xFC, 0xBE, 0xEF, 0x00, 0xFF, 0x00, 0x00,
+            // self: BRA.S self
+            0x60, 0xFE,
+        ];
+        rom[0x200..0x200 + prog.len()].copy_from_slice(prog);
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+        core.execute(Command::StepFrame);
+
+        let sentinel = (u16::from(core.work_ram[0x0000]) << 8) | u16::from(core.work_ram[0x0001]);
+        assert_eq!(
+            sentinel, 0xBEEF,
+            "BUSREQ release-wait loop must terminate and write the sentinel; \
+             got 0x{sentinel:04X} (loop hung on a stuck 'bus taken' read)"
+        );
     }
 
     #[test]
@@ -4394,6 +5190,61 @@ mod tests {
             "VBlank handler must run exactly once per frame, got {} times",
             core.z80_ram[0x1F00]
         );
+    }
+
+    /// Regression test for the Z80 banked `0x8000-0xFFFF` window reaching the
+    /// full 68000 address space (not just cartridge ROM).
+    ///
+    /// A byte the 68000 writes into work RAM must be visible when the Z80 banks
+    /// its window to that 68000 address, and a byte the Z80 writes through the
+    /// banked window must be visible to the 68000. Previously the window indexed
+    /// straight into `self.rom`, so work-RAM banking read 0 and writes were
+    /// dropped.
+    #[test]
+    fn z80_bank_window_reaches_full_68k_address_space() {
+        let mut core = GenesisCore::new();
+
+        // 68000 writes known bytes into work RAM (0xFF0000 region).
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xFF_0000, 0x5A);
+            bus.write_byte(0xFF_0010, 0x3C);
+        }
+
+        // Point the Z80 bank so the 0x8000 window base maps to 0xFF0000.
+        // bus_addr = (z80_bank | (addr & 0x7FFF)); addr 0x8000 -> offset 0.
+        core.z80_bank = 0xFF_0000;
+
+        // The Z80 reads the 68000-written bytes back through the banked window.
+        {
+            let mut bus = z80_bus_with_master_tick(&mut core, 0);
+            assert_eq!(
+                bus.read_byte(0x8000),
+                0x5A,
+                "Z80 banked read of work RAM must see the 68000-written byte",
+            );
+            assert_eq!(
+                bus.read_byte(0x8010),
+                0x3C,
+                "Z80 banked read must apply the intra-window offset to 68000 space",
+            );
+        }
+
+        // The Z80 writes into work RAM through the banked window...
+        {
+            let mut bus = z80_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0x8020, 0x77);
+        }
+        // ...and the 68000 observes it.
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            assert_eq!(
+                bus.read_byte(0xFF_0020),
+                0x77,
+                "68000 must observe a byte the Z80 banked-wrote into work RAM",
+            );
+        }
+        assert_eq!(core.work_ram[0x0020], 0x77);
     }
 
     #[test]
@@ -4825,5 +5676,175 @@ mod tests {
 
         assert!(delta_bytes > 0);
         assert!((delta_bytes as u64) < naive_bytes);
+    }
+
+    // ---- VInt-latch + CPU-stall-on-DMA integration tests (regression coverage
+    //      for the SGDK-black-screen fix). These drive the real step_frame /
+    //      step_scanline paths, not the individual VDP helpers. ----
+
+    /// A V-interrupt raised while the 68000 is masked (SR I-mask = 7) is not
+    /// dropped: the VDP latches the pending flag and delivery is attempted on
+    /// every subsequent scanline. Status bit 7 (VIP) reflects the latch.
+    #[test]
+    fn vint_pending_latches_across_masked_frames() {
+        let mut core = GenesisCore::new();
+        // Small ROM whose CPU code doesn't matter: we drive the VDP directly and
+        // step frames. `LoadRom` resets the CPU and installs the reset SR
+        // (currently mask 0), so raise the mask to 7 up front to simulate the
+        // real SGDK boot behaviour (interrupts disabled during setup).
+        core.execute(Command::LoadRom(vec![0u8; 0x8000]));
+        core.cpu.sr.set_interrupt_mask(7);
+        // Enable V-interrupts on the VDP (reg 1 bit 5).
+        core.vdp.write_control(0x8120);
+
+        // Advance a single frame — VBlank hits and the VIP flag must latch.
+        core.execute(Command::StepFrame);
+        let vdp_after_frame = core.vdp_snapshot();
+        assert!(
+            vdp_after_frame.vint_pending,
+            "V-interrupt raised while the CPU mask=7 must be latched, not dropped"
+        );
+        assert_ne!(
+            core.vdp.read_status() & 0x0080,
+            0,
+            "status bit 7 (VIP) is set while the interrupt is latched"
+        );
+    }
+
+    /// Dropping the CPU mask below 6 lets the previously-latched V-interrupt
+    /// fire: after delivery the CPU is at the V-blank handler's vector target
+    /// (auto-vector 0x78) and the VIP latch is cleared. Without the latch, a
+    /// VInt raised while mask = 7 would be lost forever — this is the exact
+    /// hardware behavior SGDK's V-blank-driven tilemap flush relies on.
+    #[test]
+    fn latched_vint_fires_when_cpu_mask_drops() {
+        // A minimal hand-assembled ROM whose reset vector points at a NOP and
+        // whose level-6 auto-vector points at a known "handler" PC.  The
+        // handler body is one NOP followed by `bra.s *` so the CPU parks there
+        // once the interrupt is taken and we can identify delivery by checking
+        // core.cpu.pc.
+        const HANDLER_PC: u32 = 0x00_0400;
+        let mut rom = vec![0u8; 0x8000];
+        // Reset vectors: SSP = 0x00FF0000, PC = 0x00000200.
+        rom[0x0000..0x0004].copy_from_slice(&[0x00, 0xFF, 0x00, 0x00]);
+        rom[0x0004..0x0008].copy_from_slice(&[0x00, 0x00, 0x02, 0x00]);
+        // Level-6 (V-blank) auto-vector at byte offset 0x60 + 6*4 = 0x78.
+        rom[0x0078..0x007C].copy_from_slice(&HANDLER_PC.to_be_bytes());
+        // Handler @ HANDLER_PC: NOP; BRA.S *  → the CPU sits at HANDLER_PC + 2.
+        rom[HANDLER_PC as usize..HANDLER_PC as usize + 4].copy_from_slice(&[
+            0x4E, 0x71, // NOP
+            0x60, 0xFE, // BRA.S *
+        ]);
+        // Reset entry @ 0x200: BRA.S *  → CPU sits at 0x200 while ints are
+        // masked (executes an infinite branch to self, one instruction per
+        // scanline, never touches memory).
+        rom[0x0200..0x0204].copy_from_slice(&[0x60, 0xFE, 0x4E, 0x71]);
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+
+        // Force the CPU into mask-7 state and enable V-interrupts on the VDP
+        // (reg 1 bit 5 = 0x20). Setting the mask BEFORE StepFrame is
+        // load-bearing: the SGDK boot path holds mask 7 through V-blank and
+        // the fix must latch the VInt across that window rather than dropping
+        // it.
+        core.cpu.sr.set_interrupt_mask(7);
+        core.vdp.write_control(0x8120);
+
+        // Step one frame at mask 7: the VInt is raised at V-blank, cannot be
+        // taken, and must be latched. Neither PC nor the VIP latch may change
+        // as a result of the CPU executing masked code.
+        core.execute(Command::StepFrame);
+        assert!(
+            core.vdp_snapshot().vint_pending,
+            "V-int raised at mask 7 must be latched (VIP flag set), not dropped"
+        );
+        assert_ne!(
+            core.cpu.pc, HANDLER_PC + 2,
+            "handler must NOT have been entered while the CPU mask is 7"
+        );
+
+        // Drop the mask so the latched VInt becomes deliverable, then step
+        // another frame.  Delivery fires within the first few scanlines: once
+        // taken, deliver_interrupt raises the mask to 6, the handler runs its
+        // NOP, and the CPU parks at HANDLER_PC + 2 for the rest of the frame.
+        // The observable end state is `PC = HANDLER_PC + 2` (the BRA.S self
+        // loop).  Note that this same frame will *also* re-latch VIP at its
+        // own V-blank; that later latch is a separate event and is not what
+        // this test observes.
+        core.cpu.sr.set_interrupt_mask(0);
+        core.execute(Command::StepFrame);
+        assert_eq!(
+            core.cpu.pc,
+            HANDLER_PC + 2,
+            "CPU should now be parked at the V-blank handler's BRA.S self-loop"
+        );
+    }
+
+    /// While the VDP holds the bus for a DMA transfer the 68000 must be
+    /// stalled — it advances scheduler cycles but does not execute any
+    /// instructions until the DMA-busy countdown drains.
+    #[test]
+    fn cpu_stalls_while_dma_holds_the_bus() {
+        let mut core = GenesisCore::new();
+        // Ordinary short ROM; the reset vector's stop word makes the CPU sit
+        // at CODE_START so it isn't wandering during the stall.
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x0000] = 0x00;
+        rom[0x0001] = 0xFF;
+        rom[0x0002] = 0x00;
+        rom[0x0003] = 0x00;
+        rom[0x0004] = 0x00;
+        rom[0x0005] = 0x00;
+        rom[0x0006] = 0x02;
+        rom[0x0007] = 0x00;
+        rom[0x0200] = 0x4E; // NOP
+        rom[0x0201] = 0x71;
+        rom[0x0202] = 0x60; // bra.s *
+        rom[0x0203] = 0xFC;
+        core.execute(Command::LoadRom(rom));
+
+        // Program a large 68K→VRAM DMA via the VDP's public control interface
+        // and execute it, so the DMA-busy cycle countdown is charged. The
+        // transfer is bigger than any single scanline could burn, so the stall
+        // remains asserted across a StepScanline call.
+        core.vdp.write_control(0x8F02); // autoinc = 2
+        core.vdp.write_control(0x9300); // DMA length low  = 0x00
+        core.vdp.write_control(0x9440); // DMA length high = 0x40  → length = 0x4000 words
+        core.vdp.write_control(0x9500); // DMA src low  = 0x00
+        core.vdp.write_control(0x9600); // DMA src mid  = 0x00
+        core.vdp.write_control(0x9700); // DMA src high = 0x00 (mode 68K→VRAM)
+        core.vdp.write_control(0x8154); // reg 1 = 0x54: DMA enable + VInt (display off)
+        // Command word pair: VRAM write + DMA at address 0xE000.
+        core.vdp.write_control(0x4000); // hi word: CD1..0 = 01 (VRAM), addr[13..0] = 0x0000
+        core.vdp.write_control(0x0083); // lo word: CD5 = 1 (DMA), addr[15..14] = 3 → 0xE000
+        // The DMA runs synchronously via the core's execute path; step a couple
+        // of instructions to trigger it (LoadRom placed a NOP/bra.s at 0x200).
+        let cpu_cycles_before_trigger = core.cpu.cycles;
+        // Manually drive the DMA (the core normally does this from step_cpu when
+        // dma_pending is observed after an instruction; here we short-circuit).
+        core.execute_vdp_dma();
+        let cycles_charged = core.vdp.dma_busy_cpu_cycles();
+        assert!(cycles_charged > 0, "run_dma must have charged the DMA-busy cycle budget");
+        let _ = cpu_cycles_before_trigger;
+
+        let pc_before = core.cpu.pc;
+        let cpu_cycles_before = core.cpu.cycles;
+        // Step one scanline's worth of frame progression.
+        core.execute(Command::StepScanline);
+        // The CPU is stalled: PC unchanged, but CPU cycles advanced.
+        assert_eq!(
+            core.cpu.pc, pc_before,
+            "68000 must not advance PC while DMA holds the bus"
+        );
+        assert!(
+            core.cpu.cycles > cpu_cycles_before,
+            "the scheduler still advances by the stall's cycle budget"
+        );
+        // DMA-busy drains as those cycles are burned.
+        assert!(
+            core.vdp.dma_busy_cpu_cycles() < cycles_charged,
+            "advance_dma_busy must decrement the countdown as the stall consumes cycles"
+        );
     }
 }

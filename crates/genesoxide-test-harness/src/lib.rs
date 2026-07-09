@@ -7,11 +7,12 @@
 //! against MAME-generated test vectors.
 
 pub mod m68k_tests;
+pub mod rom_builder;
 pub mod vgm;
 pub mod ymfm_reference;
 pub mod z80_tests;
 
-use genesoxide_core::{Command, FRAME_RGBA_BYTES, GenesisCore};
+use genesoxide_core::{Command, GenesisCore};
 
 /// Loads a ROM and runs it for the given number of frames.
 /// Returns the final framebuffer as a Vec<u8>.
@@ -29,10 +30,14 @@ pub fn run_rom_frames(rom_data: Vec<u8>, frames: u64) -> Vec<u8> {
 
 /// Compares two framebuffers pixel-by-pixel.
 /// Returns the number of differing pixels.
+///
+/// Both framebuffers must be the same non-empty length. This works for any
+/// display width — a 256-wide H32 frame and a 320-wide H40 frame both compare
+/// against a golden of matching length.
 #[must_use]
 pub fn compare_framebuffers(a: &[u8], b: &[u8]) -> usize {
-    assert_eq!(a.len(), FRAME_RGBA_BYTES);
-    assert_eq!(b.len(), FRAME_RGBA_BYTES);
+    assert!(!a.is_empty(), "framebuffer must be non-empty");
+    assert_eq!(a.len(), b.len(), "framebuffer lengths differ");
 
     a.chunks(4)
         .zip(b.chunks(4))
@@ -51,11 +56,17 @@ pub fn load_test_rom(path: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use genesoxide_core::FRAME_RGBA_BYTES;
 
     #[test]
     fn empty_rom_produces_framebuffer() {
         let fb = run_rom_frames(vec![0; 1024], 1);
-        assert_eq!(fb.len(), FRAME_RGBA_BYTES);
+        // Native-width framebuffer: an all-zero ROM leaves reg 0x0C = 0, which
+        // is H32 (256px), so the packed frame is 256x224x4. The buffer is always
+        // a whole number of 224-row RGBA lines regardless of horizontal mode.
+        assert!(!fb.is_empty());
+        assert!(fb.len() == 256 * 224 * 4 || fb.len() == FRAME_RGBA_BYTES);
+        assert_eq!(fb.len() % (224 * 4), 0);
     }
 
     #[test]

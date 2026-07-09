@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::FRAME_RGBA_BYTES;
+use crate::api::{FRAME_HEIGHT, FRAME_RGBA_BYTES, FRAME_WIDTH};
 
 /// VRAM size in bytes.
 pub const VRAM_SIZE: usize = 0x10000; // 64KB
@@ -82,12 +82,27 @@ pub struct VdpSnapshot {
     pub h_interrupt_pending: bool,
     pub control_code: u8,
     pub odd_frame: bool,
+    /// Latched V-interrupt-pending (VIP) flag — see [`Vdp::vint_pending`].
+    pub vint_pending: bool,
+    /// Remaining CPU cycles for which the DMA-busy status bit stays asserted
+    /// and the 68000 is held off the bus — see [`Vdp::dma_busy_cpu_cycles`].
+    pub dma_busy_cpu_cycles: u32,
 }
 
 /// Maximum sprites evaluated per frame (H40 mode).
-const MAX_SPRITES_TOTAL: usize = 80;
+const MAX_SPRITES_TOTAL_H40: usize = 80;
 /// Maximum sprites per scanline in H40 mode.
-const MAX_SPRITES_PER_LINE: usize = 20;
+const MAX_SPRITES_PER_LINE_H40: usize = 20;
+/// Maximum sprites evaluated per frame (H32 mode).
+const MAX_SPRITES_TOTAL_H32: usize = 64;
+/// Maximum sprites per scanline in H32 mode.
+const MAX_SPRITES_PER_LINE_H32: usize = 16;
+
+// VDP register 0x0C (mode register 4) horizontal resolution select bits.
+/// RS0 (bit 0) — horizontal resolution select, low bit.
+const RS0: u8 = 0x01;
+/// RS1 (bit 7) — horizontal resolution select, high bit.
+const RS1: u8 = 0x80;
 
 /// The VDP.
 pub struct Vdp {
@@ -111,8 +126,20 @@ pub struct Vdp {
     scanline: u16,
     /// Current dot within scanline.
     dot: u16,
-    /// RGBA framebuffer.
+    /// RGBA framebuffer. Physically sized to the H40 maximum (320x224); in H32
+    /// mode only a 256-wide packed prefix is used and returned.
     framebuffer: Box<[u8; FRAME_RGBA_BYTES]>,
+    /// Active display width (in pixels) latched for the current frame.
+    ///
+    /// Horizontal mode can change mid-frame if a game writes reg 0x0C between
+    /// scanlines, but a single frame must use ONE consistent stride to stay
+    /// coherent. This is captured once at the start of each frame (scanline 0 of
+    /// `render_scanline`) and used as both the writeback stride and the returned
+    /// framebuffer length for that whole frame; a mode change only takes effect
+    /// at the next frame boundary. This is a per-frame derived cache recomputed
+    /// every frame (and from the registers on `restore`), NOT persistent state,
+    /// so it is intentionally excluded from `VdpSnapshot`.
+    frame_width: u16,
     /// V-blank flag.
     in_vblank: bool,
     /// H-blank flag.
@@ -129,6 +156,25 @@ pub struct Vdp {
     control_code: u8,
     /// Odd frame toggle — flipped each frame for interlace/status register.
     odd_frame: bool,
+    /// Latched V-interrupt-pending (VIP) flag.
+    ///
+    /// The VDP raises this at the start of V-blank when the V-interrupt is
+    /// enabled and holds it until the level-6 interrupt is actually taken by
+    /// the 68000. Because the 68000 may be inside a mask-7 critical section at
+    /// the instant V-blank begins, delivering the interrupt as a one-shot at
+    /// that scanline would silently drop it (SGDK disables interrupts during
+    /// boot for several frames). Latching it so it is taken as soon as the CPU
+    /// mask falls below 6 matches the level-triggered IPL lines on hardware and
+    /// is what lets SGDK's V-blank-driven tilemap/DMA path make progress.
+    vint_pending: bool,
+    /// Remaining CPU cycles for which a DMA holds the bus.
+    ///
+    /// While this is non-zero the DMA-busy status bit (bit 1) reads as set and
+    /// the 68000 is stalled off the bus, matching hardware where a 68K→VRAM
+    /// DMA / VRAM fill / VRAM copy freezes the CPU for the transfer's duration.
+    /// It is decremented as CPU cycles elapse and reaches zero when the
+    /// transfer completes.
+    dma_busy_cpu_cycles: u32,
 }
 
 impl Vdp {
@@ -147,6 +193,7 @@ impl Vdp {
             scanline: 0,
             dot: 0,
             framebuffer: Box::new([0; FRAME_RGBA_BYTES]),
+            frame_width: FRAME_WIDTH as u16,
             in_vblank: false,
             in_hblank: false,
             dma_pending: false,
@@ -155,13 +202,38 @@ impl Vdp {
             h_interrupt_pending: false,
             control_code: 0,
             odd_frame: false,
+            vint_pending: false,
+            dma_busy_cpu_cycles: 0,
         }
     }
 
-    /// Returns a reference to the RGBA framebuffer.
+    /// Returns the length in bytes of the active (native-width) framebuffer for
+    /// the current frame: `frame_width * FRAME_HEIGHT * 4`. In H40 this is the
+    /// full 320-wide buffer; in H32 it is the 256-wide packed prefix.
     #[must_use]
-    pub fn framebuffer(&self) -> &[u8; FRAME_RGBA_BYTES] {
-        &self.framebuffer
+    fn framebuffer_len(&self) -> usize {
+        self.frame_width as usize * FRAME_HEIGHT * 4
+    }
+
+    /// Returns a reference to the RGBA framebuffer for the current frame.
+    ///
+    /// The slice is the native display width: 320x224 in H40, 256x224 in H32
+    /// (packed with a row stride equal to the active width, not 320).
+    #[must_use]
+    pub fn framebuffer(&self) -> &[u8] {
+        &self.framebuffer[..self.framebuffer_len()]
+    }
+
+    /// Returns the width (in pixels) of the framebuffer returned by
+    /// [`Vdp::framebuffer`] for the current frame.
+    ///
+    /// This is the latched per-frame width (320 in H40, 256 in H32), which
+    /// matches the packed stride of the framebuffer slice. A mid-frame reg 0x0C
+    /// write does not change it until the next frame boundary — so this is the
+    /// value a frontend must size its output buffer to.
+    #[must_use]
+    pub fn display_width(&self) -> u16 {
+        self.frame_width
     }
 
     /// Returns the current scanline.
@@ -351,9 +423,16 @@ impl Vdp {
         if self.in_hblank {
             status |= 0x0004;
         }
-        // Bit 1: DMA busy
-        if self.dma_pending {
+        // Bit 1: DMA busy — asserted for the whole duration of an in-flight
+        // transfer (68K→VRAM/CRAM/VSRAM, VRAM fill, or VRAM copy), cleared once
+        // the transfer's cycle budget has elapsed.
+        if self.dma_busy_cpu_cycles > 0 {
             status |= 0x0002;
+        }
+        // Bit 7: V-interrupt pending (VIP) — latched at V-blank, cleared when
+        // the level-6 interrupt is taken.
+        if self.vint_pending {
+            status |= 0x0080;
         }
         status
     }
@@ -389,6 +468,27 @@ impl Vdp {
         [r * 36 + r / 2, g * 36 + g / 2, b * 36 + b / 2, 0xFF]
     }
 
+    /// Applies a shadow/highlight intensity to an already-Normal RGBA pixel.
+    ///
+    /// Because Shadow = Normal/2 and Highlight = 128 + Normal/2 are both linear
+    /// in the 8-bit Normal value, the transform is applied directly to the
+    /// stored RGBA rather than re-derived from CRAM. Only RGB is modified; the
+    /// alpha channel is preserved. `intensity`: 0 = Shadow, 1 = Normal,
+    /// 2 = Highlight.
+    #[must_use]
+    fn apply_intensity(rgba: [u8; 4], intensity: u8) -> [u8; 4] {
+        match intensity {
+            0 => [rgba[0] >> 1, rgba[1] >> 1, rgba[2] >> 1, rgba[3]], // shadow
+            2 => [
+                128 + (rgba[0] >> 1),
+                128 + (rgba[1] >> 1),
+                128 + (rgba[2] >> 1),
+                rgba[3],
+            ], // highlight
+            _ => rgba, // normal
+        }
+    }
+
     /// Returns the background color (palette 0, color 0).
     #[must_use]
     pub fn background_color(&self) -> [u8; 4] {
@@ -413,6 +513,96 @@ impl Vdp {
         self.in_vblank = val;
     }
 
+    /// Returns true while a DMA holds the bus (DMA-busy status bit is set).
+    #[must_use]
+    pub fn dma_busy(&self) -> bool {
+        self.dma_busy_cpu_cycles > 0
+    }
+
+    /// Returns the number of CPU cycles for which the current DMA still holds
+    /// the bus. Zero when no DMA is in flight.
+    #[must_use]
+    pub fn dma_busy_cpu_cycles(&self) -> u32 {
+        self.dma_busy_cpu_cycles
+    }
+
+    /// Advances DMA-busy accounting by `cycles` CPU cycles, clearing the
+    /// DMA-busy state once the transfer's budget has fully elapsed. Called by
+    /// the core as the 68000 (or a stall) consumes cycles.
+    pub fn advance_dma_busy(&mut self, cycles: u32) {
+        self.dma_busy_cpu_cycles = self.dma_busy_cpu_cycles.saturating_sub(cycles);
+    }
+
+    /// Returns true if a V-interrupt (VIP) is latched and awaiting delivery.
+    #[must_use]
+    pub fn vint_pending(&self) -> bool {
+        self.vint_pending
+    }
+
+    /// Latches the V-interrupt-pending (VIP) flag. Called by the core at the
+    /// start of V-blank when the V-interrupt is enabled.
+    pub fn set_vint_pending(&mut self) {
+        self.vint_pending = true;
+    }
+
+    /// Clears the latched V-interrupt-pending flag. Called once the level-6
+    /// interrupt has actually been taken by the 68000.
+    pub fn clear_vint_pending(&mut self) {
+        self.vint_pending = false;
+    }
+
+    /// CPU cycles the CPU is stalled per scanline of active display.
+    ///
+    /// One NTSC scanline is 3420 master clocks; at 1 CPU cycle ≈ 7 master
+    /// clocks that is ≈ 488 CPU cycles, matching the core's per-scanline budget.
+    ///
+    /// This is identical for H32 and H40: both consume 3420 master clocks per
+    /// scanline (hence the same 488 CPU cycles/line). They differ only in the
+    /// dot clock — H32 draws 256 dots at the slower EDCLK-derived pixel clock,
+    /// H40 draws 320 dots at the faster clock — and in the DMA byte-per-line
+    /// budget, which `dma_cost_cycles`'s `bytes_per_line` table accounts for
+    /// via its `(h40, blanking)` key.
+    const CPU_CYCLES_PER_LINE: u32 = 488;
+
+    /// Computes the CPU-cycle cost (and hence DMA-busy duration / CPU stall) of
+    /// a DMA transfer of `length` words.
+    ///
+    /// The Sega Genesis Software Manual specifies how many bytes a DMA can move
+    /// per scanline; the figures differ between active display and blanking and
+    /// between H32 and H40. In H40 a 68K→VRAM DMA moves ~205 bytes/line during
+    /// blanking versus ~18 bytes/line during active display; in H32 it is ~167
+    /// vs ~16 bytes/line (see plutiedev.com "DMA transfers" and Nemesis's timing
+    /// research on SpritesMind, which tabulate the same slot rates). CRAM/VSRAM
+    /// writes and VRAM fills move one word per slot like VRAM writes; a VRAM→VRAM
+    /// copy needs a read *and* a write per unit and so runs at half the rate.
+    ///
+    /// A VRAM word occupies two bytes, so words/line = bytes/line ÷ 2. The cost
+    /// is the fraction of scanlines the transfer occupies, rounded up, times the
+    /// per-line CPU-cycle budget.
+    #[must_use]
+    fn dma_cost_cycles(&self, length: u32, copy: bool) -> u32 {
+        if length == 0 {
+            return 0;
+        }
+        let h40 = self.is_h40();
+        let blanking = self.in_vblank || (self.registers[1] & 0x40 == 0);
+        // Bytes movable per scanline, per the Software Manual DMA timing table.
+        let bytes_per_line: u32 = match (h40, blanking) {
+            (true, true) => 205,
+            (true, false) => 18,
+            (false, true) => 167,
+            (false, false) => 16,
+        };
+        // Words per line (each VRAM word = 2 bytes); copy runs at half rate.
+        let mut words_per_line = (bytes_per_line / 2).max(1);
+        if copy {
+            words_per_line = (words_per_line / 2).max(1);
+        }
+        // Fraction of scanlines occupied, rounded up, times the per-line budget.
+        let lines = length.div_ceil(words_per_line);
+        lines.saturating_mul(Self::CPU_CYCLES_PER_LINE)
+    }
+
     /// Executes a pending 68K-to-VRAM/CRAM/VSRAM DMA transfer.
     ///
     /// `read_word` is a callback that reads a 16-bit word from the 68K address space.
@@ -428,6 +618,12 @@ impl Vdp {
         if length == 0 {
             return;
         }
+
+        // Hold the bus (assert DMA-busy and stall the 68000) for the transfer's
+        // cycle cost. The data is moved in one shot below, but the busy window
+        // and CPU stall are charged so software that overlaps DMA with CPU work,
+        // polls DMA-busy, or spreads a transfer across V-blank stays in sync.
+        self.dma_busy_cpu_cycles = self.dma_cost_cycles(length, false);
 
         let src_base = u32::from(self.registers[0x15])
             | (u32::from(self.registers[0x16]) << 8)
@@ -478,6 +674,9 @@ impl Vdp {
     fn execute_dma_fill(&mut self, value: u16) {
         let length = u32::from(self.registers[0x13]) | (u32::from(self.registers[0x14]) << 8);
         let fill_byte = (value >> 8) as u8;
+
+        // Hold the bus for the fill's duration (see `run_dma`).
+        self.dma_busy_cpu_cycles = self.dma_cost_cycles(length.max(1), false);
 
         // First, write the full word to the current VRAM address
         let addr = self.address as usize;
@@ -533,15 +732,27 @@ impl Vdp {
 
     // ---- Rendering ----
 
+    /// Returns true when the VDP is in H40 (40-cell / 320-pixel) horizontal
+    /// mode. This is the single source of truth for horizontal resolution.
+    ///
+    /// H40 requires BOTH RS0 (reg 0x0C bit 0) and RS1 (bit 7) to be set;
+    /// every other bit combination selects H32 (32-cell / 256-pixel) mode.
+    /// Real software uses 0x81 for H40 and 0x00 for H32, so the "both bits"
+    /// rule matches hardware while rejecting the ambiguous single-bit cases.
+    ///
+    /// Vertical timing (NTSC vs PAL line count) is owned separately; this
+    /// helper is strictly about horizontal width.
+    #[inline]
+    #[must_use]
+    fn is_h40(&self) -> bool {
+        (self.registers[0x0C] & (RS0 | RS1)) == (RS0 | RS1)
+    }
+
     /// Returns the horizontal screen width based on the current mode.
     /// H40 = 320 pixels, H32 = 256 pixels.
     #[must_use]
     fn screen_width(&self) -> u16 {
-        if self.registers[0x0C] & 0x81 != 0 {
-            320
-        } else {
-            256
-        }
+        if self.is_h40() { 320 } else { 256 }
     }
 
     /// Returns true if the display is enabled (register 1, bit 6).
@@ -602,7 +813,8 @@ impl Vdp {
     fn window_h_range(&self, screen_width: u16) -> (u16, u16) {
         let reg = self.registers[0x11];
         let cells = u16::from(reg & 0x1F);
-        let pixels = cells * 8;
+        // WHP (reg 0x11) is in units of 2 cells = 16 px on hardware.
+        let pixels = cells * 16;
         if reg & 0x80 != 0 {
             // Window on the right side
             (pixels.min(screen_width), screen_width)
@@ -632,11 +844,7 @@ impl Vdp {
     /// H40 mode = 64 cells wide, H32 mode = 32 cells wide.
     #[must_use]
     fn window_nametable_width(&self) -> u16 {
-        if self.registers[0x0C] & 0x81 != 0 {
-            64
-        } else {
-            32
-        }
+        if self.is_h40() { 64 } else { 32 }
     }
 
     /// Returns the H-scroll data table base address.
@@ -766,14 +974,21 @@ impl Vdp {
     /// 4. Render sprites
     /// 5. Handle priority: high-priority tiles/sprites draw over low-priority
     pub fn render_scanline(&mut self, line: u16) {
-        let width = self.screen_width();
+        // Latch the active display width once at the start of the frame so the
+        // whole frame uses one consistent stride even if reg 0x0C is written
+        // mid-frame; a mode change only takes effect at the next frame boundary.
+        if line == 0 {
+            self.frame_width = self.screen_width();
+        }
+        let width = self.frame_width;
+        let stride = width as usize;
         if line >= 224 || !self.display_enabled() {
-            // During V-blank or if display disabled, fill with background
+            // During V-blank or if display disabled, fill with background.
             let bg = self.background_color();
             let y = line as usize;
             if y < 224 {
-                for x in 0..320usize {
-                    let offset = (y * 320 + x) * 4;
+                for x in 0..stride {
+                    let offset = (y * stride + x) * 4;
                     self.framebuffer[offset..offset + 4].copy_from_slice(&bg);
                 }
             }
@@ -798,8 +1013,16 @@ impl Vdp {
         let mut pixel_color = [[0u8; 4]; 320];
         let mut pixel_priority = [0u8; 320];
 
+        // Shadow/highlight mode gate (reg 0x0C bit 3). When disabled, rendering
+        // is byte-identical to a build without S/H support (no operator
+        // special-casing, plain framebuffer copy at writeback).
+        let sh = self.registers[0x0C] & 0x08 != 0;
+        // Per-pixel operator-sprite modifier: 0 = none, 1 = shadow op, 2 = highlight op.
+        // Only populated by render_sprites_on_line when `sh` is true.
+        let mut sh_op = [0u8; 320];
+
         // Step 1: Background fill
-        for pixel in pixel_color.iter_mut().take(width as usize) {
+        for pixel in pixel_color.iter_mut().take(stride) {
             *pixel = bg_color;
         }
 
@@ -886,7 +1109,14 @@ impl Vdp {
         }
 
         // Step 4: Sprites
-        self.render_sprites_on_line(line, width, &mut pixel_color, &mut pixel_priority);
+        self.render_sprites_on_line(
+            line,
+            width,
+            &mut pixel_color,
+            &mut pixel_priority,
+            sh,
+            &mut sh_op,
+        );
 
         // Step 5: Left column blank (register 0, bit 5)
         if self.registers[0] & 0x20 != 0 {
@@ -896,9 +1126,31 @@ impl Vdp {
         }
 
         // Write final pixel data to framebuffer
-        for (x, color) in pixel_color.iter().enumerate() {
-            let offset = (y * 320 + x) * 4;
-            self.framebuffer[offset..offset + 4].copy_from_slice(color);
+        if sh {
+            // Shadow/highlight: derive per-pixel base intensity from the winning
+            // pixel's priority, fold in any operator-sprite modifier, then apply.
+            for (x, color) in pixel_color.iter().take(stride).enumerate() {
+                // Base: high-priority winners are Normal, everything else Shadow.
+                let base: u8 = if pixel_priority[x] == 2 { 1 } else { 0 };
+                let intensity = match (base, sh_op[x]) {
+                    (_, 0) => base,                    // no operator
+                    (0, 2) => 1,                       // Shadow  + Highlight op -> Normal
+                    (1, 2) => 2,                       // Normal  + Highlight op -> Highlight
+                    (2, 2) => 2,                       // Highlight + Highlight op -> Highlight
+                    (2, 1) => 1,                       // Highlight + Shadow op -> Normal
+                    (1, 1) => 0,                       // Normal  + Shadow op -> Shadow
+                    (0, 1) => 0,                       // Shadow  + Shadow op -> Shadow
+                    _ => base,
+                };
+                let out = Self::apply_intensity(*color, intensity);
+                let offset = (y * stride + x) * 4;
+                self.framebuffer[offset..offset + 4].copy_from_slice(&out);
+            }
+        } else {
+            for (x, color) in pixel_color.iter().take(stride).enumerate() {
+                let offset = (y * stride + x) * 4;
+                self.framebuffer[offset..offset + 4].copy_from_slice(color);
+            }
         }
 
         self.in_hblank = false;
@@ -911,9 +1163,20 @@ impl Vdp {
         width: u16,
         pixel_color: &mut [[u8; 4]; 320],
         pixel_priority: &mut [u8; 320],
+        sh: bool,
+        sh_op: &mut [u8; 320],
     ) {
         let sat_base = self.sprite_table_addr();
         let mut sprites_on_line: usize = 0;
+        // Per-mode sprite limits: H40 evaluates 80 sprites/frame and 20/line,
+        // H32 evaluates 64/frame and 16/line. (The 256-px/line horizontal extent
+        // is already enforced by the `screen_x >= width` clip below; a separate
+        // per-line sprite-dot budget is future work.)
+        let (max_total, max_per_line) = if self.is_h40() {
+            (MAX_SPRITES_TOTAL_H40, MAX_SPRITES_PER_LINE_H40)
+        } else {
+            (MAX_SPRITES_TOTAL_H32, MAX_SPRITES_PER_LINE_H32)
+        };
         // Track which pixels already have a sprite — earlier sprites in the
         // link list have higher visual priority and should not be overwritten
         // by later sprites at the same priority level.
@@ -924,7 +1187,7 @@ impl Vdp {
         let mut sprites_visited: usize = 0;
 
         loop {
-            if sprites_visited >= MAX_SPRITES_TOTAL {
+            if sprites_visited >= max_total {
                 break;
             }
             sprites_visited += 1;
@@ -944,7 +1207,7 @@ impl Vdp {
 
             // Check if this sprite intersects the current scanline
             if line >= sprite_y && line < sprite_y.wrapping_add(sprite_height) {
-                if sprites_on_line >= MAX_SPRITES_PER_LINE {
+                if sprites_on_line >= max_per_line {
                     break; // Max sprites per line reached
                 }
 
@@ -991,6 +1254,20 @@ impl Vdp {
                         }
 
                         let xi = screen_x as usize;
+
+                        // Shadow/highlight operator sprites: palette 3, color
+                        // index 14 (highlight) or 15 (shadow). They do NOT draw
+                        // color or set priority; they record a modifier for the
+                        // pixel behind them, but only if no color sprite has
+                        // already drawn in front (front-to-back order) and no
+                        // nearer operator was already recorded.
+                        if sh && palette == 3 && (color_index == 14 || color_index == 15) {
+                            if !pixel_has_sprite[xi] && sh_op[xi] == 0 {
+                                sh_op[xi] = if color_index == 15 { 1 } else { 2 };
+                            }
+                            continue;
+                        }
+
                         let pri_level = if priority { 2 } else { 1 };
 
                         // Sprite compositing rules:
@@ -1041,6 +1318,8 @@ impl Vdp {
             h_interrupt_pending: self.h_interrupt_pending,
             control_code: self.control_code,
             odd_frame: self.odd_frame,
+            vint_pending: self.vint_pending,
+            dma_busy_cpu_cycles: self.dma_busy_cpu_cycles,
         }
     }
 
@@ -1065,6 +1344,12 @@ impl Vdp {
         self.h_interrupt_pending = snap.h_interrupt_pending;
         self.control_code = snap.control_code;
         self.odd_frame = snap.odd_frame;
+        self.vint_pending = snap.vint_pending;
+        self.dma_busy_cpu_cycles = snap.dma_busy_cpu_cycles;
+        // frame_width is a derived per-frame cache (not serialized). Recompute
+        // it from the restored registers so the returned framebuffer length is
+        // coherent even before the next frame renders.
+        self.frame_width = self.screen_width();
     }
 }
 
@@ -1664,9 +1949,10 @@ mod tests {
             vram_write_word(&mut vdp, nt_win + col as usize * 2, 0x0002);
         }
 
-        // Configure window: left 20 cells (160 pixels), full vertical
-        // Register 0x11: left side (bit 7 = 0), cell count = 20 (0x14)
-        vdp.registers[0x11] = 0x14;
+        // Configure window: left boundary at 160 px (10 cells * 16 px/unit = 160 px),
+        // full vertical.
+        // Register 0x11: left side (bit 7 = 0), count = 10 (0x0A)
+        vdp.registers[0x11] = 0x0A;
         // Register 0x12: full vertical (bit 7 = 0), cell count = 31 (0x1F) -> 248 lines, covers 224
         vdp.registers[0x12] = 0x1F;
 
@@ -1751,9 +2037,10 @@ mod tests {
             vram_write_word(&mut vdp, nt_win + col as usize * 2, 0x0002);
         }
 
-        // Configure window on right side from cell 20 rightward, full vertical
-        // Register 0x11: right side (bit 7 = 1), cell count = 20 -> 0x80 | 0x14 = 0x94
-        vdp.registers[0x11] = 0x94;
+        // Configure window on right side from x=160 rightward, full vertical
+        // (10 cells * 16 px/unit = 160 px boundary).
+        // Register 0x11: right side (bit 7 = 1), count = 10 -> 0x80 | 0x0A = 0x8A
+        vdp.registers[0x11] = 0x8A;
         // Register 0x12: full vertical coverage
         vdp.registers[0x12] = 0x1F;
 
@@ -1856,5 +2143,394 @@ mod tests {
             status2 & 0x0010,
             "odd frame bit should toggle"
         );
+    }
+
+    // ---- Shadow / highlight tests ----
+
+    /// A distinctive mid-gray (all three 3-bit components = 4).
+    /// Normal = [146,146,146,255], Shadow = [73,73,73,255], Highlight = [201,201,201,255].
+    const SH_GRAY: u16 = 0x0888;
+
+    /// Enable shadow/highlight mode (reg 0x0C bit 3) while keeping H40.
+    fn enable_shadow_highlight(vdp: &mut Vdp) {
+        vdp.registers[0x0C] |= 0x08;
+    }
+
+    /// Write a 1x1 sprite as the sole entry of the sprite attribute table,
+    /// positioned at screen (0,0). The sprite tile is filled with `color_index`.
+    fn write_single_sprite(vdp: &mut Vdp, tile: u16, palette: u8, priority: bool, color_index: u8) {
+        write_tile_pattern(vdp, tile, &[[color_index; 8]; 8]);
+        let sat = vdp.sprite_table_addr();
+        // word0: Y raw 128 -> screen Y 0
+        vram_write_word(vdp, sat, 0x0080);
+        // word1: v_size=1, h_size=1, link=0 (end of list)
+        vram_write_word(vdp, sat + 2, 0x0000);
+        // word2: priority | palette | tile
+        let pri_bit = if priority { 0x8000 } else { 0x0000 };
+        let pal_bits = (u16::from(palette) & 0x03) << 13;
+        vram_write_word(vdp, sat + 4, pri_bit | pal_bits | (tile & 0x07FF));
+        // word3: X raw 128 -> screen X 0
+        vram_write_word(vdp, sat + 6, 0x0080);
+    }
+
+    #[test]
+    fn shadow_highlight_disabled_is_unchanged() {
+        let mut vdp = setup_vdp_for_rendering();
+        // reg 0x0C bit 3 stays 0 (S/H disabled).
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        // Scroll A: low-priority tile 1.
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &normal,
+            "S/H disabled: low-priority plane must render at full normal color"
+        );
+    }
+
+    #[test]
+    fn shadow_highlight_low_priority_plane_is_shadowed() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001); // low priority
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(shadow[0], normal[0] >> 1, "shadow halves the component");
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "S/H on: low-priority plane pixel must be shadowed (halved)"
+        );
+    }
+
+    #[test]
+    fn shadow_highlight_high_priority_plane_is_normal() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x8001); // HIGH priority
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &normal,
+            "S/H on: high-priority plane pixel stays at full normal color"
+        );
+    }
+
+    #[test]
+    fn shadow_highlight_backdrop_is_shadowed() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        // Backdrop = palette 0 color 0; give it a visible value.
+        vdp.cram[0] = SH_GRAY;
+        vdp.registers[0x07] = 0x00; // background = CRAM index 0
+
+        // No tiles anywhere -> whole scanline is backdrop (priority 0).
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "S/H on: backdrop (priority 0) must be shadowed"
+        );
+    }
+
+    #[test]
+    fn shadow_operator_sprite_darkens() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        // High-priority (Normal) plane pixel behind the operator.
+        vdp.cram[1] = SH_GRAY;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x8001); // high priority -> Normal base
+
+        // Sentinel: if the operator wrongly drew its own color it would show red.
+        vdp.cram[63] = 0x000E; // palette 3 color 15 -> red
+        // Operator sprite: palette 3, color index 15 (shadow operator).
+        write_single_sprite(&mut vdp, 3, 3, false, 15);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "shadow operator over a Normal pixel yields Shadow"
+        );
+        // Prove the operator did NOT draw its own (red) color.
+        let sentinel = Vdp::color_to_rgba(0x000E);
+        assert_ne!(
+            &vdp.framebuffer[0..4],
+            &sentinel,
+            "operator sprite must not draw its own color"
+        );
+    }
+
+    #[test]
+    fn highlight_operator_sprite_brightens() {
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+
+        // Case (a): highlight operator over a SHADOWED (low-priority) pixel -> Normal.
+        {
+            let mut vdp = setup_vdp_for_rendering();
+            enable_shadow_highlight(&mut vdp);
+            vdp.cram[1] = SH_GRAY;
+            write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+            let nt_a = vdp.scroll_a_nametable_addr();
+            vram_write_word(&mut vdp, nt_a, 0x0001); // low priority -> Shadow base
+            // Operator sprite: palette 3, color index 14 (highlight operator).
+            write_single_sprite(&mut vdp, 3, 3, false, 14);
+
+            vdp.render_scanline(0);
+            assert_eq!(
+                &vdp.framebuffer[0..4],
+                &normal,
+                "highlight operator over a Shadow pixel yields Normal"
+            );
+        }
+
+        // Case (b): highlight operator over a NORMAL (high-priority) pixel -> Highlight.
+        {
+            let mut vdp = setup_vdp_for_rendering();
+            enable_shadow_highlight(&mut vdp);
+            vdp.cram[1] = SH_GRAY;
+            write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+            let nt_a = vdp.scroll_a_nametable_addr();
+            vram_write_word(&mut vdp, nt_a, 0x8001); // high priority -> Normal base
+            write_single_sprite(&mut vdp, 3, 3, false, 14);
+
+            vdp.render_scanline(0);
+            let highlight = Vdp::apply_intensity(normal, 2);
+            assert_eq!(
+                &vdp.framebuffer[0..4],
+                &highlight,
+                "highlight operator over a Normal pixel yields Highlight"
+            );
+            assert!(
+                vdp.framebuffer[0] > normal[0],
+                "highlight must increase brightness"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_sprite_draws_as_color_when_sh_disabled() {
+        let mut vdp = setup_vdp_for_rendering();
+        // S/H DISABLED (bit 3 left at 0).
+        // palette 3 color 15 = a distinct color.
+        vdp.cram[63] = 0x000E; // red
+        write_single_sprite(&mut vdp, 3, 3, false, 15);
+
+        vdp.render_scanline(0);
+
+        let red = Vdp::color_to_rgba(0x000E);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &red,
+            "with S/H disabled, a palette-3 index-15 sprite draws its actual color"
+        );
+    }
+
+    #[test]
+    fn normal_low_priority_sprite_over_low_bg_is_shadowed() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        // Low-priority plane behind (red), distinct from sprite color.
+        vdp.cram[1] = 0x000E; // red
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+        let nt_a = vdp.scroll_a_nametable_addr();
+        vram_write_word(&mut vdp, nt_a, 0x0001); // low priority
+
+        // Normal (non-operator) low-priority sprite, palette 0 color 2 = gray.
+        vdp.cram[2] = SH_GRAY;
+        write_single_sprite(&mut vdp, 3, 0, false, 2);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        let shadow = Vdp::apply_intensity(normal, 0);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &shadow,
+            "low-priority sprite over low-priority bg: winning pixel is shadowed"
+        );
+    }
+
+    #[test]
+    fn high_priority_sprite_is_normal() {
+        let mut vdp = setup_vdp_for_rendering();
+        enable_shadow_highlight(&mut vdp);
+        vdp.cram[2] = SH_GRAY;
+        // High-priority, non-operator sprite (palette 0 color 2).
+        write_single_sprite(&mut vdp, 3, 0, true, 2);
+
+        vdp.render_scanline(0);
+
+        let normal = Vdp::color_to_rgba(SH_GRAY);
+        assert_eq!(
+            &vdp.framebuffer[0..4],
+            &normal,
+            "high-priority sprite renders at full normal color"
+        );
+    }
+
+    // ---- DMA-busy / VInt-latch / status bits (regression tests for the fix) ----
+
+    /// The DMA-busy status bit (bit 1) is not set at reset and does not appear
+    /// in `read_status` until a transfer charges its cycle countdown.
+    #[test]
+    fn dma_busy_defaults_clear() {
+        let vdp = Vdp::new();
+        assert_eq!(vdp.dma_busy_cpu_cycles(), 0);
+        assert!(!vdp.dma_busy());
+        assert_eq!(vdp.read_status() & 0x0002, 0);
+    }
+
+    /// `dma_cost_cycles` charges more cycles in H40 than in H32, and more
+    /// during active display than during blanking (rates from the Sega
+    /// Software Manual DMA timing table).
+    #[test]
+    fn dma_cost_reflects_mode_and_blanking() {
+        let mut vdp = Vdp::new();
+        // H40 mode, display enabled → active-display rates.
+        vdp.registers[0x0C] = 0x81;
+        vdp.registers[1] = 0x40;
+        vdp.in_vblank = false;
+        let h40_active = vdp.dma_cost_cycles(1000, false);
+        // H40, blanking (display off).
+        vdp.registers[1] = 0x00;
+        let h40_blank = vdp.dma_cost_cycles(1000, false);
+        // H32 blanking runs slower per line than H40 blanking.
+        vdp.registers[0x0C] = 0x00;
+        let h32_blank = vdp.dma_cost_cycles(1000, false);
+
+        assert!(
+            h40_active > h40_blank,
+            "active-display DMA stalls the CPU for more cycles than blanking (h40_active={h40_active}, h40_blank={h40_blank})"
+        );
+        assert!(
+            h32_blank > h40_blank,
+            "H32 blanking DMA is slower per line than H40 blanking (h32_blank={h32_blank}, h40_blank={h40_blank})"
+        );
+
+        // Zero-length transfers cost nothing.
+        assert_eq!(vdp.dma_cost_cycles(0, false), 0);
+        // Copy DMA runs at half the rate → costs more than a normal move of
+        // the same length.
+        let move_cost = vdp.dma_cost_cycles(1000, false);
+        let copy_cost = vdp.dma_cost_cycles(1000, true);
+        assert!(copy_cost >= move_cost);
+    }
+
+    /// A pending 68K→VRAM DMA charges DMA-busy for the transfer's cycle cost;
+    /// the status register reflects it; `advance_dma_busy` drains the countdown
+    /// and clears the bit.
+    #[test]
+    fn dma_busy_asserted_by_run_dma_and_drains_to_zero() {
+        let mut vdp = setup_vdp_for_rendering();
+        // 8-word transfer from address 0 into VRAM at 0xE000.
+        vdp.registers[0x13] = 0x08;
+        vdp.registers[0x14] = 0x00;
+        vdp.registers[0x15] = 0x00;
+        vdp.registers[0x16] = 0x00;
+        vdp.registers[0x17] = 0x00;
+        vdp.address = 0xE000;
+        vdp.access_type = Some(AccessType::VramWrite);
+        vdp.dma_pending = true;
+
+        vdp.run_dma(&mut |_addr| 0xBEEF);
+
+        let cost = vdp.dma_busy_cpu_cycles();
+        assert!(cost > 0, "run_dma must charge DMA-busy cycles");
+        assert!(vdp.dma_busy());
+        assert_ne!(
+            vdp.read_status() & 0x0002,
+            0,
+            "status register bit 1 (DMA busy) is set while the transfer holds the bus"
+        );
+
+        // Drain part-way: still busy.
+        vdp.advance_dma_busy(cost / 2);
+        assert!(vdp.dma_busy());
+
+        // Drain the rest: DMA-busy clears.
+        vdp.advance_dma_busy(cost);
+        assert!(!vdp.dma_busy());
+        assert_eq!(vdp.read_status() & 0x0002, 0);
+    }
+
+    /// A VRAM fill also charges DMA-busy and stalls the bus.
+    #[test]
+    fn dma_fill_asserts_dma_busy() {
+        let mut vdp = setup_vdp_for_rendering();
+        vdp.registers[0x13] = 0x40;
+        vdp.registers[0x14] = 0x00;
+        vdp.registers[0x17] = 0x80; // fill
+        vdp.address = 0x0000;
+        vdp.access_type = Some(AccessType::VramWrite);
+
+        vdp.execute_dma_fill(0xABCD);
+
+        assert!(vdp.dma_busy_cpu_cycles() > 0);
+        assert_ne!(vdp.read_status() & 0x0002, 0);
+    }
+
+    /// The V-interrupt-pending (VIP) latch: setting it exposes status bit 7;
+    /// clearing it hides it again.
+    #[test]
+    fn vint_pending_latch_shows_in_status_bit_7() {
+        let mut vdp = Vdp::new();
+        assert!(!vdp.vint_pending());
+        assert_eq!(vdp.read_status() & 0x0080, 0);
+
+        vdp.set_vint_pending();
+        assert!(vdp.vint_pending());
+        assert_ne!(
+            vdp.read_status() & 0x0080,
+            0,
+            "status bit 7 (V-interrupt pending) tracks the latched flag"
+        );
+
+        vdp.clear_vint_pending();
+        assert!(!vdp.vint_pending());
+        assert_eq!(vdp.read_status() & 0x0080, 0);
+    }
+
+    /// Snapshot round-trip preserves the new fields — mirrors the coverage the
+    /// rewind determinism test in `genesoxide-test-harness` relies on.
+    #[test]
+    fn snapshot_roundtrip_covers_vint_and_dma_busy() {
+        let mut vdp = Vdp::new();
+        vdp.set_vint_pending();
+        vdp.dma_busy_cpu_cycles = 1234;
+
+        let snap = vdp.snapshot();
+        assert!(snap.vint_pending);
+        assert_eq!(snap.dma_busy_cpu_cycles, 1234);
+
+        let mut restored = Vdp::new();
+        restored.restore(&snap);
+        assert!(restored.vint_pending());
+        assert_eq!(restored.dma_busy_cpu_cycles(), 1234);
     }
 }

@@ -277,7 +277,7 @@ mod tests {
         );
 
         assert!(metrics.correlation_left > 0.95);
-        assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
+        assert!((0.90..=1.10).contains(&metrics.rms_ratio_left));
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         );
 
         assert!(metrics.correlation_left > 0.95);
-        assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
+        assert!((0.90..=1.10).contains(&metrics.rms_ratio_left));
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
         );
 
         assert!(metrics.correlation_left > 0.95);
-        assert!((0.8..=1.2).contains(&metrics.rms_ratio_left));
+        assert!((0.90..=1.10).contains(&metrics.rms_ratio_left));
     }
 
     /// Build a single-carrier tone driving the SSG-EG in a looping configuration:
@@ -418,7 +418,7 @@ mod tests {
                 m.correlation_left
             );
             assert!(
-                (0.8..=1.2).contains(&m.rms_ratio_left),
+                (0.90..=1.10).contains(&m.rms_ratio_left),
                 "algorithm {algo} level off vs ymfm: rms_ratio={:.4}",
                 m.rms_ratio_left
             );
@@ -470,7 +470,7 @@ mod tests {
                 min_corr
             );
             assert!(
-                (0.8..=1.2).contains(&m.rms_ratio_left),
+                (0.90..=1.10).contains(&m.rms_ratio_left),
                 "PM pms={pms} level off vs ymfm: rms_ratio={:.4}",
                 m.rms_ratio_left
             );
@@ -494,8 +494,11 @@ mod tests {
                 "SSG mode {mode:#04x} shape diverged: corr={:.4}",
                 m.correlation_left
             );
-            // The attack modes must no longer collapse to silence; every mode should
-            // land near the ~0.93x per-channel level ymfm produces.
+            // The attack modes must no longer collapse to silence. SSG-EG rms_ratio
+            // still varies by mode (envelope shape/timing differences, not output
+            // level — the FM output scale itself is now centered on ymfm at
+            // rms_ratio ~1.0, see `Ym2612::FM_SCALE`), so this only guards against a
+            // near-silent collapse rather than pinning a tight level window.
             assert!(
                 m.rms_ratio_left > 0.5,
                 "SSG mode {mode:#04x} too quiet vs ymfm: rms_ratio={:.4}",
@@ -578,6 +581,123 @@ mod tests {
                 genesoxide_zc,
                 ymfm_zc,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pitch_accuracy {
+    use super::*;
+    use crate::vgm::{VgmBuilder, estimate_frequency, left_channel, zero_crossings};
+
+    /// Theoretical YM2612 output frequency for a single MUL=1 operator:
+    /// `f = fnum * clock / (144 * 2^(21 - block))`.
+    fn theoretical_hz(fnum: u16, block: u8, clock: u32) -> f64 {
+        (fnum as f64) * (clock as f64) / (144.0 * 2f64.powi(21 - block as i32))
+    }
+
+    /// Build a single sustained carrier (algorithm 7, op1 only) at the given
+    /// frequency register / detune / multiple, keyed on for `wait` samples.
+    fn detuned_tone(fnum: u16, block: u8, dt: u8, mul: u8) -> crate::vgm::Vgm {
+        let fnum_hi = ((block & 7) << 3) | ((fnum >> 8) & 0x07) as u8;
+        let fnum_lo = (fnum & 0xFF) as u8;
+        VgmBuilder::new()
+            .ym_write(0, 0xB0, 0x07)
+            .ym_write(0, 0xB4, 0xC0)
+            .ym_write(0, 0x40, 127)
+            .ym_write(0, 0x44, 127)
+            .ym_write(0, 0x48, 127)
+            .ym_write(0, 0x4C, 127)
+            .ym_write(0, 0x30, (dt << 4) | (mul & 0x0F)) // op1 DT | MUL
+            .ym_write(0, 0x40, 0x00) // op1 TL=0
+            .ym_write(0, 0x50, 0x1F) // AR=31
+            .ym_write(0, 0x60, 0x00)
+            .ym_write(0, 0x70, 0x00)
+            .ym_write(0, 0x80, 0x0F)
+            .ym_write(0, 0xA4, fnum_hi)
+            .ym_write(0, 0xA0, fnum_lo)
+            .ym_write(0, 0x28, 0x10)
+            .wait(88_200)
+            .build()
+    }
+
+    fn measured_hz(samples: &[f32]) -> f64 {
+        let left = left_channel(samples);
+        let start = 2_000.min(left.len());
+        estimate_frequency(&left[start..], 44_100) as f64
+    }
+
+    /// The YM2612 phase increment must track ymfm's `compute_phase_step` in the
+    /// doubled-fnum domain, including detune folded into the base step *before*
+    /// the frequency multiple. Historically genesoxide's base step already
+    /// matched ymfm bit-for-bit (the `(fnum<<block)>>1` vs `(fnum<<1<<block)>>2`
+    /// forms are numerically identical, so there was never a low-fnum "flat"
+    /// error), but detune was applied *after* the multiply. That left detuned,
+    /// high-MUL notes up to ~2.5 cents off ymfm (e.g. fnum=601 block=4 DT=3
+    /// MUL=8 measured 1954.34 Hz vs ymfm 1957.15 Hz, ~2.49 cents flat); DT=0 and
+    /// MUL=1 notes were already exact. This guards both properties.
+    #[test]
+    fn low_fnum_and_detune_pitch_matches_ymfm() {
+        let clock = 7_670_453u32;
+        let cents = |meas: f64, refr: f64| 1200.0 * (meas / refr).log2();
+
+        // (fnum, block, dt, mul). Low-fnum DT=0 tones across low blocks pin the
+        // base-step precision to theory; detuned high-MUL tones pin the detune
+        // folding to ymfm (these are the cases the fix corrects).
+        let cases = [
+            (73u16, 7u8, 0u8, 1u8),
+            (101, 7, 0, 1),
+            (151, 7, 0, 1),
+            (73, 6, 0, 1),
+            (101, 5, 0, 1),
+            (301, 5, 0, 1),
+            (601, 6, 1, 1),
+            (601, 6, 3, 1),
+            (601, 6, 7, 1),
+            (601, 5, 1, 2),
+            (601, 5, 3, 2),
+            (601, 4, 1, 4),
+            (601, 4, 3, 4),
+            (601, 4, 3, 8),
+        ];
+
+        for (fnum, block, dt, mul) in cases {
+            let vgm = detuned_tone(fnum, block, dt, mul);
+            let gene = VgmRenderer::with_clock(clock).render(&vgm);
+            let ymfm = Ymfm2612Renderer::with_clock(clock).render(&vgm);
+            let gf = measured_hz(&gene);
+            let yf = measured_hz(&ymfm);
+
+            let vs_ymfm = cents(gf, yf);
+            eprintln!(
+                "fnum={fnum} block={block} dt={dt} mul={mul}: gene={gf:.4} ymfm={yf:.4} \
+                 gene_vs_ymfm={vs_ymfm:+.3}c zc_g={} zc_y={}",
+                zero_crossings(&left_channel(&gene)),
+                zero_crossings(&left_channel(&ymfm)),
+            );
+
+            // Genesoxide must track ymfm within 1 cent for every fnum/detune/MUL
+            // combination. The measurement is zero-crossing based so it is
+            // exact when both cores emit identical crossings (the fix makes them
+            // identical); 1 cent leaves headroom for resampling jitter.
+            assert!(
+                vs_ymfm.abs() < 1.0,
+                "fnum={fnum} block={block} dt={dt} mul={mul}: pitch {gf:.4} Hz diverged \
+                 from ymfm {yf:.4} Hz by {vs_ymfm:+.3} cents",
+            );
+
+            // For undetuned MUL=1 tones the phase step is exact, so the measured
+            // pitch must also sit within 2 cents of the closed-form theoretical
+            // frequency (bounded by zero-crossing quantization at these blocks).
+            if dt == 0 && mul == 1 {
+                let tf = theoretical_hz(fnum, block, clock);
+                let vs_theo = cents(gf, tf);
+                assert!(
+                    vs_theo.abs() < 2.0,
+                    "fnum={fnum} block={block}: pitch {gf:.4} Hz off theoretical \
+                     {tf:.4} Hz by {vs_theo:+.3} cents",
+                );
+            }
         }
     }
 }

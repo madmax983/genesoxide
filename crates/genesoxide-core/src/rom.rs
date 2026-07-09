@@ -3,7 +3,24 @@
 //! Genesis cartridge ROMs have a header at offset 0x100-0x1FF containing
 //! metadata: system type, copyright, game title, ROM/RAM addresses, region.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// Byte-lane layout of cartridge backup RAM (SRAM).
+///
+/// Genesis 8-bit backup RAM is wired to only one half of the 16-bit data bus.
+/// `Even` maps SRAM bytes onto even 68000 addresses (the high byte of a word),
+/// `Odd` onto odd addresses (the low byte). `Both` is used for word-wide backup
+/// RAM (and for the header-less default) where every byte address is backing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SramLayout {
+    /// SRAM backs every byte address in the window (word-wide / 16-bit).
+    Both,
+    /// SRAM only responds on even addresses (high byte of each word).
+    EvenOnly,
+    /// SRAM only responds on odd addresses (low byte of each word).
+    OddOnly,
+}
 
 /// Parsed Genesis ROM header.
 #[derive(Debug, Clone)]
@@ -30,6 +47,17 @@ pub struct RomHeader {
     pub checksum: u16,
     /// Region codes string (e.g., "JUE").
     pub region: String,
+    /// True if the header declares battery-backed cartridge SRAM
+    /// (the 'RA' marker at 0x1B0 with the backup-RAM type pattern at 0x1B2).
+    pub has_sram: bool,
+    /// SRAM window start address (68000 address space), from 0x1B4.
+    pub sram_start: u32,
+    /// SRAM window end address (68000 address space), from 0x1B8.
+    pub sram_end: u32,
+    /// Raw SRAM type/flags byte at 0x1B2 (odd/even/word layout selection).
+    pub sram_type: u8,
+    /// Decoded byte-lane layout of the backup RAM.
+    pub sram_layout: SramLayout,
 }
 
 /// Errors that can occur when parsing a ROM.
@@ -106,6 +134,30 @@ pub fn parse_header(data: &[u8]) -> Result<RomHeader, RomError> {
         return Err(RomError::InvalidSystemType(system_type));
     }
 
+    // Cartridge backup-RAM (SRAM) descriptor at 0x1B0-0x1BB.
+    //   0x1B0: 'RA' marker (0x5241 big-endian) when external RAM is present.
+    //   0x1B2: type/flags byte. Bits 6-5 == 0b10 (the 0xA0 nibble pattern)
+    //          indicates backup RAM is present. Bit 3 = even-byte-only,
+    //          bit 4 = odd-byte-only; neither set => word/both.
+    //   0x1B3: reserved flags byte (parsed but unused here).
+    //   0x1B4: SRAM start address (u32 big-endian).
+    //   0x1B8: SRAM end address (u32 big-endian).
+    let sram_marker = read_u16_be(data, 0x1B0);
+    let sram_type = data[0x1B2];
+    // The canonical "backup RAM present" type value is 0xA0 (bits 7 and 5 set,
+    // the "0xA0 nibble pattern"); odd/even layout bits live in bits 3/4.
+    let backup_present = (sram_type & 0xA0) == 0xA0;
+    let has_sram = sram_marker == 0x5241 && backup_present;
+    let sram_layout = if sram_type & 0x08 != 0 {
+        SramLayout::EvenOnly
+    } else if sram_type & 0x10 != 0 {
+        SramLayout::OddOnly
+    } else {
+        SramLayout::Both
+    };
+    let sram_start = read_u32_be(data, 0x1B4);
+    let sram_end = read_u32_be(data, 0x1B8);
+
     Ok(RomHeader {
         system_type,
         copyright: read_ascii(data, 0x110, 16),
@@ -118,6 +170,11 @@ pub fn parse_header(data: &[u8]) -> Result<RomHeader, RomError> {
         ram_start: read_u32_be(data, 0x1A8),
         ram_end: read_u32_be(data, 0x1AC),
         region: read_ascii(data, 0x1F0, 3),
+        has_sram,
+        sram_start,
+        sram_end,
+        sram_type,
+        sram_layout,
     })
 }
 
@@ -191,5 +248,63 @@ mod tests {
         let checksum = compute_checksum(&rom);
         rom[0x18E..0x190].copy_from_slice(&checksum.to_be_bytes());
         assert!(verify_checksum(&rom));
+    }
+
+    /// Writes an SRAM descriptor into a ROM buffer at 0x1B0-0x1BB.
+    fn write_sram_descriptor(rom: &mut [u8], type_byte: u8, start: u32, end: u32) {
+        rom[0x1B0..0x1B2].copy_from_slice(&0x5241u16.to_be_bytes()); // 'RA'
+        rom[0x1B2] = type_byte;
+        rom[0x1B3] = 0x20;
+        rom[0x1B4..0x1B8].copy_from_slice(&start.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&end.to_be_bytes());
+    }
+
+    #[test]
+    fn no_sram_marker_means_no_sram() {
+        let rom = make_minimal_rom();
+        let header = parse_header(&rom).unwrap();
+        assert!(!header.has_sram);
+    }
+
+    #[test]
+    fn sram_layout_both() {
+        let mut rom = make_minimal_rom();
+        // 0xA0 = bits 6,5 == 0b10, no odd/even bit => Both.
+        write_sram_descriptor(&mut rom, 0xA0, 0x200000, 0x20FFFF);
+        let header = parse_header(&rom).unwrap();
+        assert!(header.has_sram);
+        assert_eq!(header.sram_layout, SramLayout::Both);
+        assert_eq!(header.sram_start, 0x200000);
+        assert_eq!(header.sram_end, 0x20FFFF);
+    }
+
+    #[test]
+    fn sram_layout_even_only() {
+        let mut rom = make_minimal_rom();
+        // 0xA8 = 0xA0 | bit3 (even-only).
+        write_sram_descriptor(&mut rom, 0xA8, 0x200000, 0x20FFFF);
+        let header = parse_header(&rom).unwrap();
+        assert!(header.has_sram);
+        assert_eq!(header.sram_layout, SramLayout::EvenOnly);
+    }
+
+    #[test]
+    fn sram_layout_odd_only() {
+        let mut rom = make_minimal_rom();
+        // 0xB0 = 0xA0 | bit4 (odd-only).
+        write_sram_descriptor(&mut rom, 0xB0, 0x200001, 0x20FFFF);
+        let header = parse_header(&rom).unwrap();
+        assert!(header.has_sram);
+        assert_eq!(header.sram_layout, SramLayout::OddOnly);
+        assert_eq!(header.sram_start, 0x200001);
+    }
+
+    #[test]
+    fn sram_marker_without_backup_pattern_ignored() {
+        let mut rom = make_minimal_rom();
+        // 'RA' present but type bits 6,5 not 0b10 (0x00) => not backup RAM.
+        write_sram_descriptor(&mut rom, 0x00, 0x200000, 0x20FFFF);
+        let header = parse_header(&rom).unwrap();
+        assert!(!header.has_sram);
     }
 }
