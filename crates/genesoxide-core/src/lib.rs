@@ -19,7 +19,11 @@ pub use api::{
     AudioEqKind, AudioEqStage, AudioOutputConfig, AudioOutputProfile, Button, Command, CoreQuery,
     GenesisCore, GenesisCoreSnapshot, PadType,
 };
-pub use api::{FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_RGBA_BYTES, FRAME_WIDTH};
+pub use api::{
+    FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_PERIOD_NS_PAL, FRAME_RGBA_BYTES, FRAME_RGBA_BYTES_MAX,
+    FRAME_WIDTH, MAX_FRAME_HEIGHT,
+};
+pub use scheduler::Region;
 pub use rewind::{
     ArrayDelta, CompressedTimeline, FrameDelta, FrameInput, KeyframePolicy, RewindBuffer,
     RewindConfig, RewindStatus,

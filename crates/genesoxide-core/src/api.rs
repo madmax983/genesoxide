@@ -11,7 +11,7 @@ use crate::io::ControllerPort;
 use crate::psg;
 use crate::rewind;
 use crate::rom::{self, RomHeader, SramLayout};
-use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Scheduler};
+use crate::scheduler::{MASTER_CLOCK_NTSC, MASTER_PER_CPU, MASTER_PER_Z80, Region, Scheduler};
 use crate::vdp::Vdp;
 use crate::ym2612;
 use crate::z80;
@@ -24,23 +24,36 @@ use serde::{Deserialize, Serialize};
 /// can be narrower (H32 = 256px); query it via
 /// [`CoreQuery::FramebufferDimensions`] / [`GenesisCore::framebuffer_dimensions`].
 pub const FRAME_WIDTH: usize = 320;
-/// Genesis visible frame height in pixels (NTSC). Constant across H32/H40.
+/// Genesis visible frame height in pixels (NTSC / V28). Constant across H32/H40.
 pub const FRAME_HEIGHT: usize = 224;
-/// Framebuffer byte count for RGBA8 format at the H40 maximum (320x224x4).
+/// Maximum visible frame height in pixels (PAL V30, 240 lines).
 ///
-/// This is the size of the physical backing buffer. The slice returned by
-/// [`GenesisCore::framebuffer_rgba`] is this length in H40 but shorter (256x224x4)
-/// in H32 — do not assume a fixed length; use the dimension query.
+/// The VDP framebuffer is always allocated at this height so a V28→V30 mode
+/// switch never reallocates; the active slice is sized to the current mode.
+pub const MAX_FRAME_HEIGHT: usize = 240;
+/// Framebuffer byte count for RGBA8 format at the nominal 320x224 (H40 / V28).
+///
+/// The slice returned by [`GenesisCore::framebuffer_rgba`] can be narrower (H32 =
+/// 256px width) or taller (PAL V30 = 240 lines) — do not assume a fixed length;
+/// query it via [`CoreQuery::FramebufferDimensions`] /
+/// [`GenesisCore::framebuffer_dimensions`].
 pub const FRAME_RGBA_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
+/// Framebuffer allocation byte count for RGBA8 at the maximum size
+/// (H40 width × V30 height, 320×240): large enough that neither an H32↔H40 width
+/// change nor a V28↔V30 height change ever reallocates.
+pub const FRAME_RGBA_BYTES_MAX: usize = FRAME_WIDTH * MAX_FRAME_HEIGHT * 4;
 /// NTSC frame rate in millihertz (59.92 Hz * 1000).
 pub const FPS_MILLI: u32 = 59_920;
 /// NTSC frame period in nanoseconds.
 /// Derived from master clock: 53_693_175 Hz / (3420 dots × 262 lines) = 59.9227 Hz.
 pub const FRAME_PERIOD_NS: u64 = 16_688_155;
+/// PAL frame period in nanoseconds.
+/// Derived from master clock: 53_203_424 Hz / (3420 dots × 313 lines) ≈ 49.7014 Hz.
+pub const FRAME_PERIOD_NS_PAL: u64 = Region::Pal.frame_period_ns();
 
 /// Scanlines per frame (NTSC): 224 active + 38 blanking = 262 total.
 pub const SCANLINES_PER_FRAME: u16 = 262;
-/// Active (visible) scanlines.
+/// Active (visible) scanlines (NTSC / V28).
 pub const ACTIVE_SCANLINES: u16 = 224;
 /// NTSC Genesis master-clock ticks per scanline in H40 timing.
 const MASTER_TICKS_PER_SCANLINE: u64 = 3420;
@@ -1029,6 +1042,10 @@ pub enum Command {
     /// Select the physical pad type on a port (`true` = 6-button, `false` =
     /// 3-button).
     SetPadType { port: u8, six_button: bool },
+    /// Override the console region (`None` = auto-detect from the ROM header).
+    /// Applied immediately: the effective region and version register update to
+    /// reflect the override (or fall back to the loaded header when cleared).
+    SetRegionOverride(Option<Region>),
     /// Set emulation speed in permille (1000 = normal).
     SetSpeed(u16),
     /// Set audio output sample rate in Hz (e.g. 44100, 48000).
@@ -1122,6 +1139,99 @@ const DEFAULT_SRAM_END: u32 = 0x20_FFFF;
 const DEFAULT_SRAM_SIZE: usize = 0x8000;
 /// SSF SRAM write-enable register (odd byte of the 0xA130F0 word).
 const SSF_SRAM_ENABLE_ADDR: u32 = 0x00A1_30F1;
+
+/// Base address of the SSF2 (Sega) bank-register block. The odd bytes
+/// 0xA130F3, F5, F7, F9, FB, FD, FF select the physical bank mapped into
+/// windows 1..=7 of the 4MB cartridge window. (0xA130F1 is the SRAM-enable
+/// register handled separately.)
+const SSF2_BANK_BASE: u32 = 0x00A1_30F1;
+/// Size of one SSF2 window / physical bank (512KB).
+const SSF2_BANK_SIZE: usize = 0x8_0000;
+
+/// Cartridge address mapper. Decides how a 68000 cartridge-window address
+/// (0x000000–0x3FFFFF) maps onto the flat `rom: Vec<u8>` backing store.
+///
+/// - `Flat`: plain 4MB-masked pass-through (all ROMs ≤4MB).
+/// - `Ssf2`: the Sega/SSF2 >4MB banking scheme. The 4MB window is divided
+///   into eight 512KB windows; window 0 is fixed to physical bank 0, windows
+///   1..=7 are steered by the odd 0xA130F3..0xA130FF byte registers, letting an
+///   up-to-8MB ROM be paged into 0x080000–0x3FFFFF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mapper {
+    /// Flat 4MB-masked ROM (no banking).
+    Flat,
+    /// SSF2 (Sega) bank mapper; `banks[w]` is the physical bank in window `w`.
+    Ssf2 {
+        /// Physical 512KB bank selected for each of the 8 windows.
+        banks: [u8; 8],
+    },
+}
+
+impl Default for Mapper {
+    fn default() -> Self {
+        Mapper::Flat
+    }
+}
+
+impl Mapper {
+    /// Default identity bank table for a freshly powered SSF2 cartridge.
+    const SSF2_DEFAULT_BANKS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    /// Chooses a mapper for a ROM of the given length. ROMs larger than 4MB
+    /// use the SSF2 banker; everything else stays flat.
+    #[must_use]
+    fn for_rom(rom_len: usize) -> Mapper {
+        if rom_len > 0x40_0000 {
+            Mapper::Ssf2 {
+                banks: Self::SSF2_DEFAULT_BANKS,
+            }
+        } else {
+            Mapper::Flat
+        }
+    }
+
+    /// Translates a 68000 cartridge-window address into a physical offset into
+    /// the flat ROM backing store.
+    #[must_use]
+    fn rom_offset(&self, addr: u32) -> usize {
+        match self {
+            Mapper::Flat => (addr & 0x3F_FFFF) as usize,
+            Mapper::Ssf2 { banks } => {
+                let window = ((addr >> 19) & 0x7) as usize;
+                let bank = banks[window] as usize;
+                bank * SSF2_BANK_SIZE + (addr & 0x7_FFFF) as usize
+            }
+        }
+    }
+
+    /// Handles a byte write to a bank-select register (0xA130F3..0xA130FF, odd
+    /// addresses). Returns `true` if `addr` was a bank register (and was
+    /// consumed), `false` otherwise. A no-op on a `Flat` mapper.
+    fn write_bank_register(&mut self, addr: u32, val: u8) -> bool {
+        // Windows 1..=7 live at 0xA130F3, F5, F7, F9, FB, FD, FF.
+        if addr <= SSF2_BANK_BASE || addr > SSF2_BANK_BASE + 14 || (addr & 1) == 0 {
+            return false;
+        }
+        let window = ((addr - SSF2_BANK_BASE) / 2) as usize; // 1..=7
+        if let Mapper::Ssf2 { banks } = self {
+            banks[window] = val;
+        }
+        true
+    }
+
+    /// Restores default (power-on) bank assignments.
+    fn reset(&mut self) {
+        if let Mapper::Ssf2 { banks } = self {
+            *banks = Self::SSF2_DEFAULT_BANKS;
+        }
+    }
+}
+
+/// Reads a single ROM byte through the active mapper, matching the flat path's
+/// out-of-range behavior (reads past the end of ROM return 0).
+fn rom_read_byte(rom: &[u8], mapper: &Mapper, addr: u32) -> u8 {
+    rom.get(mapper.rom_offset(addr)).copied().unwrap_or(0)
+}
 
 impl CartSram {
     /// A disabled, empty SRAM (used before a ROM is loaded).
@@ -1285,6 +1395,26 @@ pub struct GenesisCoreSnapshot {
     pub speed_permille: u16,
     /// Whether emulation is paused.
     pub paused: bool,
+    /// Cartridge address mapper (bank state). Defaults to `Flat` for old save
+    /// states written before the mapper field existed.
+    #[serde(default)]
+    pub mapper: Mapper,
+    /// Effective console region. Defaults to NTSC for save states written
+    /// before region support.
+    #[serde(default)]
+    pub region: Region,
+    /// Overseas (non-Japan) machine flag for the version register. Defaults to
+    /// overseas (true) to match the legacy 0xA0 version byte.
+    #[serde(default = "default_overseas")]
+    pub overseas: bool,
+    /// Configured region override (`None` = auto-detect from header).
+    #[serde(default)]
+    pub region_override: Option<Region>,
+}
+
+/// Serde default for the snapshot's `overseas` flag (legacy = overseas NTSC).
+fn default_overseas() -> bool {
+    true
 }
 
 /// A YM2612 register write observed on the live machine timeline.
@@ -1557,6 +1687,8 @@ pub struct GenesisCore {
     port2: ControllerPort,
     /// Cartridge ROM data.
     rom: Vec<u8>,
+    /// Cartridge address mapper (flat or SSF2 >4MB banker).
+    mapper: Mapper,
     /// Parsed ROM header (if loaded).
     rom_header: Option<RomHeader>,
     /// Cartridge backup RAM (battery save) state.
@@ -1712,12 +1844,24 @@ pub struct GenesisCore {
     paused: bool,
     /// Time-travel rewind buffer (anchor + delta compressed timeline).
     rewind: rewind::RewindBuffer,
+    /// Effective console region (NTSC/PAL). Derived from the ROM header at load
+    /// time unless overridden via [`Command::SetRegionOverride`].
+    region: Region,
+    /// True when the machine reports as an overseas (non-Japan) unit in the
+    /// 0xA10001 version register. PAL machines are always overseas.
+    overseas: bool,
+    /// Region override from configuration. When `Some`, it wins over the ROM
+    /// header's region field.
+    region_override: Option<Region>,
 }
 
 impl GenesisCore {
     fn output_tick_for_sample(&self, sample_index: u64) -> u64 {
         let rate = self.audio_sample_rate.round().max(1.0) as u64;
-        ((u128::from(sample_index) * u128::from(MASTER_CLOCK_NTSC) + u128::from(rate / 2))
+        // Convert an output-sample index to an absolute master-clock tick using
+        // the region's master clock. A PAL frame (313 lines × 3420 ticks at the
+        // slower PAL clock) then yields ~50 Hz worth of samples with no drift.
+        ((u128::from(sample_index) * u128::from(self.region.master_clock()) + u128::from(rate / 2))
             / u128::from(rate)) as u64
     }
 
@@ -1823,6 +1967,7 @@ impl GenesisCore {
             port1: ControllerPort::new(),
             port2: ControllerPort::new(),
             rom: Vec::new(),
+            mapper: Mapper::Flat,
             rom_header: None,
             sram: CartSram::empty(),
             work_ram: Box::new([0; 0x10000]),
@@ -1904,6 +2049,9 @@ impl GenesisCore {
             speed_permille: 1000,
             paused: false,
             rewind: rewind::RewindBuffer::new(rewind::RewindConfig::default()),
+            region: Region::Ntsc,
+            overseas: true,
+            region_override: None,
         };
         core.reset_audio_resampler_state();
         core
@@ -1934,6 +2082,10 @@ impl GenesisCore {
                     PadType::ThreeButton
                 };
                 self.controller_port_mut(port).set_pad_type(pad_type);
+            }
+            Command::SetRegionOverride(region) => {
+                self.region_override = region;
+                self.apply_region();
             }
             Command::SetSpeed(s) => self.speed_permille = s,
             Command::SetAudioSampleRate(rate) => {
@@ -1977,10 +2129,14 @@ impl GenesisCore {
     /// Returns the current framebuffer dimensions `(width, height)` in pixels.
     ///
     /// Width follows the VDP horizontal mode (320 in H40, 256 in H32); height
-    /// is always 224 (NTSC). Answers [`CoreQuery::FramebufferDimensions`].
+    /// follows the region/vertical mode (224 in V28, 240 in PAL V30). Answers
+    /// [`CoreQuery::FramebufferDimensions`].
     #[must_use]
     pub fn framebuffer_dimensions(&self) -> (u32, u32) {
-        (u32::from(self.vdp.display_width()), FRAME_HEIGHT as u32)
+        (
+            u32::from(self.vdp.display_width()),
+            self.vdp.active_height() as u32,
+        )
     }
 
     /// Returns the frame counter.
@@ -2200,6 +2356,10 @@ impl GenesisCore {
             frame_count: self.frame_count,
             speed_permille: self.speed_permille,
             paused: self.paused,
+            mapper: self.mapper.clone(),
+            region: self.region,
+            overseas: self.overseas,
+            region_override: self.region_override,
         }
     }
 
@@ -2228,6 +2388,13 @@ impl GenesisCore {
         self.frame_count = snap.frame_count;
         self.speed_permille = snap.speed_permille;
         self.paused = snap.paused;
+        self.mapper = snap.mapper.clone();
+        self.region = snap.region;
+        self.overseas = snap.overseas;
+        self.region_override = snap.region_override;
+        // Keep the VDP's region field consistent with the restored region so
+        // its V-counter wrap and active-height derivation match.
+        self.vdp.set_region(self.region);
         // Rebuild the audio resampler/filter pipeline so the (excluded) DSP
         // scratch state is consistent with the restored chip state.
         self.reset_audio_resampler_state();
@@ -2296,17 +2463,86 @@ impl GenesisCore {
         // default). A newly loaded ROM starts with a fresh, empty save; the
         // host may repopulate it afterwards via `load_sram`.
         self.sram = CartSram::from_header(self.rom_header.as_ref());
+        self.mapper = Mapper::for_rom(data.len());
         self.rom = data;
+        // Derive the effective region (header, unless overridden) before the
+        // power cycle so the VDP starts the first frame in the right mode.
+        self.apply_region();
         self.power_cycle();
+    }
+
+    /// Recomputes the effective region and overseas flag from the ROM header and
+    /// any configured override, then propagates the region to the VDP.
+    ///
+    /// Effective region = `region_override` if set, otherwise the header-derived
+    /// region. The overseas flag (version-register bit 7) is header-derived but
+    /// forced true for PAL, since PAL hardware is always an overseas unit.
+    fn apply_region(&mut self) {
+        let (header_region, header_overseas) =
+            region_and_overseas_from_header(self.rom_header.as_ref());
+        self.region = self.region_override.unwrap_or(header_region);
+        self.overseas = header_overseas || self.region.is_pal();
+        self.vdp.set_region(self.region);
+    }
+
+    /// The byte returned by the 0xA10001 hardware version register.
+    ///
+    /// Layout: bit 7 = overseas (1) / domestic Japan (0), bit 6 = PAL (1) /
+    /// NTSC (0), bit 5 = no expansion connected (1), bits 3-0 = VDP revision (0).
+    /// So overseas NTSC = 0xA0, PAL = 0xE0, domestic (Japan) NTSC = 0x20.
+    #[must_use]
+    pub fn version_register_byte(&self) -> u8 {
+        let mut v = 0x20; // bit 5: no expansion unit connected
+        if self.overseas {
+            v |= 0x80;
+        }
+        if self.region.is_pal() {
+            v |= 0x40;
+        }
+        v
+    }
+
+    /// The effective console region (NTSC/PAL).
+    #[must_use]
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// True when the effective region is 50 Hz PAL.
+    #[must_use]
+    pub fn is_pal(&self) -> bool {
+        self.region.is_pal()
+    }
+
+    /// Active framebuffer dimensions `(width, height)` for the current mode.
+    ///
+    /// Width follows the VDP horizontal mode (320 in H40, 256 in H32); height
+    /// follows the region/vertical mode (224 in V28, 240 in PAL V30). Frontends
+    /// should size their output surface from this and re-check it each frame for
+    /// mode switches.
+    #[must_use]
+    pub fn frame_dimensions(&self) -> (usize, usize) {
+        (self.vdp.display_width() as usize, self.vdp.active_height())
+    }
+
+    /// Nominal frame period in nanoseconds for the effective region (NTSC
+    /// 16_688_155 ns, PAL 20_120_134 ns). Used by frontends to pace output.
+    #[must_use]
+    pub fn frame_period_ns(&self) -> u64 {
+        self.region.frame_period_ns()
     }
 
     fn power_cycle(&mut self) {
         self.cpu = Cpu::new();
         self.vdp = Vdp::new();
+        // The fresh VDP defaults to NTSC; restore the effective region so the
+        // V-counter wrap and V30 availability survive a power cycle.
+        self.vdp.set_region(self.region);
         self.scheduler = Scheduler::new();
         self.work_ram.fill(0);
         self.z80 = z80::Z80::new();
         self.z80_ram.fill(0);
+        self.mapper.reset();
         self.z80_bank = 0;
         self.z80_bus_requested = false;
         self.z80_reset = true;
@@ -2354,8 +2590,10 @@ impl GenesisCore {
         self.cpu.pc = self.cpu.pc.wrapping_add(2);
 
         // Build a bus wrapper that borrows the non-CPU fields.
+        let version_reg = self.version_register_byte();
         let mut bus = CoreBus {
             rom: &self.rom,
+            mapper: &mut self.mapper,
             sram: &mut self.sram,
             work_ram: &mut self.work_ram,
             vdp: &mut self.vdp,
@@ -2376,6 +2614,7 @@ impl GenesisCore {
             frame_count: self.frame_count,
             scanline,
             master_tick,
+            version_reg,
         };
 
         let cycles = cpu::execute_instruction(&mut self.cpu, opcode, &mut bus);
@@ -2461,7 +2700,14 @@ impl GenesisCore {
         self.vdp.set_vblank(false);
         self.z80.int_line = false;
 
-        for scanline in 0..SCANLINES_PER_FRAME {
+        // Region-aware frame geometry: total lines come from the region (262
+        // NTSC / 313 PAL); the active (visible) count is the VDP's current
+        // vertical mode (224 V28 / 240 PAL V30), latched once at frame start so
+        // a mid-frame register write cannot change the frame's shape.
+        let total_scanlines = self.region.total_scanlines();
+        let active_scanlines = self.vdp.active_height() as u16;
+
+        for scanline in 0..total_scanlines {
             let scanline_start_tick = self.audio_master_tick;
             let ym_trace_start = self.ym2612_timed_write_trace.len();
             let psg_trace_start = self.psg_timed_write_trace.len();
@@ -2498,7 +2744,7 @@ impl GenesisCore {
             // it here, just before the Z80 is stepped one scanline later, giving
             // the Z80 exactly one asserted-line window. The frame-start clear
             // above remains as a safety net.
-            if scanline == ACTIVE_SCANLINES + 2 {
+            if scanline == active_scanlines + 2 {
                 self.z80.int_line = false;
             }
 
@@ -2549,8 +2795,10 @@ impl GenesisCore {
                 self.vdp.clear_h_interrupt();
                 let cpu_master_tick =
                     scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
+                let version_reg = self.version_register_byte();
                 let mut bus = CoreBus {
                     rom: &self.rom,
+                    mapper: &mut self.mapper,
                     sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
@@ -2571,6 +2819,7 @@ impl GenesisCore {
                     frame_count: self.frame_count,
                     scanline,
                     master_tick: cpu_master_tick,
+                    version_reg,
                 };
                 let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 4);
                 self.cpu.cycles += u64::from(cycles);
@@ -2578,12 +2827,13 @@ impl GenesisCore {
             }
 
             // Render visible scanlines
-            if scanline < ACTIVE_SCANLINES {
+            if scanline < active_scanlines {
                 self.vdp.render_scanline(scanline);
             }
 
-            // At scanline 224: enter V-blank and latch the V-blank interrupt.
-            if scanline == ACTIVE_SCANLINES {
+            // At the first blanking line: enter V-blank and latch the V-blank
+            // interrupt.
+            if scanline == active_scanlines {
                 self.vdp.set_vblank(true);
                 // Assert Z80 INT — the Genesis directly connects this to V-blank.
                 // The Z80 will service it on its next stepping opportunity when
@@ -2614,8 +2864,10 @@ impl GenesisCore {
                 self.vdp.clear_vint_pending();
                 let cpu_master_tick =
                     scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
+                let version_reg = self.version_register_byte();
                 let mut bus = CoreBus {
                     rom: &self.rom,
+                    mapper: &mut self.mapper,
                     sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
@@ -2636,6 +2888,7 @@ impl GenesisCore {
                     frame_count: self.frame_count,
                     scanline,
                     master_tick: cpu_master_tick,
+                    version_reg,
                 };
                 let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
                 self.cpu.cycles += u64::from(cycles);
@@ -2685,11 +2938,13 @@ impl GenesisCore {
     fn step_z80_scanline_with_timing(&mut self, scanline: u16, scanline_start_tick: u64) {
         let target = self.z80.cycles + 228;
         let z80_cycle_base = self.z80.cycles;
+        let version_reg = self.version_register_byte();
         while self.z80.cycles < target {
             {
                 let mut bus = Z80Bus {
                     z80_ram: &mut self.z80_ram,
                     rom: &self.rom,
+                    mapper: &mut self.mapper,
                     sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &self.vdp,
@@ -2711,6 +2966,7 @@ impl GenesisCore {
                     scanline,
                     master_tick: scanline_start_tick
                         + (self.z80.cycles - z80_cycle_base) * MASTER_PER_Z80,
+                    version_reg,
                 };
                 let int_cycles = z80::execute::accept_interrupt(&mut self.z80, &mut bus);
                 if int_cycles > 0 {
@@ -2727,6 +2983,7 @@ impl GenesisCore {
             let mut bus = Z80Bus {
                 z80_ram: &mut self.z80_ram,
                 rom: &self.rom,
+                mapper: &mut self.mapper,
                 sram: &mut self.sram,
                 work_ram: &mut self.work_ram,
                 vdp: &self.vdp,
@@ -2748,6 +3005,7 @@ impl GenesisCore {
                 scanline,
                 master_tick: scanline_start_tick
                     + (self.z80.cycles - z80_cycle_base) * MASTER_PER_Z80,
+                version_reg,
             };
             let cycles = z80::execute_instruction(&mut self.z80, &mut bus);
             self.z80.cycles += u64::from(cycles);
@@ -2985,13 +3243,14 @@ impl GenesisCore {
         // We need to read from the 68K bus, so we build a closure that
         // accesses ROM and work RAM.
         let rom = &self.rom;
+        let mapper = &self.mapper;
         let work_ram = &self.work_ram;
         let mut read_word = |addr: u32| -> u16 {
             match bus::map_region(addr) {
                 bus::BusRegion::CartridgeRom => {
-                    let offset = (addr & 0x3FFFFF) as usize;
-                    let hi = u16::from(*rom.get(offset).unwrap_or(&0));
-                    let lo = u16::from(*rom.get(offset + 1).unwrap_or(&0));
+                    // Compose per byte so window boundaries map correctly.
+                    let hi = u16::from(rom_read_byte(rom, mapper, addr));
+                    let lo = u16::from(rom_read_byte(rom, mapper, addr.wrapping_add(1)));
                     (hi << 8) | lo
                 }
                 bus::BusRegion::WorkRam => {
@@ -3027,8 +3286,7 @@ impl GenesisCore {
                 if let Some(b) = self.sram.read(addr) {
                     return b;
                 }
-                let offset = (addr & 0x3FFFFF) as usize;
-                self.rom.get(offset).copied().unwrap_or(0)
+                rom_read_byte(&self.rom, &self.mapper, addr)
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -3037,7 +3295,7 @@ impl GenesisCore {
             bus::BusRegion::IoRegisters => {
                 let reg = (addr & 0x1F) as u8;
                 match reg {
-                    0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
+                    0x00 | 0x01 => self.version_register_byte(), // Version (region-aware)
                     0x02 | 0x03 => self.port1.read_data(),
                     0x04 | 0x05 => self.port2.read_data(),
                     0x08 | 0x09 => self.port1.read_ctrl(),
@@ -3118,6 +3376,9 @@ impl GenesisCore {
             self.sram.enabled = (val as u8) & 0x01 != 0;
             return;
         }
+        if self.mapper.write_bank_register(addr | 1, val as u8) {
+            return;
+        }
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
                 let _ = self.sram.write(addr, (val >> 8) as u8);
@@ -3193,6 +3454,61 @@ impl AudioTraceCtx<'_> {
     }
 }
 
+/// Derives `(region, overseas)` from a parsed ROM header's region field.
+///
+/// The Genesis header stores the region at offset 0x1F0 in one of two forms:
+///
+/// * The classic 3-letter ASCII set — any combination of `J` (Japan), `U`
+///   (USA / Americas) and `E` (Europe), e.g. `"JUE"`, `"E"`, `"U"`.
+/// * The modern single hex-digit bitfield, where bit 0 = Japan (NTSC),
+///   bit 2 = Americas (NTSC) and bit 3 = Europe (PAL), e.g. `"F"` = all regions,
+///   `"8"` = Europe only, `"4"` = Americas only.
+///
+/// Rule: a machine that can run NTSC (Japan or Americas present) is treated as
+/// NTSC; a Europe-only cartridge is treated as PAL. `overseas` is true for any
+/// non-Japan machine (it drives the version register's bit 7). A headerless or
+/// unrecognized ROM defaults to overseas NTSC, matching the legacy 0xA0 value.
+fn region_and_overseas_from_header(header: Option<&RomHeader>) -> (Region, bool) {
+    let Some(h) = header else {
+        return (Region::Ntsc, true);
+    };
+    let code = h.region.trim().to_ascii_uppercase();
+    if code.is_empty() {
+        return (Region::Ntsc, true);
+    }
+
+    // Shared rule: a machine that can run NTSC (Japan or Americas present) is
+    // NTSC and overseas unless Japan-only; a Europe-only cart is PAL; anything
+    // else defaults to overseas NTSC.
+    let classify = |japan: bool, americas: bool, europe: bool| -> (Region, bool) {
+        if japan || americas {
+            (Region::Ntsc, !(japan && !americas && !europe))
+        } else if europe {
+            (Region::Pal, true)
+        } else {
+            (Region::Ntsc, true)
+        }
+    };
+
+    // A lone hex digit that is not one of the J/U/E region letters is the modern
+    // bitfield form.
+    if code.len() == 1 {
+        let c = code.as_bytes()[0] as char;
+        if !matches!(c, 'J' | 'U' | 'E') {
+            if let Some(bits) = c.to_digit(16) {
+                return classify(bits & 0b0001 != 0, bits & 0b0100 != 0, bits & 0b1000 != 0);
+            }
+        }
+    }
+
+    // Letter-set form (possibly combined).
+    classify(
+        code.contains('J'),
+        code.contains('U') || code.contains('A'),
+        code.contains('E'),
+    )
+}
+
 /// Reads one byte of the 68000's 24-bit address space.
 ///
 /// This is the single source of truth for 68000 byte-level memory mapping.
@@ -3205,6 +3521,7 @@ impl AudioTraceCtx<'_> {
 fn read_68k_byte(
     addr: u32,
     rom: &[u8],
+    mapper: &Mapper,
     sram: &CartSram,
     work_ram: &[u8; 0x10000],
     vdp: &Vdp,
@@ -3213,6 +3530,7 @@ fn read_68k_byte(
     z80_ram: &[u8; 0x2000],
     ym2612: &ym2612::Ym2612,
     z80_bus_requested: bool,
+    version_reg: u8,
 ) -> u8 {
     match bus::map_region(addr) {
         bus::BusRegion::CartridgeRom => {
@@ -3220,8 +3538,7 @@ fn read_68k_byte(
             if let Some(b) = sram.read(addr) {
                 return b;
             }
-            let offset = (addr & 0x3FFFFF) as usize;
-            rom.get(offset).copied().unwrap_or(0)
+            rom_read_byte(rom, mapper, addr)
         }
         bus::BusRegion::WorkRam => {
             let offset = (addr & 0xFFFF) as usize;
@@ -3230,7 +3547,7 @@ fn read_68k_byte(
         bus::BusRegion::IoRegisters => {
             let reg = (addr & 0x1F) as u8;
             match reg {
-                0x00 | 0x01 => 0xA0, // Version: overseas NTSC, revision 0
+                0x00 | 0x01 => version_reg, // Version register (region-aware)
                 0x02 | 0x03 => port1.read_data(),
                 0x04 | 0x05 => port2.read_data(),
                 0x08 | 0x09 => port1.read_ctrl(),
@@ -3293,6 +3610,7 @@ fn read_68k_byte(
 fn write_68k_byte(
     addr: u32,
     val: u8,
+    mapper: &mut Mapper,
     sram: &mut CartSram,
     work_ram: &mut [u8; 0x10000],
     port1: &mut ControllerPort,
@@ -3313,6 +3631,12 @@ fn write_68k_byte(
     // `bus::map_region`, so special-case it before the region match.
     if addr == SSF_SRAM_ENABLE_ADDR {
         sram.enabled = val & 0x01 != 0;
+        return;
+    }
+    // SSF2 (Sega) bank-select registers at 0xA130F3..0xA130FF (odd). Also
+    // `Unmapped`, so handle before the region match, exactly like the SRAM
+    // toggle above.
+    if mapper.write_bank_register(addr, val) {
         return;
     }
     match bus::map_region(addr) {
@@ -3392,6 +3716,7 @@ fn write_68k_byte(
 /// with the mutable borrow of the CPU.
 struct CoreBus<'a> {
     rom: &'a [u8],
+    mapper: &'a mut Mapper,
     sram: &'a mut CartSram,
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a mut Vdp,
@@ -3412,6 +3737,8 @@ struct CoreBus<'a> {
     frame_count: u64,
     scanline: u16,
     master_tick: u64,
+    /// Region-aware value returned by the 0xA10001 version register.
+    version_reg: u8,
 }
 
 impl CoreBus<'_> {
@@ -3434,6 +3761,7 @@ impl Bus for CoreBus<'_> {
         read_68k_byte(
             addr,
             self.rom,
+            self.mapper,
             self.sram,
             &**self.work_ram,
             self.vdp,
@@ -3442,6 +3770,7 @@ impl Bus for CoreBus<'_> {
             &**self.z80_ram,
             self.ym2612,
             *self.z80_bus_requested,
+            self.version_reg,
         )
     }
 
@@ -3449,11 +3778,12 @@ impl Bus for CoreBus<'_> {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
                 // Each byte lane may be backed by SRAM (when mapped in) or ROM.
-                let hi = self.sram.read(addr).unwrap_or_else(|| {
-                    *self.rom.get((addr & 0x3FFFFF) as usize).unwrap_or(&0)
-                });
+                let hi = self
+                    .sram
+                    .read(addr)
+                    .unwrap_or_else(|| rom_read_byte(self.rom, self.mapper, addr));
                 let lo = self.sram.read(addr.wrapping_add(1)).unwrap_or_else(|| {
-                    *self.rom.get(((addr & 0x3FFFFF) + 1) as usize).unwrap_or(&0)
+                    rom_read_byte(self.rom, self.mapper, addr.wrapping_add(1))
                 });
                 (u16::from(hi) << 8) | u16::from(lo)
             }
@@ -3466,7 +3796,7 @@ impl Bus for CoreBus<'_> {
             bus::BusRegion::IoRegisters => {
                 let reg = (addr & 0x1F) as u8;
                 let val = match reg {
-                    0x00 | 0x01 => 0xA0, // Version register
+                    0x00 | 0x01 => self.version_reg, // Version register (region-aware)
                     0x02 | 0x03 => self.port1.read_data(),
                     0x04 | 0x05 => self.port2.read_data(),
                     0x08 | 0x09 => self.port1.read_ctrl(),
@@ -3537,6 +3867,7 @@ impl Bus for CoreBus<'_> {
         write_68k_byte(
             addr,
             val,
+            self.mapper,
             self.sram,
             &mut **self.work_ram,
             self.port1,
@@ -3560,6 +3891,12 @@ impl Bus for CoreBus<'_> {
         // control bit in its low byte (0xA130F1). Handle before the region match.
         if addr == SSF_SRAM_ENABLE_ADDR & !1 || addr == SSF_SRAM_ENABLE_ADDR {
             self.sram.enabled = (val as u8) & 0x01 != 0;
+            return;
+        }
+        // SSF2 bank-select word write: a word to the even base 0xA130F2/F4/...
+        // (or the odd register itself) carries the bank index in its low byte,
+        // targeting the odd register. Handle before the region match.
+        if self.mapper.write_bank_register(addr | 1, val as u8) {
             return;
         }
         match bus::map_region(addr) {
@@ -3660,6 +3997,7 @@ impl Bus for CoreBus<'_> {
 struct Z80Bus<'a> {
     z80_ram: &'a mut Box<[u8; 0x2000]>,
     rom: &'a [u8],
+    mapper: &'a mut Mapper,
     sram: &'a mut CartSram,
     // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
     work_ram: &'a mut Box<[u8; 0x10000]>,
@@ -3681,6 +4019,8 @@ struct Z80Bus<'a> {
     frame_count: u64,
     scanline: u16,
     master_tick: u64,
+    /// Region-aware value returned by the 0xA10001 version register.
+    version_reg: u8,
 }
 
 impl Z80Bus<'_> {
@@ -3723,6 +4063,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 read_68k_byte(
                     bus_addr,
                     self.rom,
+                    self.mapper,
                     self.sram,
                     &**self.work_ram,
                     self.vdp,
@@ -3731,6 +4072,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                     &**self.z80_ram,
                     self.ym2612,
                     *self.z80_bus_requested,
+                    self.version_reg,
                 )
             }
             _ => 0xFF,
@@ -3768,6 +4110,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 write_68k_byte(
                     bus_addr,
                     val,
+                    self.mapper,
                     self.sram,
                     &mut **self.work_ram,
                     self.port1,
@@ -3809,8 +4152,10 @@ mod tests {
 
     fn core_bus_with_master_tick<'a>(core: &'a mut GenesisCore, master_tick: u64) -> CoreBus<'a> {
         let scanline = core.vdp.scanline();
+        let version_reg = core.version_register_byte();
         CoreBus {
             rom: &core.rom,
+            mapper: &mut core.mapper,
             sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &mut core.vdp,
@@ -3831,14 +4176,17 @@ mod tests {
             frame_count: core.frame_count,
             scanline,
             master_tick,
+            version_reg,
         }
     }
 
     fn z80_bus_with_master_tick<'a>(core: &'a mut GenesisCore, master_tick: u64) -> Z80Bus<'a> {
         let scanline = core.vdp.scanline();
+        let version_reg = core.version_register_byte();
         Z80Bus {
             z80_ram: &mut core.z80_ram,
             rom: &core.rom,
+            mapper: &mut core.mapper,
             sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &core.vdp,
@@ -3859,6 +4207,7 @@ mod tests {
             frame_count: core.frame_count,
             scanline,
             master_tick,
+            version_reg,
         }
     }
 
@@ -5031,12 +5380,166 @@ mod tests {
         assert_eq!(core.read_byte(0xFF1234), 0xAB);
     }
 
+    /// Builds a valid 68000-bootable ROM with the given 3-char region code.
+    fn rom_with_region(region: &str) -> Vec<u8> {
+        let mut rom = vec![0u8; 1024];
+        rom[0..4].copy_from_slice(&0x00FF_FFF0u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&0x0000_0200u32.to_be_bytes());
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        let bytes = region.as_bytes();
+        for (i, &b) in bytes.iter().take(3).enumerate() {
+            rom[0x1F0 + i] = b;
+        }
+        rom
+    }
+
     #[test]
     fn io_version_register_returns_region() {
+        // Fresh core (no ROM): default overseas NTSC → 0xA0.
         let core = GenesisCore::new();
         let val = core.read_byte(0xA10001);
         // Should be 0xA0 (overseas NTSC), not controller data (0x7F)
         assert_eq!(val, 0xA0);
+
+        // USA cartridge → overseas NTSC → 0xA0.
+        let mut usa = GenesisCore::new();
+        usa.execute(Command::LoadRom(rom_with_region("U")));
+        assert_eq!(usa.version_register_byte(), 0xA0);
+        assert_eq!(usa.read_byte(0xA10001), 0xA0);
+
+        // European cartridge → PAL overseas → 0xE0 (0x80|0x40|0x20).
+        let mut eur = GenesisCore::new();
+        eur.execute(Command::LoadRom(rom_with_region("E")));
+        assert_eq!(eur.version_register_byte(), 0xE0);
+        assert_eq!(eur.read_byte(0xA10001), 0xE0);
+
+        // Japanese cartridge → domestic NTSC → 0x20 (only bit5 set).
+        let mut jpn = GenesisCore::new();
+        jpn.execute(Command::LoadRom(rom_with_region("J")));
+        assert_eq!(jpn.version_register_byte(), 0x20);
+        assert_eq!(jpn.read_byte(0xA10001), 0x20);
+    }
+
+    #[test]
+    fn region_derived_from_header_and_override() {
+        // Europe → PAL, USA/Japan → NTSC.
+        let mut eur = GenesisCore::new();
+        eur.execute(Command::LoadRom(rom_with_region("E")));
+        assert!(eur.is_pal());
+        assert_eq!(eur.region(), Region::Pal);
+
+        let mut usa = GenesisCore::new();
+        usa.execute(Command::LoadRom(rom_with_region("U")));
+        assert_eq!(usa.region(), Region::Ntsc);
+
+        let mut jpn = GenesisCore::new();
+        jpn.execute(Command::LoadRom(rom_with_region("J")));
+        assert_eq!(jpn.region(), Region::Ntsc);
+
+        // A multi-region "JUE" cart is NTSC-capable → NTSC.
+        let mut jue = GenesisCore::new();
+        jue.execute(Command::LoadRom(rom_with_region("JUE")));
+        assert_eq!(jue.region(), Region::Ntsc);
+
+        // Override forces the chosen region regardless of the header.
+        let mut forced = GenesisCore::new();
+        forced.execute(Command::SetRegionOverride(Some(Region::Pal)));
+        forced.execute(Command::LoadRom(rom_with_region("U"))); // header says USA/NTSC
+        assert_eq!(forced.region(), Region::Pal);
+        // Overriding a Japanese NTSC cart to PAL makes it overseas → 0xE0.
+        assert_eq!(forced.version_register_byte(), 0xE0);
+
+        // Clearing the override falls back to the header region.
+        forced.execute(Command::SetRegionOverride(None));
+        assert_eq!(forced.region(), Region::Ntsc);
+    }
+
+    #[test]
+    fn region_timing_accessors() {
+        assert_eq!(Region::Pal.total_scanlines(), 313);
+        assert_eq!(Region::Ntsc.total_scanlines(), 262);
+        assert_eq!(Region::Ntsc.frame_period_ns(), FRAME_PERIOD_NS);
+        assert_eq!(Region::Pal.frame_period_ns(), FRAME_PERIOD_NS_PAL);
+        // PAL ≈ 20.12 ms.
+        assert_eq!(FRAME_PERIOD_NS_PAL, 20_120_134);
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::SetRegionOverride(Some(Region::Pal)));
+        core.execute(Command::LoadRom(rom_with_region("E")));
+        assert_eq!(core.frame_period_ns(), FRAME_PERIOD_NS_PAL);
+    }
+
+    #[test]
+    fn v30_active_height_only_on_pal() {
+        // PAL + reg 0x01 bit 3 set → 240 lines; framebuffer is 320*240*4 bytes.
+        let mut pal = GenesisCore::new();
+        pal.execute(Command::SetRegionOverride(Some(Region::Pal)));
+        pal.execute(Command::LoadRom(rom_with_region("E")));
+        pal.vdp.write_control(0x8100 | 0x48); // reg 0x01 = display on (0x40) + V30 (0x08)
+        assert_eq!(pal.frame_dimensions(), (320, 240));
+        assert_eq!(pal.framebuffer_rgba().len(), 320 * 240 * 4);
+
+        // Same register bit on NTSC is ignored → 224 lines.
+        let mut ntsc = GenesisCore::new();
+        ntsc.execute(Command::LoadRom(rom_with_region("U")));
+        ntsc.vdp.write_control(0x8100 | 0x48);
+        assert_eq!(ntsc.frame_dimensions(), (320, 224));
+        assert_eq!(ntsc.framebuffer_rgba().len(), 320 * 224 * 4);
+
+        // PAL with the bit clear → 224 lines.
+        let mut pal_v28 = GenesisCore::new();
+        pal_v28.execute(Command::SetRegionOverride(Some(Region::Pal)));
+        pal_v28.execute(Command::LoadRom(rom_with_region("E")));
+        pal_v28.vdp.write_control(0x8100 | 0x40); // display on, V28
+        assert_eq!(pal_v28.frame_dimensions(), (320, 224));
+        assert_eq!(pal_v28.framebuffer_rgba().len(), 320 * 224 * 4);
+    }
+
+    #[test]
+    fn snapshot_preserves_region_and_version() {
+        let mut core = GenesisCore::new();
+        core.execute(Command::SetRegionOverride(Some(Region::Pal)));
+        core.execute(Command::LoadRom(rom_with_region("E")));
+        core.vdp.write_control(0x8100 | 0x48); // V30
+        // Force H40 (RS0|RS1) so the native display width is a deterministic 320
+        // that survives the snapshot/restore of the horizontal-mode register
+        // (reg 0x0C); the V30 assertion below is about the 240-line height.
+        core.vdp.write_control(0x8C00 | 0x81); // reg 0x0C = H40
+        assert_eq!(core.frame_dimensions(), (320, 240));
+
+        let snap = core.snapshot();
+        let mut fresh = GenesisCore::new();
+        // The fresh core still needs the immutable ROM/header for a like-for-like
+        // machine; load the same ROM, then restore the deterministic state.
+        fresh.execute(Command::LoadRom(rom_with_region("E")));
+        fresh.restore(&snap);
+        assert_eq!(fresh.region(), Region::Pal);
+        assert!(fresh.is_pal());
+        assert_eq!(fresh.version_register_byte(), 0xE0);
+        assert_eq!(fresh.frame_dimensions(), (320, 240));
+        assert_eq!(fresh.vdp.read_hv_counter() & 0xFF00, core.vdp.read_hv_counter() & 0xFF00);
+    }
+
+    #[test]
+    fn old_snapshot_without_region_defaults_ntsc() {
+        // A save-state JSON missing the new keys must still deserialize, with the
+        // region defaulting to NTSC and overseas to true (legacy 0xA0 behavior).
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom_with_region("U")));
+        let snap = core.snapshot();
+        let json = serde_json::to_value(&snap).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("region");
+        obj.remove("overseas");
+        obj.remove("region_override");
+        obj.get_mut("vdp")
+            .and_then(|v| v.as_object_mut())
+            .map(|v| v.remove("region"));
+        let trimmed = serde_json::Value::Object(obj);
+        let restored: GenesisCoreSnapshot = serde_json::from_value(trimmed).unwrap();
+        assert_eq!(restored.region, Region::Ntsc);
+        assert!(restored.overseas);
+        assert_eq!(restored.region_override, None);
     }
 
     #[test]
@@ -5846,5 +6349,180 @@ mod tests {
             core.vdp.dma_busy_cpu_cycles() < cycles_charged,
             "advance_dma_busy must decrement the countdown as the stall consumes cycles"
         );
+    }
+
+    // ---- SSF2 (Sega) >4MB bank mapper ----
+
+    /// Builds a synthetic ROM of `banks` physical 512KB banks, where every byte
+    /// of bank K equals K. Reading any address therefore reveals which physical
+    /// bank the mapper resolved it to.
+    fn ssf2_marker_rom(banks: usize) -> Vec<u8> {
+        let mut rom = vec![0u8; banks * SSF2_BANK_SIZE];
+        for b in 0..banks {
+            let start = b * SSF2_BANK_SIZE;
+            rom[start..start + SSF2_BANK_SIZE].fill(b as u8);
+        }
+        rom
+    }
+
+    #[test]
+    fn mapper_for_rom_selects_by_size() {
+        assert_eq!(Mapper::for_rom(1024), Mapper::Flat);
+        assert_eq!(Mapper::for_rom(0x40_0000), Mapper::Flat); // exactly 4MB
+        assert_eq!(
+            Mapper::for_rom(0x40_0001),
+            Mapper::Ssf2 {
+                banks: [0, 1, 2, 3, 4, 5, 6, 7]
+            }
+        );
+        assert_eq!(
+            Mapper::for_rom(0x80_0000), // 8MB
+            Mapper::Ssf2 {
+                banks: [0, 1, 2, 3, 4, 5, 6, 7]
+            }
+        );
+    }
+
+    #[test]
+    fn mapper_ssf2_rom_offset_identity_and_switch() {
+        let mut m = Mapper::Ssf2 {
+            banks: [0, 1, 2, 3, 4, 5, 6, 7],
+        };
+        // Default banks map address 1:1 to offset.
+        assert_eq!(m.rom_offset(0x00_0000), 0);
+        assert_eq!(m.rom_offset(0x08_00AB), 0x08_00AB);
+        assert_eq!(m.rom_offset(0x38_0000), 0x38_0000);
+        // Switch window 1 (0x080000-0x0FFFFF) to physical bank N.
+        assert!(m.write_bank_register(0xA1_30F3, 5));
+        assert_eq!(m.rom_offset(0x08_0000), 5 * SSF2_BANK_SIZE);
+        assert_eq!(m.rom_offset(0x08_00AB), 5 * SSF2_BANK_SIZE + 0xAB);
+        // Window 0 stays fixed to bank 0 regardless.
+        assert_eq!(m.rom_offset(0x00_0010), 0x10);
+    }
+
+    #[test]
+    fn mapper_bank_register_address_decoding() {
+        let mut m = Mapper::Ssf2 {
+            banks: [0, 1, 2, 3, 4, 5, 6, 7],
+        };
+        // 0xA130F1 is the SRAM-enable register, NOT a bank register.
+        assert!(!m.write_bank_register(0xA1_30F1, 3));
+        assert_eq!(
+            m,
+            Mapper::Ssf2 {
+                banks: [0, 1, 2, 3, 4, 5, 6, 7]
+            }
+        );
+        // Even addresses in the block are not bank registers either.
+        assert!(!m.write_bank_register(0xA1_30F4, 3));
+        // The seven odd registers 0xA130F3..0xA130FF steer windows 1..=7.
+        let regs = [
+            0xA1_30F3u32,
+            0xA1_30F5,
+            0xA1_30F7,
+            0xA1_30F9,
+            0xA1_30FB,
+            0xA1_30FD,
+            0xA1_30FF,
+        ];
+        for (i, &addr) in regs.iter().enumerate() {
+            assert!(m.write_bank_register(addr, 0x20 + i as u8));
+        }
+        if let Mapper::Ssf2 { banks } = m {
+            assert_eq!(banks, [0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26]);
+        } else {
+            panic!("expected Ssf2");
+        }
+        // Just past the last register is out of range.
+        assert!(!m.write_bank_register(0xA1_3101, 3));
+    }
+
+    #[test]
+    fn mapper_ssf2_bank_switch_read_through() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(ssf2_marker_rom(10))); // 5MB, banks 0..9
+        assert!(matches!(core.mapper, Mapper::Ssf2 { .. }));
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        // Default (identity) mapping: each window reads its like-numbered bank.
+        assert_eq!(bus.read_byte(0x00_0000), 0); // window 0 -> bank 0
+        assert_eq!(bus.read_byte(0x08_0000), 1); // window 1 -> bank 1
+        assert_eq!(bus.read_byte(0x10_0000), 2); // window 2 -> bank 2
+        // Switch window 1 to physical bank 7 via the 68k write path.
+        bus.write_byte(0xA1_30F3, 7);
+        assert_eq!(bus.read_byte(0x08_0000), 7);
+        assert_eq!(bus.read_byte(0x0F_FFFF), 7); // still within window 1
+        // Window 0 is always fixed to bank 0, regardless of switches.
+        assert_eq!(bus.read_byte(0x00_0000), 0);
+        // Other windows are unaffected by the window-1 switch.
+        assert_eq!(bus.read_byte(0x10_0000), 2);
+    }
+
+    #[test]
+    fn mapper_ssf2_upper_banks_reachable() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(ssf2_marker_rom(10))); // banks 0..9
+        // Window 7 near the top of the 4MB window resolves to bank 7's region,
+        // i.e. ROM offset >= 0x380000 -- NOT masked down below 4MB.
+        assert_eq!(core.mapper.rom_offset(0x38_0000), 0x38_0000);
+        assert_eq!(core.mapper.rom_offset(0x3F_FFFF), 0x3F_FFFF);
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        assert_eq!(bus.read_byte(0x38_0000), 7);
+        assert_eq!(bus.read_byte(0x3F_FFFF), 7);
+    }
+
+    #[test]
+    fn mapper_snapshot_round_trip() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(ssf2_marker_rom(10)));
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xA1_30F3, 9); // window 1 -> bank 9
+            assert_eq!(bus.read_byte(0x08_0000), 9);
+        }
+        let snap = core.snapshot();
+        // Restore into a fresh core (ROM is not serialized, so reload it).
+        let mut core2 = GenesisCore::new();
+        core2.execute(Command::LoadRom(ssf2_marker_rom(10)));
+        core2.restore(&snap);
+        assert_eq!(
+            core2.mapper,
+            Mapper::Ssf2 {
+                banks: [0, 9, 2, 3, 4, 5, 6, 7]
+            }
+        );
+        let mut bus = core_bus_with_master_tick(&mut core2, 0);
+        assert_eq!(bus.read_byte(0x08_0000), 9); // switched bank survived snapshot
+    }
+
+    #[test]
+    fn mapper_snapshot_default_for_old_saves() {
+        // A snapshot deserialized without the `mapper` field must default to Flat
+        // (serde default), so pre-mapper save states still load.
+        let core = GenesisCore::new();
+        let snap = core.snapshot();
+        let mut json = serde_json::to_value(&snap).unwrap();
+        json.as_object_mut().unwrap().remove("mapper");
+        let restored: GenesisCoreSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.mapper, Mapper::Flat);
+    }
+
+    #[test]
+    fn mapper_flat_rom_ignores_bank_writes() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        // A small (<=4MB) ROM stays flat.
+        core.execute(Command::LoadRom(rom_with_sram(0x00, 0x20_0000, 0x20_FFFF)));
+        assert_eq!(core.mapper, Mapper::Flat);
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xA1_30F3, 7); // no-op on a flat mapper
+        }
+        assert_eq!(core.mapper, Mapper::Flat); // unchanged
+        // Flat mapping masks addresses down to the 4MB window (identity below it).
+        assert_eq!(core.mapper.rom_offset(0x00_00AB), 0xAB);
+        assert_eq!(core.mapper.rom_offset(0x48_0000), 0x08_0000);
     }
 }

@@ -14,7 +14,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::{FRAME_HEIGHT, FRAME_RGBA_BYTES, FRAME_WIDTH};
+use crate::api::{FRAME_RGBA_BYTES_MAX, FRAME_WIDTH};
+use crate::scheduler::Region;
+
+/// Active display height in V28 mode (NTSC and PAL default).
+const ACTIVE_HEIGHT_V28: usize = 224;
+/// Active display height in V30 mode (PAL only, reg 0x01 bit 3 set).
+const ACTIVE_HEIGHT_V30: usize = 240;
 
 /// VRAM size in bytes.
 pub const VRAM_SIZE: usize = 0x10000; // 64KB
@@ -87,6 +93,10 @@ pub struct VdpSnapshot {
     /// Remaining CPU cycles for which the DMA-busy status bit stays asserted
     /// and the 68000 is held off the bus — see [`Vdp::dma_busy_cpu_cycles`].
     pub dma_busy_cpu_cycles: u32,
+    /// Console region. Selects PAL V-counter wrap and enables V30 (240-line)
+    /// mode. Defaults to NTSC for save states written before region support.
+    #[serde(default)]
+    pub region: Region,
 }
 
 /// Maximum sprites evaluated per frame (H40 mode).
@@ -122,13 +132,19 @@ pub struct Vdp {
     auto_increment: u16,
     /// Current access type.
     access_type: Option<AccessType>,
-    /// Current scanline (0-261 NTSC).
+    /// Current scanline (0-261 NTSC, 0-312 PAL).
     scanline: u16,
     /// Current dot within scanline.
     dot: u16,
-    /// RGBA framebuffer. Physically sized to the H40 maximum (320x224); in H32
-    /// mode only a 256-wide packed prefix is used and returned.
-    framebuffer: Box<[u8; FRAME_RGBA_BYTES]>,
+    /// Console region (NTSC/PAL). Governs the V-counter wrap and whether V30
+    /// (240-line) mode is available.
+    region: Region,
+    /// RGBA framebuffer. Physically sized to the maximum (H40 width × V30 height,
+    /// 320×240) so neither an H32↔H40 width change nor a V28↔V30 height change
+    /// ever reallocates. Only the active `frame_width × active_height()` prefix
+    /// (packed at the latched width stride) is rendered and returned by
+    /// [`Vdp::framebuffer`].
+    framebuffer: Box<[u8; FRAME_RGBA_BYTES_MAX]>,
     /// Active display width (in pixels) latched for the current frame.
     ///
     /// Horizontal mode can change mid-frame if a game writes reg 0x0C between
@@ -192,7 +208,8 @@ impl Vdp {
             access_type: None,
             scanline: 0,
             dot: 0,
-            framebuffer: Box::new([0; FRAME_RGBA_BYTES]),
+            region: Region::Ntsc,
+            framebuffer: Box::new([0; FRAME_RGBA_BYTES_MAX]),
             frame_width: FRAME_WIDTH as u16,
             in_vblank: false,
             in_hblank: false,
@@ -207,18 +224,23 @@ impl Vdp {
         }
     }
 
-    /// Returns the length in bytes of the active (native-width) framebuffer for
-    /// the current frame: `frame_width * FRAME_HEIGHT * 4`. In H40 this is the
-    /// full 320-wide buffer; in H32 it is the 256-wide packed prefix.
+    /// Returns the length in bytes of the active framebuffer for the current
+    /// frame: `frame_width * active_height() * 4`. The width is the latched
+    /// native display width (320 in H40, 256 in H32); the height is 224 in V28
+    /// or 240 in PAL V30. Both dimensions are packed at the latched width stride.
     #[must_use]
     fn framebuffer_len(&self) -> usize {
-        self.frame_width as usize * FRAME_HEIGHT * 4
+        self.frame_width as usize * self.active_height() * 4
     }
 
-    /// Returns a reference to the RGBA framebuffer for the current frame.
+    /// Returns a reference to the active RGBA framebuffer for the current frame.
     ///
-    /// The slice is the native display width: 320x224 in H40, 256x224 in H32
-    /// (packed with a row stride equal to the active width, not 320).
+    /// The slice covers exactly the current active display area
+    /// (`frame_width × active_height()`): 320×224 in H40/V28, 256×224 in H32/V28,
+    /// or 320×240 in H40/PAL-V30. It is packed with a row stride equal to the
+    /// latched active width (not the physical 320-wide allocation), and the
+    /// backing buffer is always allocated at the 320×240 maximum, so only the
+    /// active prefix is exposed.
     #[must_use]
     pub fn framebuffer(&self) -> &[u8] {
         &self.framebuffer[..self.framebuffer_len()]
@@ -234,6 +256,35 @@ impl Vdp {
     #[must_use]
     pub fn display_width(&self) -> u16 {
         self.frame_width
+    }
+
+    /// Console region (NTSC/PAL).
+    #[must_use]
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// True when configured for a 50 Hz PAL region.
+    #[must_use]
+    pub fn is_pal(&self) -> bool {
+        self.region.is_pal()
+    }
+
+    /// Sets the console region. Governs the V-counter wrap and V30 availability.
+    pub fn set_region(&mut self, region: Region) {
+        self.region = region;
+    }
+
+    /// Active display height in scanlines, derived purely from the region and
+    /// reg 0x01 bit 3 (M2 / V30 select): 240 lines in PAL V30 mode, otherwise
+    /// 224 (V28). V30 is only valid on PAL hardware; on NTSC the bit is ignored.
+    #[must_use]
+    pub fn active_height(&self) -> usize {
+        if self.is_pal() && (self.registers[0x01] & 0x08 != 0) {
+            ACTIVE_HEIGHT_V30
+        } else {
+            ACTIVE_HEIGHT_V28
+        }
     }
 
     /// Returns the current scanline.
@@ -442,12 +493,26 @@ impl Vdp {
     /// Low byte = H counter (horizontal position, approximated).
     #[must_use]
     pub fn read_hv_counter(&self) -> u16 {
-        // V counter for NTSC: 0x00-0xEA for lines 0-234, then jumps to 0xE5-0xFF
-        let v = if self.scanline <= 0xEA {
-            self.scanline as u8
+        // The 8-bit V counter cannot represent every line of a >256-line frame,
+        // so hardware repeats a value range mid-frame. The wrap point differs by
+        // region.
+        let v = if self.region.is_pal() {
+            // PAL (313 lines): counts 0x00-0xFF, 0x00-0x02, then jumps back to
+            // 0xCA-0xFF. That is 256 + 3 + 54 = 313 distinct lines.
+            if self.scanline <= 0x102 {
+                self.scanline as u8
+            } else {
+                // After line 0x102 the counter resumes at 0xCA: line 0x103 → 0xCA
+                // and line 0x138 (312) → 0xFF, i.e. subtract 0x39.
+                (self.scanline.wrapping_sub(0x39)) as u8
+            }
         } else {
-            // NTSC V counter wraps: after 0xEA it jumps to 0xE5
-            (self.scanline.wrapping_sub(6)) as u8
+            // NTSC (262 lines): 0x00-0xEA for lines 0-234, then jumps to 0xE5.
+            if self.scanline <= 0xEA {
+                self.scanline as u8
+            } else {
+                (self.scanline.wrapping_sub(6)) as u8
+            }
         };
 
         // H counter: approximate based on hblank state
@@ -710,7 +775,7 @@ impl Vdp {
         if line == 0 {
             // Reload counter at start of frame
             self.h_interrupt_counter = i16::from(self.registers[0x0A]);
-        } else if line < 224 {
+        } else if (line as usize) < self.active_height() {
             // Active scanlines: decrement counter
             self.h_interrupt_counter -= 1;
             if self.h_interrupt_counter < 0 {
@@ -833,7 +898,7 @@ impl Vdp {
         let lines = cells * 8;
         if reg & 0x80 != 0 {
             // Window below the split line
-            (lines, 224)
+            (lines, self.active_height() as u16)
         } else {
             // Window above the split line
             (0, lines)
@@ -982,11 +1047,12 @@ impl Vdp {
         }
         let width = self.frame_width;
         let stride = width as usize;
-        if line >= 224 || !self.display_enabled() {
+        let active_height = self.active_height();
+        if line as usize >= active_height || !self.display_enabled() {
             // During V-blank or if display disabled, fill with background.
             let bg = self.background_color();
             let y = line as usize;
-            if y < 224 {
+            if y < active_height {
                 for x in 0..stride {
                     let offset = (y * stride + x) * 4;
                     self.framebuffer[offset..offset + 4].copy_from_slice(&bg);
@@ -1320,6 +1386,7 @@ impl Vdp {
             odd_frame: self.odd_frame,
             vint_pending: self.vint_pending,
             dma_busy_cpu_cycles: self.dma_busy_cpu_cycles,
+            region: self.region,
         }
     }
 
@@ -1346,6 +1413,7 @@ impl Vdp {
         self.odd_frame = snap.odd_frame;
         self.vint_pending = snap.vint_pending;
         self.dma_busy_cpu_cycles = snap.dma_busy_cpu_cycles;
+        self.region = snap.region;
         // frame_width is a derived per-frame cache (not serialized). Recompute
         // it from the restored registers so the returned framebuffer length is
         // coherent even before the next frame renders.

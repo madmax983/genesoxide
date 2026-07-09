@@ -12,13 +12,23 @@ pub mod vgm;
 pub mod ymfm_reference;
 pub mod z80_tests;
 
-use genesoxide_core::{Command, GenesisCore};
+use genesoxide_core::{Command, GenesisCore, Region};
 
 /// Loads a ROM and runs it for the given number of frames.
 /// Returns the final framebuffer as a Vec<u8>.
 #[must_use]
 pub fn run_rom_frames(rom_data: Vec<u8>, frames: u64) -> Vec<u8> {
+    run_rom_frames_region(rom_data, frames, None)
+}
+
+/// Like [`run_rom_frames`], but forces a console region (`None` = auto-detect).
+///
+/// Used by the PAL/V30 golden scene, which must run at 313-line PAL timing with
+/// V30 (240-line) mode enabled regardless of the synthetic ROM's header.
+#[must_use]
+pub fn run_rom_frames_region(rom_data: Vec<u8>, frames: u64, region: Option<Region>) -> Vec<u8> {
     let mut core = GenesisCore::new();
+    core.execute(Command::SetRegionOverride(region));
     core.execute(Command::LoadRom(rom_data));
 
     for _ in 0..frames {
@@ -31,13 +41,18 @@ pub fn run_rom_frames(rom_data: Vec<u8>, frames: u64) -> Vec<u8> {
 /// Compares two framebuffers pixel-by-pixel.
 /// Returns the number of differing pixels.
 ///
-/// Both framebuffers must be the same non-empty length. This works for any
-/// display width — a 256-wide H32 frame and a 320-wide H40 frame both compare
-/// against a golden of matching length.
+/// Both framebuffers must be the same non-empty length that is a whole number of
+/// 4-byte RGBA pixels. The length encodes BOTH the active width (256 in H32, 320
+/// in H40) and the active height (224 in V28, 240 in PAL V30), so this compares
+/// exactly for any width/height combination — the existing 320×224 goldens still
+/// match exactly, while 256-wide H32 and 240-line PAL/V30 goldens are allowed.
 #[must_use]
 pub fn compare_framebuffers(a: &[u8], b: &[u8]) -> usize {
-    assert!(!a.is_empty(), "framebuffer must be non-empty");
     assert_eq!(a.len(), b.len(), "framebuffer lengths differ");
+    assert!(
+        !a.is_empty() && a.len() % 4 == 0,
+        "framebuffer must be a non-empty multiple of 4"
+    );
 
     a.chunks(4)
         .zip(b.chunks(4))

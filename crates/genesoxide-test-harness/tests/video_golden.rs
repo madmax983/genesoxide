@@ -41,8 +41,9 @@
 //! match. The programmatic pixel assertions run in BOTH modes, so a blessed
 //! golden can never encode output that violates the VDP rules.
 
+use genesoxide_core::Region;
 use genesoxide_test_harness::rom_builder::RomBuilder;
-use genesoxide_test_harness::{compare_framebuffers, run_rom_frames};
+use genesoxide_test_harness::{compare_framebuffers, run_rom_frames, run_rom_frames_region};
 
 const FRAME_W: usize = 320;
 const FRAME_H: usize = 224;
@@ -520,4 +521,56 @@ fn mode_switch_sequence() {
     assert_eq!(pixel_w(&fb, 255, 100, H32_W), red, "plane red at right edge");
 
     check_golden("mode_switch_h32", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 6: PAL V30 (240-line) vertical mode
+// ---------------------------------------------------------------------------
+
+/// Builds a PAL V30 scene: a solid red Scroll A plane covering the full frame,
+/// with reg 0x01 bit 3 (V30) set so the active area is 240 lines. Rendered under
+/// a forced PAL region, the framebuffer is 320×240 and the plane extends past
+/// the 224-line V28 boundary into the V30-only band (lines 224..239).
+fn build_pal_v30_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // reg 0x0C = H40 (RS0|RS1 = 0x81), S/H off. Backdrop black. Both resolution
+    // bits are required for the 320px H40 width; only RS0 (0x01) would select
+    // H32 (256px).
+    base_registers(&mut b, 0x81, 0x00);
+    // Enable V30: reg 0x01 = display on (0x40) + M2/V30 (0x08).
+    b.set_register(0x01, 0x48);
+
+    // Red plane at index 1.
+    b.set_cram_color(1, 0x000E); // red
+    b.write_solid_tile(1, 1);
+    // Scroll A: solid red, low priority, every row (32 rows = 256px covers 240).
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    b.finish()
+}
+
+#[test]
+fn pal_v30_240_lines() {
+    let rom = build_pal_v30_rom();
+    let fb = run_rom_frames_region(rom, FRAMES, Some(Region::Pal));
+
+    // The active area is 320×240 in PAL V30.
+    const V30_H: usize = 240;
+    assert_eq!(fb.len(), FRAME_W * V30_H * 4, "PAL V30 framebuffer is 320x240");
+
+    let red = normal_rgba(0x000E); // [255,0,0,255]
+    assert_eq!(red, [255, 0, 0, 255]);
+
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let o = (y * FRAME_W + x) * 4;
+        [fb[o], fb[o + 1], fb[o + 2], fb[o + 3]]
+    };
+    // Red plane fills the visible area, including the V30-only band beyond 224.
+    assert_eq!(px(10, 10), red, "top of frame is the red plane");
+    assert_eq!(px(160, 200), red, "mid frame is the red plane");
+    assert_eq!(px(10, 230), red, "line 230 (V30-only band) renders the plane");
+    assert_eq!(px(300, 239), red, "last V30 line renders the plane");
+
+    check_golden("pal_v30", &fb);
 }
