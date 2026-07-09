@@ -2595,6 +2595,7 @@ impl GenesisCore {
 
         // Build a bus wrapper that borrows the non-CPU fields.
         let version_reg = self.version_register_byte();
+        let interrupt_mask = self.cpu.sr.interrupt_mask();
         let mut bus = CoreBus {
             rom: &self.rom,
             mapper: &mut self.mapper,
@@ -2619,6 +2620,7 @@ impl GenesisCore {
             scanline,
             master_tick,
             version_reg,
+            interrupt_mask,
         };
 
         let cycles = cpu::execute_instruction(&mut self.cpu, opcode, &mut bus);
@@ -2891,6 +2893,10 @@ impl GenesisCore {
                     scanline,
                     master_tick: cpu_master_tick,
                     version_reg,
+                    // Interrupt delivery only pushes to RAM / reads the vector;
+                    // it issues no VDP writes, so mid-line recording never
+                    // consults this. Tag it as a level-4 (video) context anyway.
+                    interrupt_mask: 4,
                 };
                 let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 4);
                 self.cpu.cycles += u64::from(cycles);
@@ -2960,6 +2966,9 @@ impl GenesisCore {
                     scanline,
                     master_tick: cpu_master_tick,
                     version_reg,
+                    // See the level-4 delivery bus above: no VDP writes occur
+                    // here, so this value is inert; tag it as a level-6 context.
+                    interrupt_mask: 6,
                 };
                 let cycles = cpu::deliver_interrupt(&mut self.cpu, &mut bus, 6);
                 self.cpu.cycles += u64::from(cycles);
@@ -3476,9 +3485,10 @@ impl GenesisCore {
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
+                // Debug/untimed bus: apply globally, never record a mid-line event.
                 match vdp_addr {
-                    0x00 | 0x02 => self.vdp.write_data(val),
-                    0x04 | 0x06 => self.vdp.write_control(val),
+                    0x00 | 0x02 => self.vdp.write_data(val, None),
+                    0x04 | 0x06 => self.vdp.write_control(val, None),
                     _ => {}
                 }
             }
@@ -3810,6 +3820,18 @@ struct CoreBus<'a> {
     master_tick: u64,
     /// Region-aware value returned by the 0xA10001 version register.
     version_reg: u8,
+    /// 68000 interrupt mask (SR bits 8-10) at the time this bus was built.
+    ///
+    /// Used to gate mid-line VDP raster recording: a VDP write issued while the
+    /// CPU is inside a video-interrupt handler (level 4 HINT / level 6 VINT)
+    /// executes during the blanking interval and applies to the whole line, so
+    /// it is passed to the VDP as an untimed (`dot: None`) write. Only a
+    /// mainline write (mask below 4) carries a real intra-line beam dot. In this
+    /// emulator the HINT handler runs at the top of the next line's CPU budget
+    /// via the ordinary per-instruction path (not the interrupt-delivery bus),
+    /// so the interrupt mask — not the construction site — is the reliable
+    /// discriminator that keeps per-line HINT raster effects line-granular.
+    interrupt_mask: u8,
 }
 
 impl CoreBus<'_> {
@@ -4000,9 +4022,23 @@ impl Bus for CoreBus<'_> {
             }
             bus::BusRegion::Vdp => {
                 let vdp_addr = addr & 0x1F;
+                // Intra-line beam dot for mid-line raster recording. A write
+                // issued from inside a video-interrupt handler (level 4 HINT /
+                // level 6 VINT) runs during blanking and applies to the whole
+                // line, so it is recorded as untimed (`None`, line-granular);
+                // only a mainline active-display write carries a real beam dot.
+                // The linear offset→dot map ignores the hblank porch; the
+                // accurate dot-with-jump model is `read_hv_counter` (see
+                // `dot_from_line_offset`).
+                let dot = if self.interrupt_mask >= 4 {
+                    None
+                } else {
+                    let offset = self.master_tick % MASTER_TICKS_PER_LINE_H40;
+                    Some(self.vdp.dot_from_line_offset(offset))
+                };
                 match vdp_addr {
-                    0x00 | 0x02 => self.vdp.write_data(val),
-                    0x04 | 0x06 => self.vdp.write_control(val),
+                    0x00 | 0x02 => self.vdp.write_data(val, dot),
+                    0x04 | 0x06 => self.vdp.write_control(val, dot),
                     0x10 | 0x12 | 0x14 | 0x16 => {
                         // PSG port (write low byte)
                         self.psg.write(val as u8);
@@ -4263,6 +4299,7 @@ mod tests {
             scanline,
             master_tick,
             version_reg,
+            interrupt_mask: core.cpu.sr.interrupt_mask(),
         }
     }
 
@@ -5561,14 +5598,14 @@ mod tests {
         let mut pal = GenesisCore::new();
         pal.execute(Command::SetRegionOverride(Some(Region::Pal)));
         pal.execute(Command::LoadRom(rom_with_region("E")));
-        pal.vdp.write_control(0x8100 | 0x48); // reg 0x01 = display on (0x40) + V30 (0x08)
+        pal.vdp.write_control(0x8100 | 0x48, None); // reg 0x01 = display on (0x40) + V30 (0x08)
         assert_eq!(pal.frame_dimensions(), (320, 240));
         assert_eq!(pal.framebuffer_rgba().len(), 320 * 240 * 4);
 
         // Same register bit on NTSC is ignored → 224 lines.
         let mut ntsc = GenesisCore::new();
         ntsc.execute(Command::LoadRom(rom_with_region("U")));
-        ntsc.vdp.write_control(0x8100 | 0x48);
+        ntsc.vdp.write_control(0x8100 | 0x48, None);
         assert_eq!(ntsc.frame_dimensions(), (320, 224));
         assert_eq!(ntsc.framebuffer_rgba().len(), 320 * 224 * 4);
 
@@ -5576,7 +5613,7 @@ mod tests {
         let mut pal_v28 = GenesisCore::new();
         pal_v28.execute(Command::SetRegionOverride(Some(Region::Pal)));
         pal_v28.execute(Command::LoadRom(rom_with_region("E")));
-        pal_v28.vdp.write_control(0x8100 | 0x40); // display on, V28
+        pal_v28.vdp.write_control(0x8100 | 0x40, None); // display on, V28
         assert_eq!(pal_v28.frame_dimensions(), (320, 224));
         assert_eq!(pal_v28.framebuffer_rgba().len(), 320 * 224 * 4);
     }
@@ -5586,11 +5623,11 @@ mod tests {
         let mut core = GenesisCore::new();
         core.execute(Command::SetRegionOverride(Some(Region::Pal)));
         core.execute(Command::LoadRom(rom_with_region("E")));
-        core.vdp.write_control(0x8100 | 0x48); // V30
+        core.vdp.write_control(0x8100 | 0x48, None); // V30
         // Force H40 (RS0|RS1) so the native display width is a deterministic 320
         // that survives the snapshot/restore of the horizontal-mode register
         // (reg 0x0C); the V30 assertion below is about the 240-line height.
-        core.vdp.write_control(0x8C00 | 0x81); // reg 0x0C = H40
+        core.vdp.write_control(0x8C00 | 0x81, None); // reg 0x0C = H40
         assert_eq!(core.frame_dimensions(), (320, 240));
 
         let snap = core.snapshot();
@@ -6342,7 +6379,7 @@ mod tests {
         core.execute(Command::LoadRom(vec![0u8; 0x8000]));
         core.cpu.sr.set_interrupt_mask(7);
         // Enable V-interrupts on the VDP (reg 1 bit 5).
-        core.vdp.write_control(0x8120);
+        core.vdp.write_control(0x8120, None);
 
         // Advance a single frame — VBlank hits and the VIP flag must latch.
         core.execute(Command::StepFrame);
@@ -6396,7 +6433,7 @@ mod tests {
         // the fix must latch the VInt across that window rather than dropping
         // it.
         core.cpu.sr.set_interrupt_mask(7);
-        core.vdp.write_control(0x8120);
+        core.vdp.write_control(0x8120, None);
 
         // Step one frame at mask 7: the VInt is raised at V-blank, cannot be
         // taken, and must be latched. Neither PC nor the VIP latch may change
@@ -6455,16 +6492,16 @@ mod tests {
         // and execute it, so the DMA-busy cycle countdown is charged. The
         // transfer is bigger than any single scanline could burn, so the stall
         // remains asserted across a StepScanline call.
-        core.vdp.write_control(0x8F02); // autoinc = 2
-        core.vdp.write_control(0x9300); // DMA length low  = 0x00
-        core.vdp.write_control(0x9440); // DMA length high = 0x40  → length = 0x4000 words
-        core.vdp.write_control(0x9500); // DMA src low  = 0x00
-        core.vdp.write_control(0x9600); // DMA src mid  = 0x00
-        core.vdp.write_control(0x9700); // DMA src high = 0x00 (mode 68K→VRAM)
-        core.vdp.write_control(0x8154); // reg 1 = 0x54: DMA enable + VInt (display off)
+        core.vdp.write_control(0x8F02, None); // autoinc = 2
+        core.vdp.write_control(0x9300, None); // DMA length low  = 0x00
+        core.vdp.write_control(0x9440, None); // DMA length high = 0x40  → length = 0x4000 words
+        core.vdp.write_control(0x9500, None); // DMA src low  = 0x00
+        core.vdp.write_control(0x9600, None); // DMA src mid  = 0x00
+        core.vdp.write_control(0x9700, None); // DMA src high = 0x00 (mode 68K→VRAM)
+        core.vdp.write_control(0x8154, None); // reg 1 = 0x54: DMA enable + VInt (display off)
         // Command word pair: VRAM write + DMA at address 0xE000.
-        core.vdp.write_control(0x4000); // hi word: CD1..0 = 01 (VRAM), addr[13..0] = 0x0000
-        core.vdp.write_control(0x0083); // lo word: CD5 = 1 (DMA), addr[15..14] = 3 → 0xE000
+        core.vdp.write_control(0x4000, None); // hi word: CD1..0 = 01 (VRAM), addr[13..0] = 0x0000
+        core.vdp.write_control(0x0083, None); // lo word: CD5 = 1 (DMA), addr[15..14] = 3 → 0xE000
         // The DMA runs synchronously via the core's execute path; step a couple
         // of instructions to trigger it (LoadRom placed a NOP/bra.s at 0x200).
         let cpu_cycles_before_trigger = core.cpu.cycles;
