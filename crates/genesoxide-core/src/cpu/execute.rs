@@ -234,6 +234,15 @@ fn alu_to_an_cycles(ea: AddressingMode, size: InstructionSize) -> u32 {
     }
 }
 
+/// Base + EA cost for CMPA (destination An). Unlike ADDA/SUBA, CMPA is
+/// 6 + ea for BOTH word and long, with NO register/immediate +2
+/// (the `**` note in the standard table applies to ADD/AND/OR/SUB, not CMP).
+/// e.g. CMPA.W Dn,An = 6; CMPA.L Dn,An = 6; CMPA.L (An),An = 6+8 = 14.
+#[must_use]
+fn cmpa_cycles(ea: AddressingMode, size: InstructionSize) -> u32 {
+    6 + ea_calc_cycles(ea, size)
+}
+
 /// Cost for immediate-source ALU on `<ea>` (ADDI/SUBI/ANDI/ORI/EORI).
 /// To Dn: byte/word = 8, long = 16. To memory: byte/word = 12 + ea,
 /// long = 20 + ea.
@@ -921,7 +930,16 @@ fn exec_move(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
     write_ea(cpu, dst, size, bus, val);
     // MOVE total = 4 + src EA calc + dst EA calc (MC68000UM MOVE table).
     // e.g. MOVE.W Dn,Dn = 4; MOVE.L #,Dn = 12; MOVE.L (An),(An) = 20.
-    4 + ea_calc_cycles(src, size) + ea_calc_cycles(dst, size)
+    // Special case: a predecrement DESTINATION in MOVE costs the same as `(An)`
+    // — 4 (byte/word) / 8 (long), NOT the general -(An) EA time of 6/10.
+    // (MC68000UM MOVE table.) e.g. MOVE.W Dn,-(An) = 8; MOVE.L (An)+,-(An) = 20.
+    let dst_ea = match dst {
+        AddressingMode::AddrPreDec(_) => {
+            if size == InstructionSize::Long { 8 } else { 4 }
+        }
+        _ => ea_calc_cycles(dst, size),
+    };
+    4 + ea_calc_cycles(src, size) + dst_ea
 }
 
 fn exec_movea(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bus) -> u32 {
@@ -1063,13 +1081,17 @@ fn exec_movem(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn B
     //   store (reg->mem): base 8 + 4n (word) / 8n (long)
     //   load  (mem->reg): base 12 + 4n (word) / 8n (long)
     // Predecrement store and postincrement load use just the base; other
-    // (control) addressing modes add the EA calculation time on top.
+    // (control) addressing modes add only the extension-word fetch, which is
+    // size-independent: (An)=+0, d(An)/(xxx).W=+4, indexed=+6, (xxx).L=+8.
+    // The MOVEM base already includes the operand access, so we must NOT add
+    // the full EA-calc time (that would double-count the memory access). The
+    // word-size EA-calc minus 4 gives exactly the extension-fetch component.
     let n = mask.count_ones();
     let per: u32 = if size == InstructionSize::Long { 8 } else { 4 };
     let base: u32 = if direction == 0 { 8 } else { 12 };
     let ea_extra = match ea {
         AddressingMode::AddrPreDec(_) | AddressingMode::AddrPostInc(_) => 0,
-        _ => ea_calc_cycles(ea, size),
+        _ => ea_calc_cycles(ea, InstructionSize::Word).saturating_sub(4),
     };
     base + per * n + ea_extra
 }
@@ -1262,6 +1284,8 @@ fn exec_addx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
             }
             InstructionSize::Long => cpu.d[rx as usize] = result,
         }
+        // ADDX register form (MC68000UM multi-precision table): 4 (b/w) / 8 (long).
+        if size == InstructionSize::Long { 8 } else { 4 }
     } else {
         // Memory with predecrement
         let src_ea = AddressingMode::AddrPreDec(ry);
@@ -1277,9 +1301,9 @@ fn exec_addx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
             cpu.sr.set_flag(StatusRegister::Z, false);
         }
         write_to_addr(bus, addr, size, result);
+        // ADDX -(Ay),-(Ax) memory form (MC68000UM): 18 (b/w) / 30 (long).
+        if size == InstructionSize::Long { 30 } else { 18 }
     }
-
-    if size == InstructionSize::Long { 8 } else { 4 }
 }
 
 fn exec_sub(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bus) -> u32 {
@@ -1423,6 +1447,8 @@ fn exec_subx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
             }
             InstructionSize::Long => cpu.d[rx as usize] = result,
         }
+        // SUBX register form (MC68000UM multi-precision table): 4 (b/w) / 8 (long).
+        if size == InstructionSize::Long { 8 } else { 4 }
     } else {
         let src_ea = AddressingMode::AddrPreDec(ry);
         let dst_ea = AddressingMode::AddrPreDec(rx);
@@ -1437,9 +1463,9 @@ fn exec_subx(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
             cpu.sr.set_flag(StatusRegister::Z, false);
         }
         write_to_addr(bus, addr, size, result);
+        // SUBX -(Ay),-(Ax) memory form (MC68000UM): 18 (b/w) / 30 (long).
+        if size == InstructionSize::Long { 30 } else { 18 }
     }
-
-    if size == InstructionSize::Long { 8 } else { 4 }
 }
 
 fn exec_mulu(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
@@ -2169,6 +2195,8 @@ fn get_bit_number(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
 }
 
 fn exec_btst(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    // dynamic = bit number in Dn (opcode bit 8 set); static = immediate ext word.
+    let dynamic = opcode & 0x0100 != 0;
     let bit_num = get_bit_number(cpu, opcode, bus);
     let ea = src_ea(opcode);
 
@@ -2178,19 +2206,24 @@ fn exec_btst(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             let bit = bit_num % 32;
             let val = cpu.d[reg as usize];
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
-            4
+            // BTST register (MC68000UM): dynamic = 6, static = 10.
+            if dynamic { 6 } else { 10 }
         }
         _ => {
             // Byte memory: bit mod 8
             let bit = bit_num % 8;
             let val = read_ea(cpu, ea, InstructionSize::Byte, bus);
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
-            8
+            // BTST memory (MC68000UM): dynamic = 4+ea, static = 8+ea.
+            let e = ea_calc_cycles(ea, InstructionSize::Byte);
+            if dynamic { 4 + e } else { 8 + e }
         }
     }
 }
 
 fn exec_bset(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    // dynamic = bit number in Dn (opcode bit 8 set); static = immediate ext word.
+    let dynamic = opcode & 0x0100 != 0;
     let bit_num = get_bit_number(cpu, opcode, bus);
     let ea = src_ea(opcode);
 
@@ -2200,19 +2233,24 @@ fn exec_bset(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             let val = cpu.d[reg as usize];
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             cpu.d[reg as usize] = val | (1 << bit);
-            8
+            // BSET register (MC68000UM): dynamic = 8, static = 12.
+            if dynamic { 8 } else { 12 }
         }
         _ => {
             let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
             let bit = bit_num % 8;
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             write_to_addr(bus, addr, InstructionSize::Byte, val | (1 << bit));
-            12
+            // BSET memory (MC68000UM): dynamic = 8+ea, static = 12+ea.
+            let e = ea_calc_cycles(ea, InstructionSize::Byte);
+            if dynamic { 8 + e } else { 12 + e }
         }
     }
 }
 
 fn exec_bclr(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    // dynamic = bit number in Dn (opcode bit 8 set); static = immediate ext word.
+    let dynamic = opcode & 0x0100 != 0;
     let bit_num = get_bit_number(cpu, opcode, bus);
     let ea = src_ea(opcode);
 
@@ -2222,19 +2260,24 @@ fn exec_bclr(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             let val = cpu.d[reg as usize];
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             cpu.d[reg as usize] = val & !(1 << bit);
-            10
+            // BCLR register (MC68000UM): dynamic = 10, static = 14.
+            if dynamic { 10 } else { 14 }
         }
         _ => {
             let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
             let bit = bit_num % 8;
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             write_to_addr(bus, addr, InstructionSize::Byte, val & !(1 << bit));
-            12
+            // BCLR memory (MC68000UM): dynamic = 8+ea, static = 12+ea.
+            let e = ea_calc_cycles(ea, InstructionSize::Byte);
+            if dynamic { 8 + e } else { 12 + e }
         }
     }
 }
 
 fn exec_bchg(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
+    // dynamic = bit number in Dn (opcode bit 8 set); static = immediate ext word.
+    let dynamic = opcode & 0x0100 != 0;
     let bit_num = get_bit_number(cpu, opcode, bus);
     let ea = src_ea(opcode);
 
@@ -2244,14 +2287,17 @@ fn exec_bchg(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             let val = cpu.d[reg as usize];
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             cpu.d[reg as usize] = val ^ (1 << bit);
-            8
+            // BCHG register (MC68000UM): dynamic = 8, static = 12.
+            if dynamic { 8 } else { 12 }
         }
         _ => {
             let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
             let bit = bit_num % 8;
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             write_to_addr(bus, addr, InstructionSize::Byte, val ^ (1 << bit));
-            12
+            // BCHG memory (MC68000UM): dynamic = 8+ea, static = 12+ea.
+            let e = ea_calc_cycles(ea, InstructionSize::Byte);
+            if dynamic { 8 + e } else { 12 + e }
         }
     }
 }
@@ -2276,8 +2322,8 @@ fn exec_cmpa(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bu
     let dst = cpu.read_a(reg);
     let result = dst.wrapping_sub(src);
     set_flags_cmp(&mut cpu.sr, src, dst, result, InstructionSize::Long);
-    // CMPA: word = 8+ea, long = 6+ea (+2 reg/imm long src).
-    alu_to_an_cycles(ea, size)
+    // CMPA: 6 + ea for both word and long, no reg/imm +2 (MC68000UM).
+    cmpa_cycles(ea, size)
 }
 
 fn exec_cmpi(cpu: &mut Cpu, opcode: u16, size: InstructionSize, bus: &mut dyn Bus) -> u32 {
@@ -2936,7 +2982,8 @@ fn exec_tas(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
         }
         _ => {
             bus.write_byte(addr & 0x00FF_FFFF, result);
-            14
+            // TAS memory (MC68000UM): byte RMW = 10 + ea. e.g. TAS (An) = 14.
+            10 + ea_calc_cycles(ea, InstructionSize::Byte)
         }
     }
 }
@@ -3729,5 +3776,143 @@ mod tests {
         let mut cpu = make_cpu();
         let mut bus = TestBus::new();
         assert_eq!(execute_instruction(&mut cpu, 0x4E71, &mut bus), 4);
+    }
+
+    // ── Audited cycle-count fixes (MC68000UM) ─────────────────────────
+    //
+    // These paths were previously uncovered by the timing tests and each
+    // contained a confirmed over/under-count; the assertions below pin the
+    // corrected published values.
+
+    /// MOVE.W Dn,-(An): a predecrement DESTINATION costs the same as (An) —
+    /// 4 (byte/word), NOT the general -(An) EA of 6. MC68000UM MOVE table.
+    /// Total = 4 + src EA(D0)=0 + dst=4 = 8.
+    #[test]
+    fn move_word_dn_to_predec_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(1, 0x3000);
+        // MOVE.W D0,-(A1) = 0x3300.
+        assert_eq!(execute_instruction(&mut cpu, 0x3300, &mut bus), 8);
+    }
+
+    /// MOVE.L (An)+,-(An): predecrement DESTINATION long costs 8 (like (An)),
+    /// NOT the general -(An) long EA of 10. MC68000UM MOVE table.
+    /// Total = 4 + src EA((A0)+,L)=8 + dst=8 = 20.
+    #[test]
+    fn move_long_postinc_to_predec_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        cpu.write_a(1, 0x3000);
+        // MOVE.L (A0)+,-(A1) = 0x2318.
+        assert_eq!(execute_instruction(&mut cpu, 0x2318, &mut bus), 20);
+    }
+
+    /// CMPA.W Dn,An = 6: CMPA is 6 + ea for BOTH sizes with NO reg/imm +2
+    /// (unlike ADDA/SUBA). MC68000UM standard table (CMP row has no `**`).
+    #[test]
+    fn cmpa_word_dn_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // CMPA.W D0,A1 = 0xB2C0 → 6 + ea(D0)=0 = 6.
+        assert_eq!(execute_instruction(&mut cpu, 0xB2C0, &mut bus), 6);
+    }
+
+    /// CMPA.L (An),An = 14: 6 + ea((An),L)=8. MC68000UM standard table.
+    #[test]
+    fn cmpa_long_indirect_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // CMPA.L (A0),A1 = 0xB3D0 → 6 + 8 = 14.
+        assert_eq!(execute_instruction(&mut cpu, 0xB3D0, &mut bus), 14);
+    }
+
+    /// MOVEM.W regs,(An) store = 8 + 4n, with NO extra EA for plain (An)
+    /// (the base already includes the operand access). MC68000UM Table 8-8.
+    /// n = 2 → 8 + 4*2 = 16.
+    #[test]
+    fn movem_word_store_indirect_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // MOVEM.W D0/D1,(A0) = 0x4890, mask 0x0003.
+        bus.poke_word(0x1000, 0x0003);
+        assert_eq!(execute_instruction(&mut cpu, 0x4890, &mut bus), 16);
+    }
+
+    /// MOVEM.L (d16,An),regs load = 12 + 8n, plus only the extension-word
+    /// fetch (+4 for d(An)), size-independent. MC68000UM Table 8-8.
+    /// n = 2 → 12 + 8*2 + 4 = 32.
+    #[test]
+    fn movem_long_load_disp_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // MOVEM.L (d16,A0),D0/D1 = 0x4CE8; mask word then displacement word.
+        bus.poke_word(0x1000, 0x0003); // register mask
+        bus.poke_word(0x1002, 0x0000); // displacement d16 = 0
+        assert_eq!(execute_instruction(&mut cpu, 0x4CE8, &mut bus), 32);
+    }
+
+    /// ADDX.L -(Ay),-(Ax) memory form = 30 (NOT the register 8).
+    /// MC68000UM multi-precision table.
+    #[test]
+    fn addx_long_mem_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(2, 0x2000);
+        cpu.write_a(3, 0x3000);
+        // ADDX.L -(A2),-(A3) = 0xD78A.
+        assert_eq!(execute_instruction(&mut cpu, 0xD78A, &mut bus), 30);
+    }
+
+    /// ADDX.L Dy,Dx register form = 8. MC68000UM multi-precision table.
+    #[test]
+    fn addx_long_reg_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // ADDX.L D2,D3 = 0xD782.
+        assert_eq!(execute_instruction(&mut cpu, 0xD782, &mut bus), 8);
+    }
+
+    /// BTST Dn,Dn dynamic register form = 6 (NOT 4). MC68000UM bit table.
+    #[test]
+    fn btst_dynamic_reg_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        // BTST D0,D1 = 0x0101 → dynamic reg = 6.
+        assert_eq!(execute_instruction(&mut cpu, 0x0101, &mut bus), 6);
+    }
+
+    /// BTST #,Dn static register form = 10. MC68000UM bit table.
+    #[test]
+    fn btst_static_reg_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        bus.poke_word(0x1000, 0x0003); // static bit number
+        // BTST #3,D1 = 0x0801 → static reg = 10.
+        assert_eq!(execute_instruction(&mut cpu, 0x0801, &mut bus), 10);
+    }
+
+    /// BCLR #,Dn static register form = 14. MC68000UM bit table.
+    #[test]
+    fn bclr_static_reg_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        bus.poke_word(0x1000, 0x0003); // static bit number
+        // BCLR #3,D1 = 0x0881 → static reg = 14.
+        assert_eq!(execute_instruction(&mut cpu, 0x0881, &mut bus), 14);
+    }
+
+    /// TAS (An) memory byte RMW = 10 + ea((An),Byte)=4 = 14. MC68000UM.
+    #[test]
+    fn tas_indirect_cycles() {
+        let mut cpu = make_cpu();
+        let mut bus = TestBus::new();
+        cpu.write_a(0, 0x2000);
+        // TAS (A0) = 0x4AD0 → 10 + 4 = 14.
+        assert_eq!(execute_instruction(&mut cpu, 0x4AD0, &mut bus), 14);
     }
 }
