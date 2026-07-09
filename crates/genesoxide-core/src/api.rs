@@ -616,11 +616,16 @@ impl AudioOutputConfig {
 impl Default for AudioOutputConfig {
     fn default() -> Self {
         // Flat, uncolored default: only the Legacy YM anti-alias low-pass, unity
-        // EQ, no crossfeed, no side coloration. `master_gain` is set so a loud
-        // multi-channel patch peaks near (but under) full scale ahead of the
-        // final soft limiter, giving healthy loudness without brickwall clipping.
-        // The former GHZ-fit coloration is available via `ghz_colored()`.
-        Self::legacy().with_gain(1.35)
+        // EQ, no crossfeed, no side coloration. `master_gain` is set for headroom:
+        // a *dense* music mix (5-6 FM voices + DAC drums) has a high crest factor,
+        // and at the old 1.35 gain ~8% of its samples ran past full scale into the
+        // soft limiter's compression region — audibly distorting dense music while
+        // sparse SFX stayed clean. 1.10 keeps that dense mix's peaks essentially at
+        // the knee (deep-overshoot fraction ~0.5%, harmonic-distortion proxy cut
+        // ~6x) while preserving a healthy loud RMS (~0.43) and peak < 1.0. Sparse
+        // and moderate content stays fully linear. `ghz_colored()` retains the old
+        // coloration for anyone who wants it.
+        Self::legacy().with_gain(1.10)
     }
 }
 
@@ -3412,6 +3417,245 @@ mod tests {
             core.collect_audio_samples();
         }
         core.audio_buffer.clone()
+    }
+
+    /// Configures one YM channel as a sustained algorithm-7 tone (four carriers)
+    /// at a given total-level attenuation, keyed on and panned centre. Unlike
+    /// `configure_loud_channel` (which hard-codes TL 0), this takes a realistic
+    /// music-level TL so a dense multi-channel mix can be modelled.
+    fn configure_music_channel(
+        ym: &mut ym2612::Ym2612,
+        bank: u8,
+        ch: u8,
+        fnum: u16,
+        block: u8,
+        tl: u8,
+    ) {
+        write_ym_reg(ym, bank, 0xB0 + ch, 0x07); // algorithm 7, feedback 0
+        write_ym_reg(ym, bank, 0xB4 + ch, 0xC0); // left + right enabled
+        for op in [0x00u8, 0x04, 0x08, 0x0C] {
+            let reg = ch + op;
+            write_ym_reg(ym, bank, 0x30 + reg, 0x01); // detune 0, multiple 1
+            write_ym_reg(ym, bank, 0x40 + reg, tl); // total level
+            write_ym_reg(ym, bank, 0x50 + reg, 0x1F); // attack rate 31
+            write_ym_reg(ym, bank, 0x60 + reg, 0x00); // decay rate 0
+            write_ym_reg(ym, bank, 0x70 + reg, 0x00); // sustain rate 0
+            write_ym_reg(ym, bank, 0x80 + reg, 0x00); // sustain level 0, release 0
+        }
+        write_ym_reg(ym, bank, 0xA4 + ch, (block << 3) | ((fnum >> 8) as u8 & 0x07));
+        write_ym_reg(ym, bank, 0xA0 + ch, (fnum & 0xFF) as u8);
+    }
+
+    /// Dense representative music patch: five simultaneous FM channels (channels
+    /// 1-5) at a realistic loud-music total level, plus channel 6 running the DAC
+    /// for drums. Returns nothing; the caller drives the DAC drum pattern.
+    fn configure_dense_music_patch(ym: &mut ym2612::Ym2612, tl: u8) {
+        // Channels 1-3 (bank 0) and 4-5 (bank 1) as FM voices at distinct pitches.
+        configure_music_channel(ym, 0, 0, 617, 4, tl);
+        configure_music_channel(ym, 0, 1, 733, 4, tl);
+        configure_music_channel(ym, 0, 2, 872, 4, tl);
+        configure_music_channel(ym, 1, 0, 1036, 4, tl);
+        configure_music_channel(ym, 1, 1, 1232, 3, tl);
+        // Key on the five FM channels (codes 0/1/2 = bank 0, 4/5 = bank 1).
+        for code in [0x00u8, 0x01, 0x02, 0x04, 0x05] {
+            write_ym_reg(ym, 0, 0x28, 0xF0 | code);
+        }
+        // Channel 6 (bank 1 ch 2): DAC drums, panned centre.
+        write_ym_reg(ym, 1, 0xB6, 0xC0); // ch6 L+R
+        write_ym_reg(ym, 0, 0x2B, 0x80); // DAC enable
+        write_ym_reg(ym, 0, 0x2A, 0x80); // DAC mid (0x80 -> value 0)
+    }
+
+    /// Sparse SFX-like patch: a single FM channel (channel 1), keyed on centre.
+    fn configure_sparse_sfx_patch(ym: &mut ym2612::Ym2612, tl: u8) {
+        configure_music_channel(ym, 0, 0, 872, 4, tl);
+        write_ym_reg(ym, 0, 0x28, 0xF0);
+    }
+
+    /// Renders `pairs` stereo output pairs of the dense music patch through the
+    /// full live output chain under `config`, injecting a drum-like DAC pattern on
+    /// channel 6 between scanline batches. Returns the interleaved output buffer.
+    fn render_dense_music(config: AudioOutputConfig, pairs: usize, tl: u8) -> Vec<f32> {
+        let mut core = GenesisCore::new();
+        core.audio_output_config = config;
+        core.rebuild_audio_output_pipeline();
+        configure_dense_music_patch(&mut core.audio_ym2612, tl);
+
+        // Drum: a decaying square burst re-triggered every `beat` scanline batches.
+        let beat = 64usize;
+        let mut batch = 0usize;
+        while core.audio_buffer.len() < pairs * 2 {
+            let pos = batch % beat;
+            let env = 120.0 * (-4.0 * pos as f32 / beat as f32).exp();
+            let sign = if batch % 2 == 0 { 1.0 } else { -1.0 };
+            let dac = (0x80i32 + (sign * env) as i32).clamp(0, 255) as u8;
+            write_ym_reg(&mut core.audio_ym2612, 0, 0x2A, dac);
+            core.collect_audio_samples();
+            batch += 1;
+        }
+        core.audio_buffer.clone()
+    }
+
+    /// Renders `pairs` stereo output pairs of the sparse SFX patch.
+    fn render_sparse_sfx(config: AudioOutputConfig, pairs: usize, tl: u8) -> Vec<f32> {
+        let mut core = GenesisCore::new();
+        core.audio_output_config = config;
+        core.rebuild_audio_output_pipeline();
+        configure_sparse_sfx_patch(&mut core.audio_ym2612, tl);
+        while core.audio_buffer.len() < pairs * 2 {
+            core.collect_audio_samples();
+        }
+        core.audio_buffer.clone()
+    }
+
+    /// Fraction of samples whose *pre-limiter* magnitude exceeds `threshold`. The
+    /// pre-limiter chain is linear in `master_gain`, so render at a tiny gain (well
+    /// below the knee, where `soft_limit` is the identity) and scale the recorded
+    /// output back up to the real gain to recover the pre-limiter signal.
+    fn prelimiter_over_fraction(
+        render: &dyn Fn(AudioOutputConfig, usize, u8) -> Vec<f32>,
+        config: AudioOutputConfig,
+        pairs: usize,
+        tl: u8,
+        skip_pairs: usize,
+        threshold: f32,
+    ) -> f32 {
+        const PROBE_GAIN: f32 = 0.001;
+        let scale = config.master_gain / PROBE_GAIN;
+        let probe = render(config.with_gain(PROBE_GAIN), pairs, tl);
+        let probe = &probe[skip_pairs * 2..];
+        let over = probe
+            .iter()
+            .filter(|&&s| (s * scale).abs() > threshold)
+            .count();
+        over as f32 / probe.len() as f32
+    }
+
+    /// A dense 5-FM-voice + DAC-drum music mix has a high crest factor. Through the
+    /// shipped flat default it must (a) never hard-clip, (b) keep only a small
+    /// fraction of samples in the limiter's *gentle* knee region and essentially
+    /// none *deep* past full scale (the audible-distortion band), and (c) still be
+    /// loud (healthy RMS, peak filling most of full scale). A *sparse* SFX-like
+    /// patch, by contrast, must stay perfectly linear (0% into the limiter).
+    ///
+    /// This guards Issue 1: dense music distorting while SFX stayed clean, caused
+    /// by the pre-fix `master_gain = 1.35` pushing ~8% of dense samples deep into
+    /// the tanh compression region.
+    #[test]
+    fn dense_music_stays_out_of_deep_compression() {
+        const PAIRS: usize = 8_000;
+        const SKIP: usize = 2_000;
+        // Loud but realistic music level (carriers attenuated a little from TL 0).
+        const TL: u8 = 8;
+        let cfg = AudioOutputConfig::default();
+
+        let dense = render_dense_music(cfg, PAIRS, TL);
+        let dense = &dense[SKIP * 2..];
+        let dense_clip = clipped_fraction(dense, 0.999);
+        let dense_peak = peak(dense);
+        let dense_rms = rms(dense);
+        // Pre-limiter overshoot fractions: gentle knee region (>0.8) vs deep (>1.0).
+        let knee_frac =
+            prelimiter_over_fraction(&render_dense_music, cfg, PAIRS, TL, SKIP, 0.8);
+        let deep_frac =
+            prelimiter_over_fraction(&render_dense_music, cfg, PAIRS, TL, SKIP, 1.0);
+
+        let sparse_knee =
+            prelimiter_over_fraction(&render_sparse_sfx, cfg, PAIRS, TL, SKIP, 0.8);
+
+        eprintln!(
+            "[dense] peak={dense_peak:.4} rms={dense_rms:.4} clip%={:.3} \
+             knee%={:.3} deep%={:.3}  sparse knee%={:.3}",
+            dense_clip * 100.0,
+            knee_frac * 100.0,
+            deep_frac * 100.0,
+            sparse_knee * 100.0,
+        );
+
+        // (a) No hard clipping.
+        assert!(dense_clip < 1e-3, "dense clip fraction too high: {dense_clip}");
+        assert!(dense_peak < 0.999, "dense peak at full scale: {dense_peak}");
+        // (b) Essentially nothing deep in compression; only a small gentle-knee tail.
+        assert!(
+            deep_frac < 0.02,
+            "too many dense samples deep past full scale: {deep_frac}"
+        );
+        assert!(
+            knee_frac < 0.12,
+            "too many dense samples in the limiter knee: {knee_frac}"
+        );
+        // (c) Still loud.
+        assert!(
+            (0.35..=0.52).contains(&dense_rms),
+            "dense RMS outside healthy band: {dense_rms}"
+        );
+        assert!(dense_peak > 0.5, "dense output too quiet: peak={dense_peak}");
+        // Sparse SFX must stay fully linear (no limiter engagement at all).
+        assert_eq!(sparse_knee, 0.0, "sparse SFX entered the limiter: {sparse_knee}");
+    }
+
+    /// Trimming `master_gain` for headroom must dramatically reduce how many dense
+    /// samples reach the audible (deep) compression band versus the old 1.35 gain,
+    /// without reintroducing hard clipping. Locks the headroom fix in place.
+    #[test]
+    fn headroom_trim_reduces_deep_compression() {
+        const PAIRS: usize = 8_000;
+        const SKIP: usize = 2_000;
+        const TL: u8 = 8;
+
+        let new_deep = prelimiter_over_fraction(
+            &render_dense_music,
+            AudioOutputConfig::default(),
+            PAIRS,
+            TL,
+            SKIP,
+            1.0,
+        );
+        let old_deep = prelimiter_over_fraction(
+            &render_dense_music,
+            AudioOutputConfig::default().with_gain(1.35),
+            PAIRS,
+            TL,
+            SKIP,
+            1.0,
+        );
+        eprintln!("[headroom] deep%% old(1.35)={:.3} new={:.3}", old_deep * 100.0, new_deep * 100.0);
+        assert!(
+            new_deep < old_deep * 0.25,
+            "headroom trim did not meaningfully cut deep compression: old={old_deep} new={new_deep}"
+        );
+        // The default must not have crept back up toward the distorting gain.
+        assert!(AudioOutputConfig::default().master_gain <= 1.15);
+    }
+
+    /// The DAC (channel 6 drums) must sit at the same level as one loud FM voice,
+    /// not disproportionately hot or quiet — otherwise drum-heavy music would clip
+    /// or vanish. The DAC path is `dac_value<<1` (±256); an FM channel clamps to
+    /// ±256, so a full DAC hit should be ~one loud FM channel.
+    #[test]
+    fn dac_level_matches_one_fm_voice() {
+        let mut fm = ym2612::Ym2612::new();
+        configure_music_channel(&mut fm, 0, 0, 872, 4, 0);
+        write_ym_reg(&mut fm, 0, 0x28, 0xF0);
+        let mut fm_peak = 0i32;
+        for _ in 0..4_000 {
+            let (l, _) = fm.output_sample_per_channel()[0];
+            fm_peak = fm_peak.max((l * 1536.0).round().abs() as i32);
+        }
+
+        let mut dac = ym2612::Ym2612::new();
+        write_ym_reg(&mut dac, 1, 0xB6, 0xC0);
+        write_ym_reg(&mut dac, 0, 0x2B, 0x80); // DAC enable
+        write_ym_reg(&mut dac, 0, 0x2A, 0xFF); // full positive (value +127)
+        let (dl, _) = dac.output_sample_per_channel()[5];
+        let dac_peak = (dl * 1536.0).round().abs() as i32;
+
+        let ratio = dac_peak as f32 / fm_peak as f32;
+        eprintln!("[dac-vs-fm] fm_peak={fm_peak} dac_peak={dac_peak} ratio={ratio:.3}");
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "DAC level disproportionate to one FM voice: ratio={ratio}"
+        );
     }
 
     #[test]
