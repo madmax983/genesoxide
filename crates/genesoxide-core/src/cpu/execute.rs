@@ -1504,12 +1504,10 @@ fn exec_muls(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     // is the number of 10 or 01 bit patterns in the 17-bit value formed by the
     // 16-bit source with a 0 appended to the least-significant end.
     let appended = raw << 1; // 17-bit value, bit 0 = 0
-    let mut transitions = 0u32;
-    for i in 0..16 {
-        if ((appended >> i) & 1) != ((appended >> (i + 1)) & 1) {
-            transitions += 1;
-        }
-    }
+    // Count adjacent-bit transitions across the 17-bit value: bit i of
+    // (appended ^ appended>>1) is set iff bits i and i+1 differ, and the low 16
+    // bits cover exactly the 16 pairs (0,1)..(15,16).
+    let transitions = ((appended ^ (appended >> 1)) & 0xFFFF).count_ones();
     38 + 2 * transitions + ea_calc_cycles(ea, InstructionSize::Word)
 }
 
