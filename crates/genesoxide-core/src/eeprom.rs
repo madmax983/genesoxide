@@ -160,6 +160,62 @@ pub struct LineConfig {
     pub scl: LinePin,
 }
 
+/// One serial-EEPROM database entry: a ROM-serial fragment to match, plus the
+/// chip and mapper that title uses. Serial fragments are matched by substring
+/// against the header serial (matching Genesis Plus GX's `strstr` behaviour),
+/// so leading/trailing framing (e.g. "GM ", trailing region digits) does not
+/// defeat the lookup.
+struct DbEntry {
+    /// ROM-serial fragment (as printed in the header product code).
+    serial: &'static str,
+    /// EEPROM chip fitted.
+    chip: EepromType,
+    /// Cartridge mapper wiring.
+    mapper: EepromMapper,
+}
+
+/// Serial-EEPROM game database. Serials and chip/mapper assignments are
+/// hardware facts taken from the Genesis Plus GX `i2c_database` table.
+///
+/// Note on chip mapping: this core exposes one [`EepromType`] per capacity, so
+/// GPGX's mode-1 vs mode-2 24C02 split and its 24C65 both fold onto the nearest
+/// capacity variant (24C02 -> `X24C02`, 24C65 -> `X24C64`). This preserves
+/// size/address-mode behaviour; only the page-write granularity of those few
+/// titles differs slightly from silicon.
+const GAME_DB: &[DbEntry] = &[
+    // --- EA mapper (X24C01) ---
+    DbEntry { serial: "T-50176", chip: EepromType::X24C01, mapper: EepromMapper::Ea }, // Rings of Power
+    DbEntry { serial: "T-50396", chip: EepromType::X24C01, mapper: EepromMapper::Ea }, // NHLPA Hockey 93
+    DbEntry { serial: "T-50446", chip: EepromType::X24C01, mapper: EepromMapper::Ea }, // John Madden Football 93
+    DbEntry { serial: "T-50516", chip: EepromType::X24C01, mapper: EepromMapper::Ea }, // Madden 93 Championship
+    DbEntry { serial: "T-50606", chip: EepromType::X24C01, mapper: EepromMapper::Ea }, // Bill Walsh College Football
+    // --- SEGA mapper (X24C01) ---
+    DbEntry { serial: "T-12046", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Megaman - The Wily Wars
+    DbEntry { serial: "T-12053", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Rockman Mega World
+    DbEntry { serial: "MK-1215", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Evander Holyfield's Boxing
+    DbEntry { serial: "MK-1228", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Greatest Heavyweights (U/E)
+    DbEntry { serial: "G-5538", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Greatest Heavyweights (J)
+    DbEntry { serial: "PR-1993", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Greatest Heavyweights (Proto)
+    DbEntry { serial: "G-4060", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Wonder Boy in Monster World
+    DbEntry { serial: "00001211", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Sports Talk Baseball
+    DbEntry { serial: "00004076", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Honoo no Toukyuuji Dodge Danpei
+    DbEntry { serial: "G-4524", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Ninja Burai Densetsu
+    DbEntry { serial: "00054503", chip: EepromType::X24C01, mapper: EepromMapper::Sega }, // Game Toshokan
+    // --- Acclaim 16M mapper (X24C02) ---
+    DbEntry { serial: "T-81033", chip: EepromType::X24C02, mapper: EepromMapper::AcclaimOld }, // NBA Jam (J)
+    DbEntry { serial: "T-081326", chip: EepromType::X24C02, mapper: EepromMapper::AcclaimOld }, // NBA Jam (UE)
+    // --- Acclaim 32M mapper ---
+    DbEntry { serial: "T-081276", chip: EepromType::X24C02, mapper: EepromMapper::AcclaimNew }, // NFL Quarterback Club (24C02)
+    DbEntry { serial: "T-81406", chip: EepromType::X24C04, mapper: EepromMapper::AcclaimNew }, // NBA Jam TE (24C04)
+    DbEntry { serial: "T-081586", chip: EepromType::X24C16, mapper: EepromMapper::AcclaimNew }, // NFL QB Club '96 (24C16)
+    DbEntry { serial: "T-81476", chip: EepromType::X24C64, mapper: EepromMapper::AcclaimNew }, // Frank Thomas Big Hurt (24C65)
+    DbEntry { serial: "T-81576", chip: EepromType::X24C64, mapper: EepromMapper::AcclaimNew }, // College Slam (24C65)
+    // --- Codemasters J-CART mapper ---
+    DbEntry { serial: "T-120106", chip: EepromType::X24C08, mapper: EepromMapper::Codemasters }, // Brian Lara Cricket (24C08)
+    DbEntry { serial: "T-120096", chip: EepromType::X24C16, mapper: EepromMapper::Codemasters }, // Micro Machines 2 (24C16)
+    DbEntry { serial: "T-120146", chip: EepromType::X24C64, mapper: EepromMapper::Codemasters }, // Brian Lara Cricket 96 (24C65)
+];
+
 impl EepromMapper {
     /// Standard SEGA-style whole-cartridge EEPROM window.
     const CART_LO: u32 = 0x20_0000;
@@ -204,5 +260,439 @@ impl EepromMapper {
                 scl: LinePin { start: 0x30_0000, end: 0x37_FFFF, lane: Lane::Any, bit: 1 },
             },
         }
+    }
+}
+
+/// I2C transfer phase of the EEPROM state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum I2cState {
+    /// Idle; waiting for a START condition.
+    Standby,
+    /// Transfer finished (e.g. read NACK); waiting for a STOP.
+    WaitStop,
+    /// Latching the device-address byte (mode 2/3).
+    GetDeviceAddr,
+    /// Latching the 7-bit word address + R/W (mode 1, X24C01).
+    GetWordAddr7,
+    /// Latching the high byte of a 16-bit word address (mode 3).
+    GetWordAddrHigh,
+    /// Latching the low byte of the word address (mode 2/3).
+    GetWordAddrLow,
+    /// Streaming data out to the host.
+    ReadData,
+    /// Streaming data in from the host.
+    WriteData,
+}
+
+/// A cartridge serial EEPROM plus its live I2C bit-bang state.
+///
+/// Mirrors the `CartSram` bus contract: [`read`](Self::read) returns
+/// `Option<u8>` so a non-EEPROM address falls through to ROM, and
+/// [`write`](Self::write) returns whether it consumed the access. An absent
+/// EEPROM ([`Eeprom::empty`]) never claims any access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Eeprom {
+    /// Chip fitted, or `None` when the cartridge has no serial EEPROM.
+    chip: Option<EepromType>,
+    /// Board wiring.
+    mapper: EepromMapper,
+    /// Backing store (length == chip size, empty when absent).
+    mem: Vec<u8>,
+    /// Current SDA line level.
+    sda: bool,
+    /// Current SCL line level.
+    scl: bool,
+    /// SDA level at the previous I2C tick (for edge detection).
+    old_sda: bool,
+    /// SCL level at the previous I2C tick.
+    old_scl: bool,
+    /// Bit/cycle counter within the current byte phase (0-9).
+    cycles: u8,
+    /// True when the master requested a read (R/W bit == 1).
+    rw: bool,
+    /// Device-address block bits, pre-shifted into high word-address bits.
+    device_address: u16,
+    /// Current word (memory) address.
+    word_address: u16,
+    /// Byte being assembled during a write.
+    buffer: u8,
+    /// Current transfer phase.
+    state: I2cState,
+    /// Set whenever `mem` is modified; cleared by the host after a flush.
+    dirty: bool,
+}
+
+impl Eeprom {
+    /// An absent EEPROM (used before a ROM is loaded or for non-EEPROM carts).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            chip: None,
+            mapper: EepromMapper::Sega,
+            mem: Vec::new(),
+            sda: true,
+            scl: true,
+            old_sda: true,
+            old_scl: true,
+            cycles: 0,
+            rw: false,
+            device_address: 0,
+            word_address: 0,
+            buffer: 0,
+            state: I2cState::Standby,
+            dirty: false,
+        }
+    }
+
+    /// Builds EEPROM state for a freshly loaded ROM by matching its header
+    /// serial against the game database. Returns [`Eeprom::empty`] on no match.
+    #[must_use]
+    pub fn for_rom(header: &RomHeader) -> Self {
+        match Self::lookup(&header.serial) {
+            Some((chip, mapper)) => Self::new(chip, mapper),
+            None => Self::empty(),
+        }
+    }
+
+    /// Constructs a present EEPROM of the given chip and mapper (zero-filled).
+    #[must_use]
+    pub fn new(chip: EepromType, mapper: EepromMapper) -> Self {
+        Self {
+            chip: Some(chip),
+            mapper,
+            mem: vec![0; chip.size()],
+            ..Self::empty()
+        }
+    }
+
+    /// Tolerant database lookup: succeeds if any database serial fragment is a
+    /// substring of the (whitespace/NUL-trimmed) header serial, mirroring the
+    /// reference emulator's substring match.
+    fn lookup(serial: &str) -> Option<(EepromType, EepromMapper)> {
+        let needle = serial.trim().trim_matches('\0').trim();
+        GAME_DB
+            .iter()
+            .find(|e| needle.contains(e.serial))
+            .map(|e| (e.chip, e.mapper))
+    }
+
+    /// True if a serial EEPROM is fitted.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        self.chip.is_some()
+    }
+
+    /// Effective backing index for the current device/word address.
+    fn mem_index(&self) -> usize {
+        let addr = (self.device_address | self.word_address) as usize;
+        // All chip sizes are powers of two, so mask to stay in range.
+        addr & (self.mem.len().wrapping_sub(1))
+    }
+
+    /// Returns the bit the chip currently drives on SDA (mirrors the reference
+    /// `eeprom_i2c_out`).
+    fn sda_out(&self) -> u8 {
+        if self.state == I2cState::ReadData {
+            if self.cycles < 9 {
+                let byte = self.mem[self.mem_index()];
+                return (byte >> (8 - self.cycles)) & 1;
+            }
+        } else if self.cycles == 9 {
+            // ACK cycle: chip pulls SDA low.
+            return 0;
+        }
+        u8::from(self.sda)
+    }
+
+    /// Reads a byte if `addr` decodes to this EEPROM's SDA-out line; otherwise
+    /// `None` so the bus falls through to ROM.
+    #[must_use]
+    pub fn read(&self, addr: u32) -> Option<u8> {
+        let chip = self.chip?;
+        let cfg = self.mapper.line_config();
+        let _ = chip;
+        if cfg.sda_out.matches(addr) {
+            Some(self.sda_out() << cfg.sda_out.bit)
+        } else {
+            None
+        }
+    }
+
+    /// Decodes SCL/SDA from a byte write and advances the I2C state machine.
+    /// Returns `true` if the write targeted an EEPROM line (and was consumed).
+    pub fn write(&mut self, addr: u32, val: u8) -> bool {
+        if self.chip.is_none() {
+            return false;
+        }
+        let cfg = self.mapper.line_config();
+        let mut hit = false;
+        if cfg.scl.matches(addr) {
+            self.scl = (val >> cfg.scl.bit) & 1 != 0;
+            hit = true;
+        }
+        if cfg.sda_in.matches(addr) {
+            self.sda = (val >> cfg.sda_in.bit) & 1 != 0;
+            hit = true;
+        }
+        if hit {
+            self.update();
+        }
+        hit
+    }
+
+    /// The chip's backing bytes (empty when absent).
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.mem
+    }
+
+    /// Loads persisted bytes into the EEPROM. Copies up to the chip size; does
+    /// not mark dirty (the on-disk copy is current).
+    pub fn load(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.mem.len());
+        self.mem[..n].copy_from_slice(&bytes[..n]);
+        self.dirty = false;
+    }
+
+    /// True if the EEPROM has been written since the last [`clear_dirty`](Self::clear_dirty).
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Clears the dirty flag (call after flushing the save to disk).
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    /// True if this EEPROM holds data worth persisting (i.e. it is present).
+    #[must_use]
+    pub fn worth_saving(&self) -> bool {
+        self.chip.is_some()
+    }
+
+    /// Detects an I2C START: SDA high→low while SCL stays high.
+    fn detect_start(&mut self) -> bool {
+        if self.old_scl && self.scl && self.old_sda && !self.sda {
+            self.cycles = 0;
+            if self.address_bits() == 7 {
+                self.word_address = 0;
+                self.state = I2cState::GetWordAddr7;
+            } else {
+                self.device_address = 0;
+                self.state = I2cState::GetDeviceAddr;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Detects an I2C STOP: SDA low→high while SCL stays high.
+    fn detect_stop(&mut self) -> bool {
+        if self.old_scl && self.scl && !self.old_sda && self.sda {
+            self.state = I2cState::Standby;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Address width of the fitted chip (0 if absent).
+    fn address_bits(&self) -> u8 {
+        self.chip.map_or(0, EepromType::address_bits)
+    }
+
+    fn size_mask(&self) -> u16 {
+        self.chip.map_or(0, EepromType::size_mask)
+    }
+
+    fn pagewrite_mask(&self) -> u16 {
+        self.chip.map_or(0, EepromType::pagewrite_mask)
+    }
+
+    /// True on an SCL rising edge (data sampled here).
+    fn scl_rising(&self) -> bool {
+        !self.old_scl && self.scl
+    }
+
+    /// True on an SCL falling edge (phase advance).
+    fn scl_falling(&self) -> bool {
+        self.old_scl && !self.scl
+    }
+
+    /// Advances the I2C state machine by one bus tick, then latches the new
+    /// SCL/SDA levels as the previous state for the next edge comparison.
+    fn update(&mut self) {
+        match self.state {
+            I2cState::Standby => {
+                self.detect_start();
+            }
+            I2cState::WaitStop => {
+                self.detect_stop();
+            }
+            I2cState::GetWordAddr7 => self.step_word_addr7(),
+            I2cState::GetDeviceAddr => self.step_device_addr(),
+            I2cState::GetWordAddrHigh => self.step_word_addr_high(),
+            I2cState::GetWordAddrLow => self.step_word_addr_low(),
+            I2cState::ReadData => self.step_read(),
+            I2cState::WriteData => self.step_write(),
+        }
+        self.old_scl = self.scl;
+        self.old_sda = self.sda;
+    }
+
+    /// Mode-1 (X24C01): 7 word-address bits + R/W bit in a single byte.
+    fn step_word_addr7(&mut self) {
+        if self.detect_start() || self.detect_stop() {
+            return;
+        }
+        if self.scl_falling() {
+            if self.cycles < 9 {
+                self.cycles += 1;
+            } else {
+                self.cycles = 1;
+                self.state = if self.rw { I2cState::ReadData } else { I2cState::WriteData };
+                self.buffer = 0;
+            }
+        } else if self.scl_rising() {
+            if self.cycles < 8 {
+                self.word_address |= u16::from(self.sda) << (7 - self.cycles);
+            } else if self.cycles == 8 {
+                self.rw = self.sda;
+            }
+        }
+    }
+
+    /// Mode-2/3: device-address byte (1010 + block bits + R/W).
+    fn step_device_addr(&mut self) {
+        if self.detect_start() || self.detect_stop() {
+            return;
+        }
+        if self.scl_falling() {
+            if self.cycles < 9 {
+                self.cycles += 1;
+            } else {
+                self.device_address <<= self.address_bits();
+                self.cycles = 1;
+                if self.rw {
+                    self.state = I2cState::ReadData;
+                } else {
+                    self.word_address = 0;
+                    self.state = if self.address_bits() == 16 {
+                        I2cState::GetWordAddrHigh
+                    } else {
+                        I2cState::GetWordAddrLow
+                    };
+                }
+            }
+        } else if self.scl_rising() {
+            if self.cycles > 4 && self.cycles < 8 {
+                // Block-select bits become the high word-address bits.
+                self.device_address |= u16::from(self.sda) << (7 - self.cycles);
+            } else if self.cycles == 8 {
+                self.rw = self.sda;
+            }
+        }
+    }
+
+    /// Mode-3: high byte of a 16-bit word address.
+    fn step_word_addr_high(&mut self) {
+        if self.detect_start() || self.detect_stop() {
+            return;
+        }
+        if self.scl_falling() {
+            if self.cycles < 9 {
+                self.cycles += 1;
+            } else {
+                self.cycles = 1;
+                self.state = I2cState::GetWordAddrLow;
+            }
+        } else if self.scl_rising() && self.cycles < 9 {
+            if self.size_mask() < (1u16 << (16 - self.cycles)) {
+                self.device_address >>= 1;
+            } else {
+                self.word_address |= u16::from(self.sda) << (16 - self.cycles);
+            }
+        }
+    }
+
+    /// Mode-2/3: low byte of the word address (7 bits for X24C01-style, 8 else).
+    fn step_word_addr_low(&mut self) {
+        if self.detect_start() || self.detect_stop() {
+            return;
+        }
+        if self.scl_falling() {
+            if self.cycles < 9 {
+                self.cycles += 1;
+            } else {
+                self.cycles = 1;
+                self.state = I2cState::WriteData;
+                self.buffer = 0;
+            }
+        } else if self.scl_rising() && self.cycles < 9 {
+            if self.size_mask() < (1u16 << (8 - self.cycles)) {
+                self.device_address >>= 1;
+            } else {
+                self.word_address |= u16::from(self.sda) << (8 - self.cycles);
+            }
+        }
+    }
+
+    /// Read burst: on ACK the master either continues (auto-increment) or NACKs
+    /// to end the transfer.
+    fn step_read(&mut self) {
+        if self.detect_start() || self.detect_stop() {
+            return;
+        }
+        if self.scl_falling() {
+            if self.cycles < 9 {
+                self.cycles += 1;
+            } else {
+                self.cycles = 1;
+            }
+        } else if self.scl_rising() && self.cycles == 9 {
+            if self.sda {
+                // NACK: master ends the read.
+                self.state = I2cState::WaitStop;
+            } else {
+                // ACK: auto-increment (wraps at the whole array).
+                self.word_address = (self.word_address + 1) & self.size_mask();
+            }
+        }
+    }
+
+    /// Write burst: assemble a byte, commit on the 9th (ACK) cycle, then advance
+    /// the word address within the current page.
+    fn step_write(&mut self) {
+        if self.detect_start() || self.detect_stop() {
+            return;
+        }
+        if self.scl_falling() {
+            if self.cycles < 9 {
+                self.cycles += 1;
+            } else {
+                self.cycles = 1;
+            }
+        } else if self.scl_rising() {
+            if self.cycles < 9 {
+                self.buffer |= u8::from(self.sda) << (8 - self.cycles);
+            } else {
+                let idx = self.mem_index();
+                self.mem[idx] = self.buffer;
+                self.dirty = true;
+                self.buffer = 0;
+                // Increment only the in-page low bits (page-write wrap).
+                let page = self.pagewrite_mask();
+                self.word_address =
+                    (self.word_address & !page) | ((self.word_address + 1) & page);
+            }
+        }
+    }
+}
+
+impl Default for Eeprom {
+    fn default() -> Self {
+        Self::empty()
     }
 }
