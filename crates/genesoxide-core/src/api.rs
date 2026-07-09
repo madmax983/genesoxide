@@ -1118,6 +1118,99 @@ const DEFAULT_SRAM_SIZE: usize = 0x8000;
 /// SSF SRAM write-enable register (odd byte of the 0xA130F0 word).
 const SSF_SRAM_ENABLE_ADDR: u32 = 0x00A1_30F1;
 
+/// Base address of the SSF2 (Sega) bank-register block. The odd bytes
+/// 0xA130F3, F5, F7, F9, FB, FD, FF select the physical bank mapped into
+/// windows 1..=7 of the 4MB cartridge window. (0xA130F1 is the SRAM-enable
+/// register handled separately.)
+const SSF2_BANK_BASE: u32 = 0x00A1_30F1;
+/// Size of one SSF2 window / physical bank (512KB).
+const SSF2_BANK_SIZE: usize = 0x8_0000;
+
+/// Cartridge address mapper. Decides how a 68000 cartridge-window address
+/// (0x000000–0x3FFFFF) maps onto the flat `rom: Vec<u8>` backing store.
+///
+/// - `Flat`: plain 4MB-masked pass-through (all ROMs ≤4MB).
+/// - `Ssf2`: the Sega/SSF2 >4MB banking scheme. The 4MB window is divided
+///   into eight 512KB windows; window 0 is fixed to physical bank 0, windows
+///   1..=7 are steered by the odd 0xA130F3..0xA130FF byte registers, letting an
+///   up-to-8MB ROM be paged into 0x080000–0x3FFFFF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mapper {
+    /// Flat 4MB-masked ROM (no banking).
+    Flat,
+    /// SSF2 (Sega) bank mapper; `banks[w]` is the physical bank in window `w`.
+    Ssf2 {
+        /// Physical 512KB bank selected for each of the 8 windows.
+        banks: [u8; 8],
+    },
+}
+
+impl Default for Mapper {
+    fn default() -> Self {
+        Mapper::Flat
+    }
+}
+
+impl Mapper {
+    /// Default identity bank table for a freshly powered SSF2 cartridge.
+    const SSF2_DEFAULT_BANKS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    /// Chooses a mapper for a ROM of the given length. ROMs larger than 4MB
+    /// use the SSF2 banker; everything else stays flat.
+    #[must_use]
+    fn for_rom(rom_len: usize) -> Mapper {
+        if rom_len > 0x40_0000 {
+            Mapper::Ssf2 {
+                banks: Self::SSF2_DEFAULT_BANKS,
+            }
+        } else {
+            Mapper::Flat
+        }
+    }
+
+    /// Translates a 68000 cartridge-window address into a physical offset into
+    /// the flat ROM backing store.
+    #[must_use]
+    fn rom_offset(&self, addr: u32) -> usize {
+        match self {
+            Mapper::Flat => (addr & 0x3F_FFFF) as usize,
+            Mapper::Ssf2 { banks } => {
+                let window = ((addr >> 19) & 0x7) as usize;
+                let bank = banks[window] as usize;
+                bank * SSF2_BANK_SIZE + (addr & 0x7_FFFF) as usize
+            }
+        }
+    }
+
+    /// Handles a byte write to a bank-select register (0xA130F3..0xA130FF, odd
+    /// addresses). Returns `true` if `addr` was a bank register (and was
+    /// consumed), `false` otherwise. A no-op on a `Flat` mapper.
+    fn write_bank_register(&mut self, addr: u32, val: u8) -> bool {
+        // Windows 1..=7 live at 0xA130F3, F5, F7, F9, FB, FD, FF.
+        if addr <= SSF2_BANK_BASE || addr > SSF2_BANK_BASE + 14 || (addr & 1) == 0 {
+            return false;
+        }
+        let window = ((addr - SSF2_BANK_BASE) / 2) as usize; // 1..=7
+        if let Mapper::Ssf2 { banks } = self {
+            banks[window] = val;
+        }
+        true
+    }
+
+    /// Restores default (power-on) bank assignments.
+    fn reset(&mut self) {
+        if let Mapper::Ssf2 { banks } = self {
+            *banks = Self::SSF2_DEFAULT_BANKS;
+        }
+    }
+}
+
+/// Reads a single ROM byte through the active mapper, matching the flat path's
+/// out-of-range behavior (reads past the end of ROM return 0).
+fn rom_read_byte(rom: &[u8], mapper: &Mapper, addr: u32) -> u8 {
+    rom.get(mapper.rom_offset(addr)).copied().unwrap_or(0)
+}
+
 impl CartSram {
     /// A disabled, empty SRAM (used before a ROM is loaded).
     fn empty() -> Self {
@@ -1280,6 +1373,10 @@ pub struct GenesisCoreSnapshot {
     pub speed_permille: u16,
     /// Whether emulation is paused.
     pub paused: bool,
+    /// Cartridge address mapper (bank state). Defaults to `Flat` for old save
+    /// states written before the mapper field existed.
+    #[serde(default)]
+    pub mapper: Mapper,
 }
 
 /// A YM2612 register write observed on the live machine timeline.
@@ -1552,6 +1649,8 @@ pub struct GenesisCore {
     port2: ControllerPort,
     /// Cartridge ROM data.
     rom: Vec<u8>,
+    /// Cartridge address mapper (flat or SSF2 >4MB banker).
+    mapper: Mapper,
     /// Parsed ROM header (if loaded).
     rom_header: Option<RomHeader>,
     /// Cartridge backup RAM (battery save) state.
@@ -1818,6 +1917,7 @@ impl GenesisCore {
             port1: ControllerPort::new(),
             port2: ControllerPort::new(),
             rom: Vec::new(),
+            mapper: Mapper::Flat,
             rom_header: None,
             sram: CartSram::empty(),
             work_ram: Box::new([0; 0x10000]),
@@ -2195,6 +2295,7 @@ impl GenesisCore {
             frame_count: self.frame_count,
             speed_permille: self.speed_permille,
             paused: self.paused,
+            mapper: self.mapper.clone(),
         }
     }
 
@@ -2223,6 +2324,7 @@ impl GenesisCore {
         self.frame_count = snap.frame_count;
         self.speed_permille = snap.speed_permille;
         self.paused = snap.paused;
+        self.mapper = snap.mapper.clone();
         // Rebuild the audio resampler/filter pipeline so the (excluded) DSP
         // scratch state is consistent with the restored chip state.
         self.reset_audio_resampler_state();
@@ -2291,6 +2393,7 @@ impl GenesisCore {
         // default). A newly loaded ROM starts with a fresh, empty save; the
         // host may repopulate it afterwards via `load_sram`.
         self.sram = CartSram::from_header(self.rom_header.as_ref());
+        self.mapper = Mapper::for_rom(data.len());
         self.rom = data;
         self.power_cycle();
     }
@@ -2302,6 +2405,7 @@ impl GenesisCore {
         self.work_ram.fill(0);
         self.z80 = z80::Z80::new();
         self.z80_ram.fill(0);
+        self.mapper.reset();
         self.z80_bank = 0;
         self.z80_bus_requested = false;
         self.z80_reset = true;
@@ -2351,6 +2455,7 @@ impl GenesisCore {
         // Build a bus wrapper that borrows the non-CPU fields.
         let mut bus = CoreBus {
             rom: &self.rom,
+            mapper: &mut self.mapper,
             sram: &mut self.sram,
             work_ram: &mut self.work_ram,
             vdp: &mut self.vdp,
@@ -2546,6 +2651,7 @@ impl GenesisCore {
                     scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                 let mut bus = CoreBus {
                     rom: &self.rom,
+                    mapper: &mut self.mapper,
                     sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
@@ -2611,6 +2717,7 @@ impl GenesisCore {
                     scanline_start_tick + (self.cpu.cycles - cpu_cycle_base) * MASTER_PER_CPU;
                 let mut bus = CoreBus {
                     rom: &self.rom,
+                    mapper: &mut self.mapper,
                     sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &mut self.vdp,
@@ -2685,6 +2792,7 @@ impl GenesisCore {
                 let mut bus = Z80Bus {
                     z80_ram: &mut self.z80_ram,
                     rom: &self.rom,
+                    mapper: &mut self.mapper,
                     sram: &mut self.sram,
                     work_ram: &mut self.work_ram,
                     vdp: &self.vdp,
@@ -2722,6 +2830,7 @@ impl GenesisCore {
             let mut bus = Z80Bus {
                 z80_ram: &mut self.z80_ram,
                 rom: &self.rom,
+                mapper: &mut self.mapper,
                 sram: &mut self.sram,
                 work_ram: &mut self.work_ram,
                 vdp: &self.vdp,
@@ -2980,13 +3089,14 @@ impl GenesisCore {
         // We need to read from the 68K bus, so we build a closure that
         // accesses ROM and work RAM.
         let rom = &self.rom;
+        let mapper = &self.mapper;
         let work_ram = &self.work_ram;
         let mut read_word = |addr: u32| -> u16 {
             match bus::map_region(addr) {
                 bus::BusRegion::CartridgeRom => {
-                    let offset = (addr & 0x3FFFFF) as usize;
-                    let hi = u16::from(*rom.get(offset).unwrap_or(&0));
-                    let lo = u16::from(*rom.get(offset + 1).unwrap_or(&0));
+                    // Compose per byte so window boundaries map correctly.
+                    let hi = u16::from(rom_read_byte(rom, mapper, addr));
+                    let lo = u16::from(rom_read_byte(rom, mapper, addr.wrapping_add(1)));
                     (hi << 8) | lo
                 }
                 bus::BusRegion::WorkRam => {
@@ -3022,8 +3132,7 @@ impl GenesisCore {
                 if let Some(b) = self.sram.read(addr) {
                     return b;
                 }
-                let offset = (addr & 0x3FFFFF) as usize;
-                self.rom.get(offset).copied().unwrap_or(0)
+                rom_read_byte(&self.rom, &self.mapper, addr)
             }
             bus::BusRegion::WorkRam => {
                 let offset = (addr & 0xFFFF) as usize;
@@ -3113,6 +3222,9 @@ impl GenesisCore {
             self.sram.enabled = (val as u8) & 0x01 != 0;
             return;
         }
+        if self.mapper.write_bank_register(addr | 1, val as u8) {
+            return;
+        }
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
                 let _ = self.sram.write(addr, (val >> 8) as u8);
@@ -3200,6 +3312,7 @@ impl AudioTraceCtx<'_> {
 fn read_68k_byte(
     addr: u32,
     rom: &[u8],
+    mapper: &Mapper,
     sram: &CartSram,
     work_ram: &[u8; 0x10000],
     vdp: &Vdp,
@@ -3215,8 +3328,7 @@ fn read_68k_byte(
             if let Some(b) = sram.read(addr) {
                 return b;
             }
-            let offset = (addr & 0x3FFFFF) as usize;
-            rom.get(offset).copied().unwrap_or(0)
+            rom_read_byte(rom, mapper, addr)
         }
         bus::BusRegion::WorkRam => {
             let offset = (addr & 0xFFFF) as usize;
@@ -3288,6 +3400,7 @@ fn read_68k_byte(
 fn write_68k_byte(
     addr: u32,
     val: u8,
+    mapper: &mut Mapper,
     sram: &mut CartSram,
     work_ram: &mut [u8; 0x10000],
     port1: &mut ControllerPort,
@@ -3308,6 +3421,12 @@ fn write_68k_byte(
     // `bus::map_region`, so special-case it before the region match.
     if addr == SSF_SRAM_ENABLE_ADDR {
         sram.enabled = val & 0x01 != 0;
+        return;
+    }
+    // SSF2 (Sega) bank-select registers at 0xA130F3..0xA130FF (odd). Also
+    // `Unmapped`, so handle before the region match, exactly like the SRAM
+    // toggle above.
+    if mapper.write_bank_register(addr, val) {
         return;
     }
     match bus::map_region(addr) {
@@ -3387,6 +3506,7 @@ fn write_68k_byte(
 /// with the mutable borrow of the CPU.
 struct CoreBus<'a> {
     rom: &'a [u8],
+    mapper: &'a mut Mapper,
     sram: &'a mut CartSram,
     work_ram: &'a mut Box<[u8; 0x10000]>,
     vdp: &'a mut Vdp,
@@ -3429,6 +3549,7 @@ impl Bus for CoreBus<'_> {
         read_68k_byte(
             addr,
             self.rom,
+            self.mapper,
             self.sram,
             &**self.work_ram,
             self.vdp,
@@ -3444,11 +3565,12 @@ impl Bus for CoreBus<'_> {
         match bus::map_region(addr) {
             bus::BusRegion::CartridgeRom => {
                 // Each byte lane may be backed by SRAM (when mapped in) or ROM.
-                let hi = self.sram.read(addr).unwrap_or_else(|| {
-                    *self.rom.get((addr & 0x3FFFFF) as usize).unwrap_or(&0)
-                });
+                let hi = self
+                    .sram
+                    .read(addr)
+                    .unwrap_or_else(|| rom_read_byte(self.rom, self.mapper, addr));
                 let lo = self.sram.read(addr.wrapping_add(1)).unwrap_or_else(|| {
-                    *self.rom.get(((addr & 0x3FFFFF) + 1) as usize).unwrap_or(&0)
+                    rom_read_byte(self.rom, self.mapper, addr.wrapping_add(1))
                 });
                 (u16::from(hi) << 8) | u16::from(lo)
             }
@@ -3532,6 +3654,7 @@ impl Bus for CoreBus<'_> {
         write_68k_byte(
             addr,
             val,
+            self.mapper,
             self.sram,
             &mut **self.work_ram,
             self.port1,
@@ -3555,6 +3678,12 @@ impl Bus for CoreBus<'_> {
         // control bit in its low byte (0xA130F1). Handle before the region match.
         if addr == SSF_SRAM_ENABLE_ADDR & !1 || addr == SSF_SRAM_ENABLE_ADDR {
             self.sram.enabled = (val as u8) & 0x01 != 0;
+            return;
+        }
+        // SSF2 bank-select word write: a word to the even base 0xA130F2/F4/...
+        // (or the odd register itself) carries the bank index in its low byte,
+        // targeting the odd register. Handle before the region match.
+        if self.mapper.write_bank_register(addr | 1, val as u8) {
             return;
         }
         match bus::map_region(addr) {
@@ -3655,6 +3784,7 @@ impl Bus for CoreBus<'_> {
 struct Z80Bus<'a> {
     z80_ram: &'a mut Box<[u8; 0x2000]>,
     rom: &'a [u8],
+    mapper: &'a mut Mapper,
     sram: &'a mut CartSram,
     // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
     work_ram: &'a mut Box<[u8; 0x10000]>,
@@ -3718,6 +3848,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 read_68k_byte(
                     bus_addr,
                     self.rom,
+                    self.mapper,
                     self.sram,
                     &**self.work_ram,
                     self.vdp,
@@ -3763,6 +3894,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                 write_68k_byte(
                     bus_addr,
                     val,
+                    self.mapper,
                     self.sram,
                     &mut **self.work_ram,
                     self.port1,
@@ -3806,6 +3938,7 @@ mod tests {
         let scanline = core.vdp.scanline();
         CoreBus {
             rom: &core.rom,
+            mapper: &mut core.mapper,
             sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &mut core.vdp,
@@ -3834,6 +3967,7 @@ mod tests {
         Z80Bus {
             z80_ram: &mut core.z80_ram,
             rom: &core.rom,
+            mapper: &mut core.mapper,
             sram: &mut core.sram,
             work_ram: &mut core.work_ram,
             vdp: &core.vdp,
@@ -5557,5 +5691,180 @@ mod tests {
             core.vdp.dma_busy_cpu_cycles() < cycles_charged,
             "advance_dma_busy must decrement the countdown as the stall consumes cycles"
         );
+    }
+
+    // ---- SSF2 (Sega) >4MB bank mapper ----
+
+    /// Builds a synthetic ROM of `banks` physical 512KB banks, where every byte
+    /// of bank K equals K. Reading any address therefore reveals which physical
+    /// bank the mapper resolved it to.
+    fn ssf2_marker_rom(banks: usize) -> Vec<u8> {
+        let mut rom = vec![0u8; banks * SSF2_BANK_SIZE];
+        for b in 0..banks {
+            let start = b * SSF2_BANK_SIZE;
+            rom[start..start + SSF2_BANK_SIZE].fill(b as u8);
+        }
+        rom
+    }
+
+    #[test]
+    fn mapper_for_rom_selects_by_size() {
+        assert_eq!(Mapper::for_rom(1024), Mapper::Flat);
+        assert_eq!(Mapper::for_rom(0x40_0000), Mapper::Flat); // exactly 4MB
+        assert_eq!(
+            Mapper::for_rom(0x40_0001),
+            Mapper::Ssf2 {
+                banks: [0, 1, 2, 3, 4, 5, 6, 7]
+            }
+        );
+        assert_eq!(
+            Mapper::for_rom(0x80_0000), // 8MB
+            Mapper::Ssf2 {
+                banks: [0, 1, 2, 3, 4, 5, 6, 7]
+            }
+        );
+    }
+
+    #[test]
+    fn mapper_ssf2_rom_offset_identity_and_switch() {
+        let mut m = Mapper::Ssf2 {
+            banks: [0, 1, 2, 3, 4, 5, 6, 7],
+        };
+        // Default banks map address 1:1 to offset.
+        assert_eq!(m.rom_offset(0x00_0000), 0);
+        assert_eq!(m.rom_offset(0x08_00AB), 0x08_00AB);
+        assert_eq!(m.rom_offset(0x38_0000), 0x38_0000);
+        // Switch window 1 (0x080000-0x0FFFFF) to physical bank N.
+        assert!(m.write_bank_register(0xA1_30F3, 5));
+        assert_eq!(m.rom_offset(0x08_0000), 5 * SSF2_BANK_SIZE);
+        assert_eq!(m.rom_offset(0x08_00AB), 5 * SSF2_BANK_SIZE + 0xAB);
+        // Window 0 stays fixed to bank 0 regardless.
+        assert_eq!(m.rom_offset(0x00_0010), 0x10);
+    }
+
+    #[test]
+    fn mapper_bank_register_address_decoding() {
+        let mut m = Mapper::Ssf2 {
+            banks: [0, 1, 2, 3, 4, 5, 6, 7],
+        };
+        // 0xA130F1 is the SRAM-enable register, NOT a bank register.
+        assert!(!m.write_bank_register(0xA1_30F1, 3));
+        assert_eq!(
+            m,
+            Mapper::Ssf2 {
+                banks: [0, 1, 2, 3, 4, 5, 6, 7]
+            }
+        );
+        // Even addresses in the block are not bank registers either.
+        assert!(!m.write_bank_register(0xA1_30F4, 3));
+        // The seven odd registers 0xA130F3..0xA130FF steer windows 1..=7.
+        let regs = [
+            0xA1_30F3u32,
+            0xA1_30F5,
+            0xA1_30F7,
+            0xA1_30F9,
+            0xA1_30FB,
+            0xA1_30FD,
+            0xA1_30FF,
+        ];
+        for (i, &addr) in regs.iter().enumerate() {
+            assert!(m.write_bank_register(addr, 0x20 + i as u8));
+        }
+        if let Mapper::Ssf2 { banks } = m {
+            assert_eq!(banks, [0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26]);
+        } else {
+            panic!("expected Ssf2");
+        }
+        // Just past the last register is out of range.
+        assert!(!m.write_bank_register(0xA1_3101, 3));
+    }
+
+    #[test]
+    fn mapper_ssf2_bank_switch_read_through() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(ssf2_marker_rom(10))); // 5MB, banks 0..9
+        assert!(matches!(core.mapper, Mapper::Ssf2 { .. }));
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        // Default (identity) mapping: each window reads its like-numbered bank.
+        assert_eq!(bus.read_byte(0x00_0000), 0); // window 0 -> bank 0
+        assert_eq!(bus.read_byte(0x08_0000), 1); // window 1 -> bank 1
+        assert_eq!(bus.read_byte(0x10_0000), 2); // window 2 -> bank 2
+        // Switch window 1 to physical bank 7 via the 68k write path.
+        bus.write_byte(0xA1_30F3, 7);
+        assert_eq!(bus.read_byte(0x08_0000), 7);
+        assert_eq!(bus.read_byte(0x0F_FFFF), 7); // still within window 1
+        // Window 0 is always fixed to bank 0, regardless of switches.
+        assert_eq!(bus.read_byte(0x00_0000), 0);
+        // Other windows are unaffected by the window-1 switch.
+        assert_eq!(bus.read_byte(0x10_0000), 2);
+    }
+
+    #[test]
+    fn mapper_ssf2_upper_banks_reachable() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(ssf2_marker_rom(10))); // banks 0..9
+        // Window 7 near the top of the 4MB window resolves to bank 7's region,
+        // i.e. ROM offset >= 0x380000 -- NOT masked down below 4MB.
+        assert_eq!(core.mapper.rom_offset(0x38_0000), 0x38_0000);
+        assert_eq!(core.mapper.rom_offset(0x3F_FFFF), 0x3F_FFFF);
+        let mut bus = core_bus_with_master_tick(&mut core, 0);
+        assert_eq!(bus.read_byte(0x38_0000), 7);
+        assert_eq!(bus.read_byte(0x3F_FFFF), 7);
+    }
+
+    #[test]
+    fn mapper_snapshot_round_trip() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(ssf2_marker_rom(10)));
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xA1_30F3, 9); // window 1 -> bank 9
+            assert_eq!(bus.read_byte(0x08_0000), 9);
+        }
+        let snap = core.snapshot();
+        // Restore into a fresh core (ROM is not serialized, so reload it).
+        let mut core2 = GenesisCore::new();
+        core2.execute(Command::LoadRom(ssf2_marker_rom(10)));
+        core2.restore(&snap);
+        assert_eq!(
+            core2.mapper,
+            Mapper::Ssf2 {
+                banks: [0, 9, 2, 3, 4, 5, 6, 7]
+            }
+        );
+        let mut bus = core_bus_with_master_tick(&mut core2, 0);
+        assert_eq!(bus.read_byte(0x08_0000), 9); // switched bank survived snapshot
+    }
+
+    #[test]
+    fn mapper_snapshot_default_for_old_saves() {
+        // A snapshot deserialized without the `mapper` field must default to Flat
+        // (serde default), so pre-mapper save states still load.
+        let core = GenesisCore::new();
+        let snap = core.snapshot();
+        let mut json = serde_json::to_value(&snap).unwrap();
+        json.as_object_mut().unwrap().remove("mapper");
+        let restored: GenesisCoreSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.mapper, Mapper::Flat);
+    }
+
+    #[test]
+    fn mapper_flat_rom_ignores_bank_writes() {
+        use crate::cpu::execute::Bus as _;
+        let mut core = GenesisCore::new();
+        // A small (<=4MB) ROM stays flat.
+        core.execute(Command::LoadRom(rom_with_sram(0x00, 0x20_0000, 0x20_FFFF)));
+        assert_eq!(core.mapper, Mapper::Flat);
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xA1_30F3, 7); // no-op on a flat mapper
+        }
+        assert_eq!(core.mapper, Mapper::Flat); // unchanged
+        // Flat mapping masks addresses down to the 4MB window (identity below it).
+        assert_eq!(core.mapper.rom_offset(0x00_00AB), 0xAB);
+        assert_eq!(core.mapper.rom_offset(0x48_0000), 0x08_0000);
     }
 }
