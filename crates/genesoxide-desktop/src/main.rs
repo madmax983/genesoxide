@@ -425,10 +425,8 @@ impl ApplicationHandler for App {
                 // up to the surface for us.
                 if let Some(pixels) = &mut self.pixels {
                     let dims = self.core.framebuffer_dimensions();
-                    if dims != self.last_dims {
-                        if pixels.resize_buffer(dims.0, dims.1).is_ok() {
-                            self.last_dims = dims;
-                        }
+                    if dims != self.last_dims && pixels.resize_buffer(dims.0, dims.1).is_ok() {
+                        self.last_dims = dims;
                     }
                     let fb = self.core.framebuffer_rgba();
                     pixels.frame_mut().copy_from_slice(fb);

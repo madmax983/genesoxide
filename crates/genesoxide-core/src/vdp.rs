@@ -1022,7 +1022,7 @@ impl Vdp {
         let mut sh_op = [0u8; 320];
 
         // Step 1: Background fill
-        for pixel in pixel_color.iter_mut().take(width as usize) {
+        for pixel in pixel_color.iter_mut().take(stride) {
             *pixel = bg_color;
         }
 
