@@ -211,6 +211,7 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         srm_path,
         frames_since_flush: 0,
         gilrs,
+        last_dims: (FRAME_WIDTH as u32, FRAME_HEIGHT as u32),
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
@@ -239,6 +240,10 @@ struct App {
     frames_since_flush: u32,
     /// Gamepad input context (`None` when unavailable).
     gilrs: Option<Gilrs>,
+    /// Last framebuffer dimensions the Pixels buffer was sized to. Used to
+    /// detect an H32<->H40 mode switch at a frame boundary and resize the
+    /// Pixels texture buffer to match the core's native-width framebuffer.
+    last_dims: (u32, u32),
 }
 
 /// Maps a gilrs gamepad button to a Genesis controller button.
@@ -412,8 +417,17 @@ impl ApplicationHandler for App {
                     self.core.clear_audio_buffer();
                 }
 
-                // Copy framebuffer to pixel surface
+                // Copy framebuffer to pixel surface. The core framebuffer is
+                // native-width (256px in H32, 320px in H40), so on a mode switch
+                // — applied at this frame boundary — resize the Pixels texture
+                // buffer to match before copying. The window/surface physical
+                // size is left unchanged; Pixels scales the narrower H32 buffer
+                // up to the surface for us.
                 if let Some(pixels) = &mut self.pixels {
+                    let dims = self.core.framebuffer_dimensions();
+                    if dims != self.last_dims && pixels.resize_buffer(dims.0, dims.1).is_ok() {
+                        self.last_dims = dims;
+                    }
                     let fb = self.core.framebuffer_rgba();
                     pixels.frame_mut().copy_from_slice(fb);
                     let _ = pixels.render();

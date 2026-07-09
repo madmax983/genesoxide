@@ -17,11 +17,20 @@ use crate::ym2612;
 use crate::z80;
 use serde::{Deserialize, Serialize};
 
-/// Genesis visible frame width in pixels (H40 mode).
+/// Genesis visible frame width in pixels — the H40 maximum/default.
+///
+/// This is the widest mode (H40 = 320px) and is used for the physical
+/// framebuffer allocation and initial window sizing. The RUNTIME display width
+/// can be narrower (H32 = 256px); query it via
+/// [`CoreQuery::FramebufferDimensions`] / [`GenesisCore::framebuffer_dimensions`].
 pub const FRAME_WIDTH: usize = 320;
-/// Genesis visible frame height in pixels (NTSC).
+/// Genesis visible frame height in pixels (NTSC). Constant across H32/H40.
 pub const FRAME_HEIGHT: usize = 224;
-/// Framebuffer byte count for RGBA8 format.
+/// Framebuffer byte count for RGBA8 format at the H40 maximum (320x224x4).
+///
+/// This is the size of the physical backing buffer. The slice returned by
+/// [`GenesisCore::framebuffer_rgba`] is this length in H40 but shorter (256x224x4)
+/// in H32 — do not assume a fixed length; use the dimension query.
 pub const FRAME_RGBA_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
 /// NTSC frame rate in millihertz (59.92 Hz * 1000).
 pub const FPS_MILLI: u32 = 59_920;
@@ -1050,6 +1059,9 @@ pub enum CoreQuery {
     FrameCounter,
     /// Rewind buffer status (frames available, memory used, window bounds).
     RewindStatus,
+    /// Current framebuffer dimensions `(width, height)` in pixels. Width tracks
+    /// the horizontal mode (320 in H40, 256 in H32); height is always 224.
+    FramebufferDimensions,
 }
 
 /// A complete, serializable snapshot of the deterministic emulation state.
@@ -1947,9 +1959,23 @@ impl GenesisCore {
     }
 
     /// Returns a reference to the RGBA framebuffer.
+    ///
+    /// The slice is the native display width for the current mode: 320x224 in
+    /// H40, 256x224 in H32 (packed with a row stride equal to the active width).
+    /// Frontends should query [`GenesisCore::framebuffer_dimensions`] to learn
+    /// the current dimensions rather than assuming a fixed width.
     #[must_use]
     pub fn framebuffer_rgba(&self) -> &[u8] {
         self.vdp.framebuffer()
+    }
+
+    /// Returns the current framebuffer dimensions `(width, height)` in pixels.
+    ///
+    /// Width follows the VDP horizontal mode (320 in H40, 256 in H32); height
+    /// is always 224 (NTSC). Answers [`CoreQuery::FramebufferDimensions`].
+    #[must_use]
+    pub fn framebuffer_dimensions(&self) -> (u32, u32) {
+        (u32::from(self.vdp.display_width()), FRAME_HEIGHT as u32)
     }
 
     /// Returns the frame counter.

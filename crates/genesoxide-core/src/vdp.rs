@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::FRAME_RGBA_BYTES;
+use crate::api::{FRAME_HEIGHT, FRAME_RGBA_BYTES, FRAME_WIDTH};
 
 /// VRAM size in bytes.
 pub const VRAM_SIZE: usize = 0x10000; // 64KB
@@ -90,9 +90,19 @@ pub struct VdpSnapshot {
 }
 
 /// Maximum sprites evaluated per frame (H40 mode).
-const MAX_SPRITES_TOTAL: usize = 80;
+const MAX_SPRITES_TOTAL_H40: usize = 80;
 /// Maximum sprites per scanline in H40 mode.
-const MAX_SPRITES_PER_LINE: usize = 20;
+const MAX_SPRITES_PER_LINE_H40: usize = 20;
+/// Maximum sprites evaluated per frame (H32 mode).
+const MAX_SPRITES_TOTAL_H32: usize = 64;
+/// Maximum sprites per scanline in H32 mode.
+const MAX_SPRITES_PER_LINE_H32: usize = 16;
+
+// VDP register 0x0C (mode register 4) horizontal resolution select bits.
+/// RS0 (bit 0) — horizontal resolution select, low bit.
+const RS0: u8 = 0x01;
+/// RS1 (bit 7) — horizontal resolution select, high bit.
+const RS1: u8 = 0x80;
 
 /// The VDP.
 pub struct Vdp {
@@ -116,8 +126,20 @@ pub struct Vdp {
     scanline: u16,
     /// Current dot within scanline.
     dot: u16,
-    /// RGBA framebuffer.
+    /// RGBA framebuffer. Physically sized to the H40 maximum (320x224); in H32
+    /// mode only a 256-wide packed prefix is used and returned.
     framebuffer: Box<[u8; FRAME_RGBA_BYTES]>,
+    /// Active display width (in pixels) latched for the current frame.
+    ///
+    /// Horizontal mode can change mid-frame if a game writes reg 0x0C between
+    /// scanlines, but a single frame must use ONE consistent stride to stay
+    /// coherent. This is captured once at the start of each frame (scanline 0 of
+    /// `render_scanline`) and used as both the writeback stride and the returned
+    /// framebuffer length for that whole frame; a mode change only takes effect
+    /// at the next frame boundary. This is a per-frame derived cache recomputed
+    /// every frame (and from the registers on `restore`), NOT persistent state,
+    /// so it is intentionally excluded from `VdpSnapshot`.
+    frame_width: u16,
     /// V-blank flag.
     in_vblank: bool,
     /// H-blank flag.
@@ -171,6 +193,7 @@ impl Vdp {
             scanline: 0,
             dot: 0,
             framebuffer: Box::new([0; FRAME_RGBA_BYTES]),
+            frame_width: FRAME_WIDTH as u16,
             in_vblank: false,
             in_hblank: false,
             dma_pending: false,
@@ -184,10 +207,33 @@ impl Vdp {
         }
     }
 
-    /// Returns a reference to the RGBA framebuffer.
+    /// Returns the length in bytes of the active (native-width) framebuffer for
+    /// the current frame: `frame_width * FRAME_HEIGHT * 4`. In H40 this is the
+    /// full 320-wide buffer; in H32 it is the 256-wide packed prefix.
     #[must_use]
-    pub fn framebuffer(&self) -> &[u8; FRAME_RGBA_BYTES] {
-        &self.framebuffer
+    fn framebuffer_len(&self) -> usize {
+        self.frame_width as usize * FRAME_HEIGHT * 4
+    }
+
+    /// Returns a reference to the RGBA framebuffer for the current frame.
+    ///
+    /// The slice is the native display width: 320x224 in H40, 256x224 in H32
+    /// (packed with a row stride equal to the active width, not 320).
+    #[must_use]
+    pub fn framebuffer(&self) -> &[u8] {
+        &self.framebuffer[..self.framebuffer_len()]
+    }
+
+    /// Returns the width (in pixels) of the framebuffer returned by
+    /// [`Vdp::framebuffer`] for the current frame.
+    ///
+    /// This is the latched per-frame width (320 in H40, 256 in H32), which
+    /// matches the packed stride of the framebuffer slice. A mid-frame reg 0x0C
+    /// write does not change it until the next frame boundary — so this is the
+    /// value a frontend must size its output buffer to.
+    #[must_use]
+    pub fn display_width(&self) -> u16 {
+        self.frame_width
     }
 
     /// Returns the current scanline.
@@ -505,10 +551,17 @@ impl Vdp {
         self.vint_pending = false;
     }
 
-    /// CPU cycles the CPU is stalled per scanline of active display (H40).
+    /// CPU cycles the CPU is stalled per scanline of active display.
     ///
-    /// One NTSC H40 scanline is 3420 master clocks; at 1 CPU cycle ≈ 7 master
+    /// One NTSC scanline is 3420 master clocks; at 1 CPU cycle ≈ 7 master
     /// clocks that is ≈ 488 CPU cycles, matching the core's per-scanline budget.
+    ///
+    /// This is identical for H32 and H40: both consume 3420 master clocks per
+    /// scanline (hence the same 488 CPU cycles/line). They differ only in the
+    /// dot clock — H32 draws 256 dots at the slower EDCLK-derived pixel clock,
+    /// H40 draws 320 dots at the faster clock — and in the DMA byte-per-line
+    /// budget, which `dma_cost_cycles`'s `bytes_per_line` table accounts for
+    /// via its `(h40, blanking)` key.
     const CPU_CYCLES_PER_LINE: u32 = 488;
 
     /// Computes the CPU-cycle cost (and hence DMA-busy duration / CPU stall) of
@@ -531,7 +584,7 @@ impl Vdp {
         if length == 0 {
             return 0;
         }
-        let h40 = self.registers[0x0C] & 0x81 != 0;
+        let h40 = self.is_h40();
         let blanking = self.in_vblank || (self.registers[1] & 0x40 == 0);
         // Bytes movable per scanline, per the Software Manual DMA timing table.
         let bytes_per_line: u32 = match (h40, blanking) {
@@ -679,15 +732,27 @@ impl Vdp {
 
     // ---- Rendering ----
 
+    /// Returns true when the VDP is in H40 (40-cell / 320-pixel) horizontal
+    /// mode. This is the single source of truth for horizontal resolution.
+    ///
+    /// H40 requires BOTH RS0 (reg 0x0C bit 0) and RS1 (bit 7) to be set;
+    /// every other bit combination selects H32 (32-cell / 256-pixel) mode.
+    /// Real software uses 0x81 for H40 and 0x00 for H32, so the "both bits"
+    /// rule matches hardware while rejecting the ambiguous single-bit cases.
+    ///
+    /// Vertical timing (NTSC vs PAL line count) is owned separately; this
+    /// helper is strictly about horizontal width.
+    #[inline]
+    #[must_use]
+    fn is_h40(&self) -> bool {
+        (self.registers[0x0C] & (RS0 | RS1)) == (RS0 | RS1)
+    }
+
     /// Returns the horizontal screen width based on the current mode.
     /// H40 = 320 pixels, H32 = 256 pixels.
     #[must_use]
     fn screen_width(&self) -> u16 {
-        if self.registers[0x0C] & 0x81 != 0 {
-            320
-        } else {
-            256
-        }
+        if self.is_h40() { 320 } else { 256 }
     }
 
     /// Returns true if the display is enabled (register 1, bit 6).
@@ -779,11 +844,7 @@ impl Vdp {
     /// H40 mode = 64 cells wide, H32 mode = 32 cells wide.
     #[must_use]
     fn window_nametable_width(&self) -> u16 {
-        if self.registers[0x0C] & 0x81 != 0 {
-            64
-        } else {
-            32
-        }
+        if self.is_h40() { 64 } else { 32 }
     }
 
     /// Returns the H-scroll data table base address.
@@ -913,14 +974,21 @@ impl Vdp {
     /// 4. Render sprites
     /// 5. Handle priority: high-priority tiles/sprites draw over low-priority
     pub fn render_scanline(&mut self, line: u16) {
-        let width = self.screen_width();
+        // Latch the active display width once at the start of the frame so the
+        // whole frame uses one consistent stride even if reg 0x0C is written
+        // mid-frame; a mode change only takes effect at the next frame boundary.
+        if line == 0 {
+            self.frame_width = self.screen_width();
+        }
+        let width = self.frame_width;
+        let stride = width as usize;
         if line >= 224 || !self.display_enabled() {
-            // During V-blank or if display disabled, fill with background
+            // During V-blank or if display disabled, fill with background.
             let bg = self.background_color();
             let y = line as usize;
             if y < 224 {
-                for x in 0..320usize {
-                    let offset = (y * 320 + x) * 4;
+                for x in 0..stride {
+                    let offset = (y * stride + x) * 4;
                     self.framebuffer[offset..offset + 4].copy_from_slice(&bg);
                 }
             }
@@ -954,7 +1022,7 @@ impl Vdp {
         let mut sh_op = [0u8; 320];
 
         // Step 1: Background fill
-        for pixel in pixel_color.iter_mut().take(width as usize) {
+        for pixel in pixel_color.iter_mut().take(stride) {
             *pixel = bg_color;
         }
 
@@ -1061,7 +1129,7 @@ impl Vdp {
         if sh {
             // Shadow/highlight: derive per-pixel base intensity from the winning
             // pixel's priority, fold in any operator-sprite modifier, then apply.
-            for (x, color) in pixel_color.iter().enumerate() {
+            for (x, color) in pixel_color.iter().take(stride).enumerate() {
                 // Base: high-priority winners are Normal, everything else Shadow.
                 let base: u8 = if pixel_priority[x] == 2 { 1 } else { 0 };
                 let intensity = match (base, sh_op[x]) {
@@ -1075,12 +1143,12 @@ impl Vdp {
                     _ => base,
                 };
                 let out = Self::apply_intensity(*color, intensity);
-                let offset = (y * 320 + x) * 4;
+                let offset = (y * stride + x) * 4;
                 self.framebuffer[offset..offset + 4].copy_from_slice(&out);
             }
         } else {
-            for (x, color) in pixel_color.iter().enumerate() {
-                let offset = (y * 320 + x) * 4;
+            for (x, color) in pixel_color.iter().take(stride).enumerate() {
+                let offset = (y * stride + x) * 4;
                 self.framebuffer[offset..offset + 4].copy_from_slice(color);
             }
         }
@@ -1100,6 +1168,15 @@ impl Vdp {
     ) {
         let sat_base = self.sprite_table_addr();
         let mut sprites_on_line: usize = 0;
+        // Per-mode sprite limits: H40 evaluates 80 sprites/frame and 20/line,
+        // H32 evaluates 64/frame and 16/line. (The 256-px/line horizontal extent
+        // is already enforced by the `screen_x >= width` clip below; a separate
+        // per-line sprite-dot budget is future work.)
+        let (max_total, max_per_line) = if self.is_h40() {
+            (MAX_SPRITES_TOTAL_H40, MAX_SPRITES_PER_LINE_H40)
+        } else {
+            (MAX_SPRITES_TOTAL_H32, MAX_SPRITES_PER_LINE_H32)
+        };
         // Track which pixels already have a sprite — earlier sprites in the
         // link list have higher visual priority and should not be overwritten
         // by later sprites at the same priority level.
@@ -1110,7 +1187,7 @@ impl Vdp {
         let mut sprites_visited: usize = 0;
 
         loop {
-            if sprites_visited >= MAX_SPRITES_TOTAL {
+            if sprites_visited >= max_total {
                 break;
             }
             sprites_visited += 1;
@@ -1130,7 +1207,7 @@ impl Vdp {
 
             // Check if this sprite intersects the current scanline
             if line >= sprite_y && line < sprite_y.wrapping_add(sprite_height) {
-                if sprites_on_line >= MAX_SPRITES_PER_LINE {
+                if sprites_on_line >= max_per_line {
                     break; // Max sprites per line reached
                 }
 
@@ -1269,6 +1346,10 @@ impl Vdp {
         self.odd_frame = snap.odd_frame;
         self.vint_pending = snap.vint_pending;
         self.dma_busy_cpu_cycles = snap.dma_busy_cpu_cycles;
+        // frame_width is a derived per-frame cache (not serialized). Recompute
+        // it from the restored registers so the returned framebuffer length is
+        // coherent even before the next frame renders.
+        self.frame_width = self.screen_width();
     }
 }
 
