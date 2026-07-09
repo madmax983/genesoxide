@@ -448,14 +448,13 @@ impl Vdp {
                         // not applied yet), so snapshot the baseline BEFORE
                         // mutating, then record the change at its dot.
                         if let Some(x) = self.record_dot(dot) {
-                            self.capture_line_baseline();
-                            self.line_events.push(LineEvent {
-                                dot: x,
-                                change: LineChange::Register {
+                            self.record_change(
+                                x,
+                                LineChange::Register {
                                     reg: reg as u8,
                                     value: data,
                                 },
-                            });
+                            );
                         }
                         self.registers[reg] = data;
                         if reg == 0x0F {
@@ -538,11 +537,7 @@ impl Vdp {
                 if let Some(x) = record
                     && let Some(plane) = self.hscroll_slot_plane(self.scanline, self.address)
                 {
-                    self.capture_line_baseline();
-                    self.line_events.push(LineEvent {
-                        dot: x,
-                        change: LineChange::Hscroll { plane, value },
-                    });
+                    self.record_change(x, LineChange::Hscroll { plane, value });
                 }
                 if addr < VRAM_SIZE - 1 {
                     self.vram[addr] = (value >> 8) as u8;
@@ -554,14 +549,13 @@ impl Vdp {
                 let masked = value & 0x0EEE; // 9-bit: 0BBB0GGG0RRR
                 if index < CRAM_ENTRIES {
                     if let Some(x) = record {
-                        self.capture_line_baseline();
-                        self.line_events.push(LineEvent {
-                            dot: x,
-                            change: LineChange::Cram {
+                        self.record_change(
+                            x,
+                            LineChange::Cram {
                                 index: (index & 0x3F) as u8,
                                 value: masked,
                             },
-                        });
+                        );
                     }
                     self.cram[index] = masked;
                 }
@@ -571,14 +565,13 @@ impl Vdp {
                 let masked = value & 0x07FF; // 11-bit scroll value
                 if index < VSRAM_ENTRIES {
                     if let Some(x) = record {
-                        self.capture_line_baseline();
-                        self.line_events.push(LineEvent {
-                            dot: x,
-                            change: LineChange::Vsram {
+                        self.record_change(
+                            x,
+                            LineChange::Vsram {
                                 index: index as u8,
                                 value: masked,
                             },
-                        });
+                        );
                     }
                     self.vsram[index] = masked;
                 }
@@ -605,6 +598,15 @@ impl Vdp {
         } else {
             None
         }
+    }
+
+    /// Records a mid-line change at beam dot `x`: captures the start-of-line
+    /// baseline (once per line) and appends the event. Must be called BEFORE the
+    /// triggering write mutates the live state, so the lazy baseline snapshots the
+    /// true start-of-line values (see [`Vdp::capture_line_baseline`]).
+    fn record_change(&mut self, x: u16, change: LineChange) {
+        self.capture_line_baseline();
+        self.line_events.push(LineEvent { dot: x, change });
     }
 
     /// Captures the start-of-line baseline on the first recorded event of a line.
