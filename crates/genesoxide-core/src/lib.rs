@@ -11,6 +11,7 @@ pub mod psg;
 pub mod rewind;
 pub mod rom;
 pub mod scheduler;
+pub mod timing;
 pub mod vdp;
 pub mod ym2612;
 pub mod z80;

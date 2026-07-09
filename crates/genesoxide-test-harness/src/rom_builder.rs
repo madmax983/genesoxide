@@ -73,7 +73,18 @@ pub struct RomBuilder {
     /// Recorded instruction words (already encoded, big-endian order preserved
     /// as native `u16`s; serialized big-endian in `finish`).
     code: Vec<u16>,
+    /// Optional interrupt handler code blocks. Each entry is `(vector_addr,
+    /// handler_words)`: the handler is appended after the main code and the
+    /// 68000 auto-vector at `vector_addr` (e.g. `0x70` for level-4 HINT,
+    /// `0x78` for level-6 VINT) is patched to point at it. Empty by default, so
+    /// ROMs that use no interrupts are byte-for-byte unchanged.
+    handlers: Vec<(u32, Vec<u16>)>,
 }
+
+/// 68000 auto-vector address for a level-4 (H-blank) interrupt: `0x60 + 4*4`.
+pub const HINT_VECTOR: u32 = 0x0000_0070;
+/// 68000 auto-vector address for a level-6 (V-blank) interrupt: `0x60 + 6*4`.
+pub const VINT_VECTOR: u32 = 0x0000_0078;
 
 impl Default for RomBuilder {
     fn default() -> Self {
@@ -85,7 +96,27 @@ impl RomBuilder {
     /// Creates an empty builder.
     #[must_use]
     pub fn new() -> Self {
-        Self { code: Vec::new() }
+        Self {
+            code: Vec::new(),
+            handlers: Vec::new(),
+        }
+    }
+
+    /// Emits raw, already-encoded big-endian instruction words into the main
+    /// code stream (executed after the port-loading prologue). Use this for
+    /// instructions the higher-level helpers don't cover, e.g. lowering the
+    /// interrupt mask with `move.w #0x2000, sr` (`[0x46FC, 0x2000]`).
+    pub fn emit(&mut self, words: &[u16]) -> &mut Self {
+        self.code.extend_from_slice(words);
+        self
+    }
+
+    /// Installs an interrupt handler: `handler_words` is appended after the
+    /// main code and the auto-vector at `vector_addr` is patched to point at
+    /// it. The handler must end with `rte` (`0x4E73`).
+    pub fn set_handler(&mut self, vector_addr: u32, handler_words: &[u16]) -> &mut Self {
+        self.handlers.push((vector_addr, handler_words.to_vec()));
+        self
     }
 
     /// `move.w #value, (a0)` — write a raw word to the VDP control port.
@@ -211,8 +242,18 @@ impl RomBuilder {
         // Infinite self-loop.
         words.push(0x60FE);
 
-        // Serialize code bytes (big-endian) starting at CODE_START.
+        // Append any interrupt handlers after the self-loop and remember each
+        // one's absolute 68000 address (ROM maps at 0x000000, so the handler's
+        // address equals its ROM byte offset). The vectors are patched below.
         let code_start = CODE_START as usize;
+        let mut handler_addrs: Vec<(u32, u32)> = Vec::new();
+        for (vector_addr, handler) in &self.handlers {
+            let handler_addr = (code_start + words.len() * 2) as u32;
+            handler_addrs.push((*vector_addr, handler_addr));
+            words.extend_from_slice(handler);
+        }
+
+        // Serialize code bytes (big-endian) starting at CODE_START.
         let mut rom = vec![0u8; code_start + words.len() * 2];
         for (i, w) in words.iter().enumerate() {
             let off = code_start + i * 2;
@@ -223,6 +264,11 @@ impl RomBuilder {
         // Reset vectors.
         write_be32(&mut rom, 0x0000, INITIAL_SP);
         write_be32(&mut rom, 0x0004, CODE_START);
+
+        // Interrupt auto-vectors (patched only when handlers were installed).
+        for (vector_addr, handler_addr) in handler_addrs {
+            write_be32(&mut rom, vector_addr as usize, handler_addr);
+        }
 
         // Pad up to at least 0x400, rounded to the next power of two.
         let min_len = 0x400usize.max(rom.len());

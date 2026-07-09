@@ -411,6 +411,30 @@ fn compare_state(cpu: &Cpu, bus: &TestBus, expected: &TestState) -> Vec<Mismatch
     mismatches
 }
 
+/// Returns true if `opcode` decodes to MULU / MULS / DIVU / DIVS.
+///
+/// Our 68000 core documents (see the Commit-2 timing comments in
+/// `cpu/execute.rs`) that the cycle counts for the multiply/divide family are
+/// *data-dependent approximations* rather than the exact per-operand MC68000UM
+/// timings. Asserting exact cycles for these opcodes against a real vector
+/// corpus would therefore be spuriously flaky, so they are excluded from the
+/// cycle assertion in [`run_test`] (all other instructions ARE asserted).
+///
+/// Detection is by opcode pattern (the 68000 has only word-size MUL/DIV):
+///   * DIVU = `1000 rrr 011 mmmrrr`  (line 0x8, bits 8-6 = 0b011)
+///   * DIVS = `1000 rrr 111 mmmrrr`  (line 0x8, bits 8-6 = 0b111)
+///   * MULU = `1100 rrr 011 mmmrrr`  (line 0xC, bits 8-6 = 0b011)
+///   * MULS = `1100 rrr 111 mmmrrr`  (line 0xC, bits 8-6 = 0b111)
+///
+/// The `0b011` / `0b111` sub-field disambiguates MUL/DIV from the other
+/// opcodes sharing lines 0x8 (SBCD/OR) and 0xC (ABCD/EXG/AND), which use
+/// different bit-8-6 values.
+fn is_mul_div_opcode(opcode: u16) -> bool {
+    let line = opcode >> 12;
+    let sub = (opcode >> 6) & 0b111;
+    (line == 0x8 || line == 0xC) && (sub == 0b011 || sub == 0b111)
+}
+
 /// Runs a single test case. Returns `None` on success, `Some(failure)` on mismatch.
 pub fn run_test(test: &TestCase) -> Option<TestFailure> {
     let mut cpu = Cpu::new();
@@ -423,11 +447,28 @@ pub fn run_test(test: &TestCase) -> Option<TestFailure> {
     // The opcode is prefetch[0]
     let opcode = test.initial.prefetch[0] as u16;
 
-    // Execute one instruction
-    let _cycles = execute_instruction(&mut cpu, opcode, &mut bus);
+    // Execute one instruction, capturing the cycle count our core reports.
+    let cycles = execute_instruction(&mut cpu, opcode, &mut bus);
 
     // Compare against expected
-    let mismatches = compare_state(&cpu, &bus, &test.expected);
+    let mut mismatches = compare_state(&cpu, &bus, &test.expected);
+
+    // Assert the reported cycle count matches the vector's expected count.
+    //
+    // NOTE: the m68000 vector corpus is downloaded-not-vendored (the
+    // `tests/m68000-tests/v1/` directory ships empty), so missing files are
+    // skipped and this assertion changes no CI pass count today. It makes the
+    // harness validate timing the moment the corpus is present.
+    //
+    // MULU/MULS/DIVU/DIVS are excluded because our core's cycle counts for them
+    // are documented data-dependent approximations (see `is_mul_div_opcode`).
+    if !is_mul_div_opcode(opcode) && cycles != test.cycles {
+        mismatches.push(Mismatch {
+            field: "cycles".into(),
+            expected: test.cycles,
+            actual: cycles,
+        });
+    }
 
     if mismatches.is_empty() {
         None

@@ -42,7 +42,7 @@
 //! golden can never encode output that violates the VDP rules.
 
 use genesoxide_core::Region;
-use genesoxide_test_harness::rom_builder::RomBuilder;
+use genesoxide_test_harness::rom_builder::{HINT_VECTOR, RomBuilder, VINT_VECTOR};
 use genesoxide_test_harness::{compare_framebuffers, run_rom_frames, run_rom_frames_region};
 
 const FRAME_W: usize = 320;
@@ -573,4 +573,187 @@ fn pal_v30_240_lines() {
     assert_eq!(px(300, 239), red, "last V30 line renders the plane");
 
     check_golden("pal_v30", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 7: HINT raster split — per-scanline backdrop color bands
+// ---------------------------------------------------------------------------
+//
+// This scene demonstrates a per-scanline raster split driven by the VDP's
+// H-interrupt (HINT). The 68000 program:
+//
+//   * enables H-interrupts (reg 0x00 bit 4) and sets the HINT counter
+//     (reg 0x0A) to 0 so a HINT fires on every active scanline;
+//   * enables V-interrupts (reg 0x01 bit 5) for the frame-start reset;
+//   * lowers the CPU interrupt mask so levels 4 (HINT) and 6 (VINT) are taken;
+//   * installs a HINT handler that, once per line, bumps a line counter in
+//     work RAM and rewrites the backdrop palette index (reg 0x07) to
+//     `line / 16`, selecting a different preloaded CRAM color every 16 lines;
+//   * installs a VINT handler that, once per frame, resets the line counter
+//     and the backdrop index to 0 so every frame reproduces the same bands.
+//
+// With no tiles or sprites drawn (all nametable entries are transparent tile
+// 0), the whole screen shows the backdrop, so the result is a stack of 14
+// solid horizontal color bands, each 16 scanlines tall.
+//
+// GRANULARITY NOTE: HINT delivery in this core is line-granular (documented in
+// the VDP HINT-delivery comment in `api.rs` / Commit 3 — the handler's register
+// writes land in the hblank *between* rendered lines, not mid-line). A true
+// MID-LINE split (two colors within a single scanline) is therefore NOT
+// representable at the current documented granularity and is deliberately out
+// of scope for this scene; the bands here are strictly per-scanline.
+
+/// Backdrop colors preloaded into CRAM entries 0..13. The HINT handler selects
+/// entry `scanline / 16`, so band `b` (lines `16b..16b+15`) shows `BAND_COLORS[b]`.
+const BAND_COLORS: [u16; 14] = [
+    0x0000, // 0  black
+    0x000E, // 1  red
+    0x00E0, // 2  green
+    0x0E00, // 3  blue
+    0x00EE, // 4  yellow
+    0x0E0E, // 5  magenta
+    0x0EE0, // 6  cyan
+    0x0EEE, // 7  white
+    0x0008, // 8  dim red
+    0x0080, // 9  dim green
+    0x0800, // 10 dim blue
+    0x0088, // 11 dim yellow
+    0x0808, // 12 dim magenta
+    0x0880, // 13 dim cyan
+];
+
+/// Height of each color band, in scanlines (= the HINT handler's `line / 16`).
+const BAND_HEIGHT: usize = 16;
+
+fn build_hint_raster_bands_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // reg 0x0C = H40 only (0x81 = RS0|RS1, S/H off), backdrop index 0 initially.
+    base_registers(&mut b, 0x81, 0x00);
+
+    // Preload the band palette (CRAM entries 0..13). No tiles or sprites are
+    // written, so every plane pixel is transparent and the backdrop fills the
+    // screen.
+    for (i, &color) in BAND_COLORS.iter().enumerate() {
+        b.set_cram_color(i as u16, color);
+    }
+
+    // HINT handler (auto-vector 0x70). Runs once per active scanline; a0 still
+    // holds the VDP control port (0xC00004) from the prologue and is never
+    // modified by the spinning main loop. The line counter lives in work RAM at
+    // short-absolute 0xF000 (sign-extends to 0xFFFFF000 -> masked to 0xFFF000).
+    //
+    //   addq.w #1, (0xF000).w   ; line counter++
+    //   move.w (0xF000).w, d0   ; d0 = counter
+    //   lsr.w  #4, d0           ; d0 = counter / 16  (band index)
+    //   andi.w #0x000F, d0      ; safety clamp to 0..15
+    //   ori.w  #0x8700, d0      ; VDP reg 0x07 (backdrop) write command
+    //   move.w d0, (a0)         ; set backdrop palette index for this line
+    //   rte
+    b.set_handler(
+        HINT_VECTOR,
+        &[
+            0x5278, 0xF000, // addq.w #1, (0xF000).w
+            0x3038, 0xF000, // move.w (0xF000).w, d0
+            0xE848, // lsr.w #4, d0
+            0x0240, 0x000F, // andi.w #0x000F, d0
+            0x0040, 0x8700, // ori.w #0x8700, d0
+            0x3080, // move.w d0, (a0)
+            0x4E73, // rte
+        ],
+    );
+
+    // VINT handler (auto-vector 0x78). Runs once per frame at the top of
+    // V-blank; resets the line counter and the backdrop index so each frame
+    // renders identical bands.
+    //
+    //   clr.w  (0xF000).w         ; line counter = 0
+    //   move.w #0x8700, (a0)      ; reg 0x07 = 0 (backdrop index 0)
+    //   rte
+    b.set_handler(
+        VINT_VECTOR,
+        &[
+            0x4278, 0xF000, // clr.w (0xF000).w
+            0x30BC, 0x8700, // move.w #0x8700, (a0)
+            0x4E73, // rte
+        ],
+    );
+
+    // Enable interrupts last, after all VRAM/CRAM setup is complete.
+    b.set_register(0x00, 0x14); // Mode 1: H-int enable (bit 4) + bit 2
+    b.set_register(0x0A, 0x00); // HINT counter = 0 -> fire every line
+    b.set_register(0x01, 0x60); // Mode 2: display on (bit 6) + V-int enable (bit 5)
+
+    // Lower the 68000 interrupt mask to 0 so levels 4 and 6 are delivered
+    // (supervisor mode is retained). move.w #0x2000, sr.
+    b.emit(&[0x46FC, 0x2000]);
+
+    b.finish()
+}
+
+#[test]
+fn hint_raster_bands() {
+    let rom = build_hint_raster_bands_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    // Expected backdrop color for scanline `y`.
+    //
+    // HINT delivery is line-granular: the handler for scanline L runs during
+    // L's hblank and its reg 0x07 write takes effect on the NEXT rendered line.
+    // The net result is a one-line lag — band 0 covers lines 0..=16 (line 0 has
+    // no HINT, then the first 16 HINTs still select index 0), and band `b`
+    // (b >= 1) covers lines `16b+1..=16b+16`. So the band index is
+    // `(y - 1) / 16` for y >= 1, and 0 at y = 0.
+    let band_of = |y: usize| if y == 0 { 0 } else { (y - 1) / BAND_HEIGHT };
+    let expected_at = |y: usize| normal_rgba(BAND_COLORS[band_of(y)]);
+
+    // Sanity on a couple of band colors.
+    assert_eq!(normal_rgba(0x0000), [0, 0, 0, 255]);
+    assert_eq!(normal_rgba(0x000E), [255, 0, 0, 255]);
+
+    // Every band renders its preloaded backdrop color across the full width.
+    // Sample two scanlines well inside each of the first several bands, at two
+    // x positions each, proving (a) the band color is correct and (b) pixels
+    // WITHIN a band (same scanline, different x) match.
+    for band in 0..8usize {
+        let y = band * BAND_HEIGHT + 8; // 8 lines into the band
+        let want = expected_at(y);
+        assert_eq!(
+            pixel(&fb, 10, y),
+            want,
+            "band {band} (y={y}) left edge is its backdrop color"
+        );
+        assert_eq!(
+            pixel(&fb, 310, y),
+            want,
+            "band {band} (y={y}) right edge matches left (within-band pixels match)"
+        );
+    }
+
+    // Adjacent bands must DIFFER: a pixel in the top band vs one a band lower.
+    assert_ne!(
+        pixel(&fb, 160, 8),
+        pixel(&fb, 160, 24),
+        "band 0 (y=8) and band 1 (y=24) are different colors"
+    );
+    // Two well-separated bands also differ.
+    assert_ne!(
+        pixel(&fb, 160, 40),
+        pixel(&fb, 160, 200),
+        "band 2 (y=40) and band 12 (y=200) are different colors"
+    );
+
+    // The band-0/band-1 boundary lands exactly at the 16-line HINT step (with
+    // the one-line delivery lag): the last line of band 0 (y=16) still shows
+    // band 0's color, the first line of band 1 (y=17) shows band 1's color.
+    assert_eq!(band_of(16), 0, "model: y=16 is band 0");
+    assert_eq!(band_of(17), 1, "model: y=17 is band 1");
+    assert_eq!(pixel(&fb, 160, 16), expected_at(16), "y=16 is still band 0");
+    assert_eq!(pixel(&fb, 160, 17), expected_at(17), "y=17 is band 1");
+    assert_ne!(
+        pixel(&fb, 160, 16),
+        pixel(&fb, 160, 17),
+        "the band boundary falls between y=16 and y=17"
+    );
+
+    check_golden("hint_raster_bands", &fb);
 }
