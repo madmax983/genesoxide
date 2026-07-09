@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use genesoxide_config::GenesisConfig;
 use genesoxide_core::{Command, FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_WIDTH, GenesisCore};
+use gilrs::{Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -162,10 +163,30 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         delta_spike_threshold: config.rewind.delta_spike_threshold,
     }));
 
+    // Select each port's pad type from config so the core decodes 6-button
+    // extras (X/Y/Z/Mode) only for ports configured for a 6-button pad.
+    core.execute(Command::SetPadType {
+        port: 0,
+        six_button: config.desktop.pad1_six_button,
+    });
+    core.execute(Command::SetPadType {
+        port: 1,
+        six_button: config.desktop.pad2_six_button,
+    });
+
     if let Some(header) = core.rom_header() {
         eprintln!("Loaded: {}", header.title_overseas);
         eprintln!("Region: {}", header.region);
     }
+
+    // Gamepad input via gilrs (optional — keyboard still works without one).
+    let gilrs = match Gilrs::new() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("Warning: gamepad support unavailable: {e}");
+            None
+        }
+    };
 
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -189,6 +210,7 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         paused: false,
         srm_path,
         frames_since_flush: 0,
+        gilrs,
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
@@ -215,6 +237,32 @@ struct App {
     srm_path: PathBuf,
     /// Frames elapsed since the last periodic SRAM flush.
     frames_since_flush: u32,
+    /// Gamepad input context (`None` when unavailable).
+    gilrs: Option<Gilrs>,
+}
+
+/// Maps a gilrs gamepad button to a Genesis controller button.
+///
+/// Face buttons South/East/West/North and the two shoulders map to the six
+/// Genesis face buttons A/B/C/X/Y/Z; Start→Start, Select→Mode, and the D-pad to
+/// directions. Returns `None` for buttons with no Genesis equivalent.
+fn pad_button_to_genesis(button: PadButton) -> Option<genesoxide_core::Button> {
+    use genesoxide_core::Button as G;
+    Some(match button {
+        PadButton::South => G::A,
+        PadButton::East => G::B,
+        PadButton::West => G::C,
+        PadButton::North => G::X,
+        PadButton::LeftTrigger | PadButton::LeftTrigger2 => G::Y,
+        PadButton::RightTrigger | PadButton::RightTrigger2 => G::Z,
+        PadButton::Start => G::Start,
+        PadButton::Select | PadButton::Mode => G::Mode,
+        PadButton::DPadUp => G::Up,
+        PadButton::DPadDown => G::Down,
+        PadButton::DPadLeft => G::Left,
+        PadButton::DPadRight => G::Right,
+        _ => return None,
+    })
 }
 
 impl ApplicationHandler for App {
@@ -275,6 +323,11 @@ impl ApplicationHandler for App {
                         KeyCode::KeyZ => Some(genesoxide_core::Button::A),
                         KeyCode::KeyX => Some(genesoxide_core::Button::B),
                         KeyCode::KeyC => Some(genesoxide_core::Button::C),
+                        // 6-button extras: A/S/D row above Z/X/C, Shift = Mode.
+                        KeyCode::KeyA => Some(genesoxide_core::Button::X),
+                        KeyCode::KeyS => Some(genesoxide_core::Button::Y),
+                        KeyCode::KeyD => Some(genesoxide_core::Button::Z),
+                        KeyCode::ShiftLeft => Some(genesoxide_core::Button::Mode),
                         KeyCode::Enter => Some(genesoxide_core::Button::Start),
                         KeyCode::Escape => {
                             flush_sram(&self.core, &self.srm_path);
@@ -373,6 +426,25 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drain gamepad events and feed them to controller port 0.
+        if let Some(gilrs) = &mut self.gilrs {
+            while let Some(event) = gilrs.next_event() {
+                let (button, pressed) = match event.event {
+                    EventType::ButtonPressed(b, _) => (b, true),
+                    EventType::ButtonReleased(b, _) => (b, false),
+                    _ => continue,
+                };
+                if let Some(btn) = pad_button_to_genesis(button) {
+                    let cmd = if pressed {
+                        Command::PressButton { port: 0, button: btn }
+                    } else {
+                        Command::ReleaseButton { port: 0, button: btn }
+                    };
+                    self.core.execute(cmd);
+                }
+            }
+        }
+
         if let Some(last) = self.last_frame_time {
             let elapsed = last.elapsed();
             if elapsed < self.frame_duration {
