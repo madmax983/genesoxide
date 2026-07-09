@@ -91,6 +91,43 @@ fn main() -> Result<()> {
     }
 }
 
+/// How often (in frames) to flush dirty SRAM to disk during play, so a crash
+/// or forced kill does not lose recent progress. ~3 seconds at 60 Hz.
+const SRAM_FLUSH_INTERVAL: u32 = 180;
+
+/// Derives the `.srm` battery-save path for a ROM. When `saves_dir` is set the
+/// file lives there (named after the ROM stem); otherwise it sits next to the
+/// ROM with its extension replaced by `.srm`.
+fn srm_path_for(rom_path: &Path, saves_dir: Option<&str>) -> PathBuf {
+    match saves_dir {
+        Some(dir) => {
+            let stem = rom_path
+                .file_stem()
+                .map(std::ffi::OsString::from)
+                .unwrap_or_default();
+            let mut file = stem;
+            file.push(".srm");
+            Path::new(dir).join(file)
+        }
+        None => rom_path.with_extension("srm"),
+    }
+}
+
+/// Writes the core's SRAM to `srm_path` if it holds data worth persisting.
+fn flush_sram(core: &GenesisCore, srm_path: &Path) {
+    if !core.sram_worth_saving() {
+        return;
+    }
+    if let Some(parent) = srm_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    if let Err(e) = fs::write(srm_path, core.sram()) {
+        eprintln!("Warning: failed to write SRAM {}: {e}", srm_path.display());
+    }
+}
+
 fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
     let config = GenesisConfig::load(config_path).unwrap_or_default();
     let rom_path = config.resolve_rom(rom_name);
@@ -99,6 +136,22 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
 
     let mut core = GenesisCore::new();
     core.execute(Command::LoadRom(rom_data));
+
+    // Battery-save persistence: derive the `.srm` path and load any existing
+    // save into the cartridge SRAM before the game boots.
+    let srm_path = srm_path_for(&rom_path, config.desktop.saves_dir.as_deref());
+    if srm_path.exists() {
+        match fs::read(&srm_path) {
+            Ok(bytes) => {
+                core.load_sram(&bytes);
+                eprintln!("Loaded SRAM: {}", srm_path.display());
+            }
+            Err(e) => eprintln!(
+                "Warning: failed to read SRAM {}: {e}",
+                srm_path.display()
+            ),
+        }
+    }
 
     // Apply the configured rewind settings (mapping the config-crate struct to
     // the core struct).
@@ -134,9 +187,15 @@ fn cmd_run(rom_name: &str, scale: u32, config_path: &Path) -> Result<()> {
         frame_duration: Duration::from_nanos(FRAME_PERIOD_NS),
         rewind_held: false,
         paused: false,
+        srm_path,
+        frames_since_flush: 0,
     };
 
     event_loop.run_app(&mut app).context("Event loop error")?;
+
+    // Final save-on-exit flush (covers a clean event-loop return).
+    flush_sram(&app.core, &app.srm_path);
+    app.core.clear_sram_dirty();
     Ok(())
 }
 
@@ -152,6 +211,10 @@ struct App {
     rewind_held: bool,
     /// True when emulation is paused (P toggles).
     paused: bool,
+    /// Battery-save file path for this ROM.
+    srm_path: PathBuf,
+    /// Frames elapsed since the last periodic SRAM flush.
+    frames_since_flush: u32,
 }
 
 impl ApplicationHandler for App {
@@ -196,7 +259,11 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                flush_sram(&self.core, &self.srm_path);
+                self.core.clear_sram_dirty();
+                event_loop.exit();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     let pressed = event.state.is_pressed();
@@ -210,6 +277,8 @@ impl ApplicationHandler for App {
                         KeyCode::KeyC => Some(genesoxide_core::Button::C),
                         KeyCode::Enter => Some(genesoxide_core::Button::Start),
                         KeyCode::Escape => {
+                            flush_sram(&self.core, &self.srm_path);
+                            self.core.clear_sram_dirty();
                             event_loop.exit();
                             None
                         }
@@ -272,6 +341,15 @@ impl ApplicationHandler for App {
                     self.core.execute(Command::StepBack);
                 } else if !self.paused {
                     self.core.execute(Command::StepFrame);
+                }
+
+                // Periodically flush dirty battery SRAM so a crash does not
+                // discard recent saves.
+                self.frames_since_flush = self.frames_since_flush.saturating_add(1);
+                if self.frames_since_flush >= SRAM_FLUSH_INTERVAL && self.core.sram_is_dirty() {
+                    flush_sram(&self.core, &self.srm_path);
+                    self.core.clear_sram_dirty();
+                    self.frames_since_flush = 0;
                 }
 
                 // Push audio samples to output
