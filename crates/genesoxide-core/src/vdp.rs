@@ -725,8 +725,9 @@ impl Vdp {
         if self.in_vblank {
             status |= 0x0008;
         }
-        // Bit 4: Odd frame (toggles each frame)
-        if self.odd_frame {
+        // Bit 4: Odd frame flag. Hardware only reports the field flag while
+        // interlace is enabled; in non-interlaced modes this bit reads 0.
+        if self.interlace_enabled() && self.odd_frame {
             status |= 0x0010;
         }
         // Bit 2: H-blank
@@ -791,6 +792,16 @@ impl Vdp {
             } else {
                 (self.scanline.wrapping_sub(6)) as u8
             }
+        };
+
+        // Interlace V-counter behavior (Charles MacDonald, vdp.txt): in
+        // interlace mode 2 the external V counter is shifted left one bit with
+        // bit 0 replaced by the field flag, doubling the reported vertical
+        // count. Interlace mode 1 keeps the same resolution, so V is unchanged.
+        let v = if self.interlace_double() {
+            ((u16::from(v) << 1) | u16::from(self.odd_frame)) as u8
+        } else {
+            v
         };
 
         // H counter: real intra-line beam position with the documented mid-line
@@ -1121,6 +1132,33 @@ impl Vdp {
     #[must_use]
     fn is_h40(&self) -> bool {
         (self.registers[0x0C] & (RS0 | RS1)) == (RS0 | RS1)
+    }
+
+    /// Interlace mode select (LSM1:LSM0) from mode register 4 (reg 0x0C bits
+    /// 2:1). Values: 0b00 = no interlace, 0b01 = interlace mode 1 (same res),
+    /// 0b10 = prohibited (treated as no interlace), 0b11 = interlace mode 2
+    /// (double vertical resolution).
+    #[inline]
+    #[must_use]
+    fn lsm(&self) -> u8 {
+        (self.registers[0x0C] >> 1) & 0x03
+    }
+
+    /// Whether interlacing is active — LSM0 (reg 0x0C bit 1) set selects
+    /// interlace mode 1 or mode 2. The prohibited encoding 0b10 leaves LSM0
+    /// clear, so it correctly reads as non-interlaced.
+    #[inline]
+    #[must_use]
+    fn interlace_enabled(&self) -> bool {
+        self.lsm() & 0x01 != 0
+    }
+
+    /// Whether interlace mode 2 (double vertical resolution) is active — only
+    /// LSM1:LSM0 == 0b11 (both reg 0x0C bits 2 and 1 set).
+    #[inline]
+    #[must_use]
+    fn interlace_double(&self) -> bool {
+        self.lsm() == 0x03
     }
 
     /// Returns the horizontal screen width based on the current mode.
@@ -2732,6 +2770,9 @@ mod tests {
     #[test]
     fn status_register_odd_frame_toggles() {
         let mut vdp = Vdp::new();
+        // The field flag (status bit 4) is only reported while interlace is
+        // enabled, so select interlace mode 1 (reg 0x0C LSM0 = bit 1).
+        vdp.registers[0x0C] |= 0x02;
         let status1 = vdp.read_status();
         vdp.end_frame();
         let status2 = vdp.read_status();
