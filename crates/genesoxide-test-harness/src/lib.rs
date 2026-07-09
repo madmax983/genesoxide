@@ -7,6 +7,7 @@
 //! against MAME-generated test vectors.
 
 pub mod m68k_tests;
+pub mod rom_builder;
 pub mod vgm;
 pub mod ymfm_reference;
 pub mod z80_tests;
