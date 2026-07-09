@@ -54,10 +54,18 @@ const FRAMES: u64 = 4;
 /// Gray used for the S/H scene. CRAM 0x0888 -> Normal RGBA [146,146,146].
 const SH_GRAY: u16 = 0x0888;
 
-/// Returns the RGBA pixel at (x, y) in a 320x224 framebuffer.
+/// Returns the RGBA pixel at (x, y) in a 320x224 (H40) framebuffer.
 fn pixel(fb: &[u8], x: usize, y: usize) -> [u8; 4] {
     assert!(x < FRAME_W && y < FRAME_H, "pixel ({x},{y}) out of bounds");
     let o = (y * FRAME_W + x) * 4;
+    [fb[o], fb[o + 1], fb[o + 2], fb[o + 3]]
+}
+
+/// Returns the RGBA pixel at (x, y) in a framebuffer packed at the given native
+/// row `width` (256 for H32, 320 for H40).
+fn pixel_w(fb: &[u8], x: usize, y: usize, width: usize) -> [u8; 4] {
+    assert!(x < width && y < FRAME_H, "pixel ({x},{y}) out of bounds");
+    let o = (y * width + x) * 4;
     [fb[o], fb[o + 1], fb[o + 2], fb[o + 3]]
 }
 
@@ -105,9 +113,10 @@ fn check_golden(scene: &str, rendered: &[u8]) {
     assert_eq!(diff, 0, "scene `{scene}`: {diff} pixels differ from golden");
 }
 
-/// Common minimal register setup for a visible H40 frame. `reg0c` selects the
-/// mode-4 register (H40 bit0 = 0x01, plus S/H bit3 = 0x08 when desired). Does not
-/// enable the VBlank interrupt (no handler is present in these tiny ROMs).
+/// Common minimal register setup for a visible frame. `reg0c` selects the mode-4
+/// register: H40 (320px) needs BOTH RS0|RS1 (0x81), H32 (256px) uses 0x00; add
+/// S/H bit3 = 0x08 when desired. Does not enable the VBlank interrupt (no handler
+/// is present in these tiny ROMs).
 fn base_registers(b: &mut RomBuilder, reg0c: u8, backdrop_index: u8) {
     b.set_register(0x00, 0x04); // Mode 1: no H-int
     b.set_register(0x01, 0x40); // Mode 2: display on, no VInt, no DMA
@@ -118,7 +127,7 @@ fn base_registers(b: &mut RomBuilder, reg0c: u8, backdrop_index: u8) {
     b.set_register(0x07, backdrop_index); // Backdrop color index
     b.set_register(0x0A, 0xFF); // H-int counter (unused)
     b.set_register(0x0B, 0x00); // Scroll modes: full-screen
-    b.set_register(0x0C, reg0c); // Mode 4: H40 (+ optional S/H)
+    b.set_register(0x0C, reg0c); // Mode 4: horizontal mode (+ optional S/H)
     b.set_register(0x0D, 0x37); // H-scroll table = 0xDC00
     b.set_register(0x0F, 0x02); // Auto-increment = 2
     b.set_register(0x10, 0x00); // Scroll size 32x32
@@ -176,8 +185,8 @@ fn write_sprite(
 /// | 20-31 | 160-255 | (transp)  | backdrop -> Shadow         |
 fn build_shadow_highlight_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
-    // reg 0x0C = H40 (0x01) + S/H (0x08); backdrop = palette 0 color 15.
-    base_registers(&mut b, 0x09, 0x0F);
+    // reg 0x0C = H40 (0x81 = RS0|RS1) + S/H (0x08); backdrop = palette 0 color 15.
+    base_registers(&mut b, 0x89, 0x0F);
 
     // Palette entries: gray at index 1 and at backdrop index 15.
     b.set_cram_color(1, SH_GRAY);
@@ -283,8 +292,8 @@ fn shadow_highlight_operators() {
 
 fn build_window_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
-    // reg 0x0C = H40 only (S/H off). Backdrop black.
-    base_registers(&mut b, 0x01, 0x00);
+    // reg 0x0C = H40 only (0x81 = RS0|RS1, S/H off). Backdrop black.
+    base_registers(&mut b, 0x81, 0x00);
 
     // Colors: red (Scroll A) at index 1, green (window) at index 2.
     b.set_cram_color(1, 0x000E); // red
@@ -349,8 +358,8 @@ fn window_plane_positioning() {
 
 fn build_normal_lock_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
-    // reg 0x0C = H40 only (S/H off). Backdrop black.
-    base_registers(&mut b, 0x01, 0x00);
+    // reg 0x0C = H40 only (0x81 = RS0|RS1, S/H off). Backdrop black.
+    base_registers(&mut b, 0x81, 0x00);
 
     // Colors: blue plane at index 1, green sprite at index 2.
     b.set_cram_color(1, 0x0E00); // blue
@@ -395,4 +404,120 @@ fn normal_render_lock() {
     assert_eq!(pixel(&fb, 70, 80), blue, "just below sprite is blue");
 
     check_golden("normal_render_lock", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 4: H32 (256px) native-width framebuffer
+// ---------------------------------------------------------------------------
+
+/// H32 display width in pixels.
+const H32_W: usize = 256;
+
+fn build_h32_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // reg 0x0C = H32 (0x00: neither RS0 nor RS1). Backdrop black.
+    base_registers(&mut b, 0x00, 0x00);
+
+    // Colors: red plane at index 1, green sprites at index 2.
+    b.set_cram_color(1, 0x000E); // red
+    b.set_cram_color(2, 0x00E0); // green
+
+    b.write_solid_tile(1, 1); // red plane tile
+    // 16x16 green sprite: 2x2 tiles column-major (tiles 2..5).
+    for t in 2..=5 {
+        b.write_solid_tile(t, 2);
+    }
+
+    // Scroll A: solid red across every one of the 32 cells (= full 256px width),
+    // low priority, every row. This makes the ENTIRE 256-wide frame red, so the
+    // rightmost columns carry content — there is no 64px black bar and no
+    // 320-wide buffer.
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    // Two green sprites at y=64: one at the left (x=16) and one hard against the
+    // right edge (x=232 -> spans 232..247, inside 256). The right one exercises
+    // sprite compositing in the far-right region of an H32 frame.
+    write_sprite(&mut b, 0, 64 + 128, 1, 1, 1, 0x8000 | 2, 16 + 128);
+    write_sprite(&mut b, 1, 64 + 128, 1, 1, 0, 0x8000 | 2, 232 + 128);
+
+    b.finish()
+}
+
+#[test]
+fn h32_centered() {
+    let rom = build_h32_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    // Native-width framebuffer: H32 is 256x224x4, NOT 320-wide.
+    assert_eq!(fb.len(), H32_W * FRAME_H * 4, "H32 frame must be 256x224 RGBA");
+
+    let red = normal_rgba(0x000E); // [255,0,0,255]
+    let green = normal_rgba(0x00E0); // [0,255,0,255]
+    assert_eq!(red, [255, 0, 0, 255]);
+    assert_eq!(green, [0, 255, 0, 255]);
+
+    // Plane content is present across the FULL 256 width, including the
+    // rightmost columns 248..255 — proving there is no left-jammed content with
+    // a black bar and the buffer really is 256 wide (indexing 255 is valid).
+    assert_eq!(pixel_w(&fb, 0, 100, H32_W), red, "leftmost column is plane red");
+    assert_eq!(pixel_w(&fb, 128, 100, H32_W), red, "center column is plane red");
+    assert_eq!(pixel_w(&fb, 250, 100, H32_W), red, "col 250 is plane red");
+    assert_eq!(
+        pixel_w(&fb, 255, 100, H32_W),
+        red,
+        "rightmost column (255) is plane red — no 64px black bar"
+    );
+
+    // Sprites render at both the left and the far right of the H32 frame.
+    assert_eq!(pixel_w(&fb, 20, 68, H32_W), green, "left sprite is green");
+    assert_eq!(pixel_w(&fb, 240, 68, H32_W), green, "right-edge sprite is green");
+
+    check_golden("h32_centered", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 5: Runtime H40 -> H32 mode switch (no panic / no corruption)
+// ---------------------------------------------------------------------------
+
+fn build_mode_switch_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // Start in H40 (0x81), build content, THEN switch to H32 (0x00). Because the
+    // setup stream runs within the first frame and the switch is applied at the
+    // next frame boundary (frame_width is latched per frame), the captured final
+    // frame renders entirely in H32.
+    base_registers(&mut b, 0x81, 0x00);
+
+    b.set_cram_color(1, 0x000E); // red
+    b.write_solid_tile(1, 1);
+
+    // Scroll A: solid red every row.
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    // Switch the horizontal mode to H32 at the end of the setup stream.
+    b.set_register(0x0C, 0x00);
+
+    b.finish()
+}
+
+#[test]
+fn mode_switch_sequence() {
+    let rom = build_mode_switch_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    // The runtime H40 -> H32 switch must be applied cleanly at a frame boundary:
+    // the final frame is a coherent 256x224 buffer, not a crash or a ragged mix.
+    assert_eq!(
+        fb.len(),
+        H32_W * FRAME_H * 4,
+        "after switching to H32 the frame must be 256x224 RGBA"
+    );
+
+    let red = normal_rgba(0x000E);
+    // Content is intact across the full native width (no corruption).
+    assert_eq!(pixel_w(&fb, 0, 100, H32_W), red, "plane red at left");
+    assert_eq!(pixel_w(&fb, 255, 100, H32_W), red, "plane red at right edge");
+
+    check_golden("mode_switch_h32", &fb);
 }
