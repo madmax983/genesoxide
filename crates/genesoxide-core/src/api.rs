@@ -3015,9 +3015,18 @@ impl GenesisCore {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted to 68K
-                // Since Z80 is not emulated, bus is always available.
-                0x00
+                // Z80 BUSREQ status at 0xA11100/0xA11101: bit 0 = 0 means the bus
+                // has been granted to the 68000, bit 0 = 1 means the Z80 still owns
+                // it. Mirror the live CoreBus read path (mask `& 0xFFFF`, register
+                // 0x1100..=0x1101) so this debug bus reports the real arbitration
+                // state instead of a fixed value.
+                let reg = addr & 0xFFFF;
+                match reg {
+                    0x1100..=0x1101 => {
+                        if self.z80_bus_requested { 0x00 } else { 0x01 }
+                    }
+                    _ => 0x00,
+                }
             }
             bus::BusRegion::Vdp => {
                 // VDP byte reads: return high or low byte of word read
@@ -3208,9 +3217,17 @@ fn read_68k_byte(
             }
         }
         bus::BusRegion::ControlRegisters => {
-            let offset = addr & 0x01FF;
-            match offset {
-                0x0000..=0x0001 => {
+            // Mask to the 0xA1xxxx register offset, matching the write path's
+            // `addr & 0xFFFF` convention. The Z80 BUSREQ register lives at
+            // 0xA11100/0xA11101, so a `& 0x01FF` mask (offset 0x100) does NOT
+            // land in 0x0000..=0x0001 — using it silently dropped every BUSREQ
+            // read to the fallback, so `Z80_isBusTaken()` always saw "taken" and
+            // SGDK's bus-release wait spun forever (black screen).
+            let reg = addr & 0xFFFF;
+            match reg {
+                // BUSREQ status (bit 0): 0 = bus granted to the 68000, 1 = Z80
+                // still owns the bus.
+                0x1100..=0x1101 => {
                     if z80_bus_requested { 0x00 } else { 0x01 }
                 }
                 _ => 0x00,
@@ -3447,10 +3464,15 @@ impl Bus for CoreBus<'_> {
                 }
             }
             bus::BusRegion::ControlRegisters => {
-                // Z80 bus request (0xA11100): bit 0 = 0 means bus granted
-                let offset = addr & 0x01FF;
-                match offset {
-                    0x0000..=0x0001 => {
+                // Z80 BUSREQ status word for 0xA11100. The status bit is the
+                // high byte's bit 0 (word bit 8, 0x0100): 0 = bus granted to the
+                // 68000, 1 = Z80 still owns the bus. Mask with `& 0xFFFF` to match
+                // the write path — a `& 0x01FF` mask maps 0xA11100 to offset 0x100
+                // (never 0x00), which used to drop the read to the fallback so the
+                // status always read "granted/taken" and SGDK hung on release.
+                let reg = addr & 0xFFFF;
+                match reg {
+                    0x1100..=0x1101 => {
                         if *self.z80_bus_requested {
                             0x0000
                         } else {
@@ -4703,11 +4725,84 @@ mod tests {
     }
 
     #[test]
-    fn z80_bus_request_grants_immediately() {
-        let core = GenesisCore::new();
-        // Z80 bus request: bit 0 = 0 means bus granted to 68K
-        let val = core.read_byte(0xA11100);
-        assert_eq!(val & 0x01, 0x00, "bit 0 should be 0 (bus granted)");
+    fn z80_busreq_read_reflects_grant_state() {
+        // The Z80 BUSREQ status register at 0xA11100 must reflect the actual
+        // arbitration state (bit 0: 0 = bus granted to the 68000, 1 = Z80 owns
+        // the bus). Regression guard for a mask bug where the read path used
+        // `addr & 0x01FF` (→ offset 0x100 for 0xA11100, never matching the
+        // 0x0000..=0x0001 arm) so BUSREQ reads always returned the 0 fallback.
+        // SGDK's `Z80_isBusTaken()` release-wait loop then spun forever and the
+        // screen stayed black.
+        let mut core = GenesisCore::new();
+
+        // Power-on: the 68000 has not requested the bus, so the Z80 owns it and
+        // bit 0 reads as 1.
+        assert_eq!(
+            core.read_byte(0xA11100) & 0x01,
+            0x01,
+            "at power-on the Z80 owns the bus (bit 0 = 1)"
+        );
+
+        // After the 68000 requests the bus, the read reports "granted" (bit 0 = 0).
+        core.z80_bus_requested = true;
+        assert_eq!(
+            core.read_byte(0xA11100) & 0x01,
+            0x00,
+            "after BUSREQ the bus is granted to the 68000 (bit 0 = 0)"
+        );
+
+        // After release, the status returns to Z80-owned (bit 0 = 1).
+        core.z80_bus_requested = false;
+        assert_eq!(
+            core.read_byte(0xA11100) & 0x01,
+            0x01,
+            "after release the Z80 owns the bus again (bit 0 = 1)"
+        );
+    }
+
+    /// End-to-end regression guard for the BUSREQ-read mask bug via the live
+    /// CoreBus path. A crafted 68000 program requests the Z80 bus, releases it,
+    /// then runs SGDK's `Z80_isBusTaken()` idiom
+    /// (`MOVE.W $A11100,D0; LSR.W #8; EORI #1; ANDI #1`) in a wait-for-release
+    /// loop. With the mask bug the read always reported "taken", the loop never
+    /// exited, and the sentinel store after the loop never ran. With the fix the
+    /// released bus reads as not-taken, the loop falls through and writes a
+    /// sentinel to work RAM within a single frame.
+    #[test]
+    fn busreq_release_wait_loop_terminates() {
+        let mut rom = vec![0u8; 0x400];
+        rom[0..4].copy_from_slice(&0x00FF_0000u32.to_be_bytes()); // initial SSP
+        rom[4..8].copy_from_slice(&0x0000_0200u32.to_be_bytes()); // initial PC
+
+        // Program at 0x0200:
+        let prog: &[u8] = &[
+            // MOVE.W #$0100,($00A11100).L   ; request the Z80 bus
+            0x33, 0xFC, 0x01, 0x00, 0x00, 0xA1, 0x11, 0x00,
+            // MOVE.W #$0000,($00A11100).L   ; release the Z80 bus
+            0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x11, 0x00,
+            // loop: MOVE.W ($00A11100).L,D0 ; read BUSREQ status  (0x0210)
+            0x30, 0x39, 0x00, 0xA1, 0x11, 0x00, //
+            0xE0, 0x48, // LSR.W  #8,D0
+            0x0A, 0x40, 0x00, 0x01, // EORI.W #$0001,D0
+            0x02, 0x40, 0x00, 0x01, // ANDI.W #$0001,D0
+            0x66, 0xEE, // BNE.S  loop (-18 → back to 0x0210)
+            // MOVE.W #$BEEF,($00FF0000).L   ; sentinel proving the loop exited
+            0x33, 0xFC, 0xBE, 0xEF, 0x00, 0xFF, 0x00, 0x00,
+            // self: BRA.S self
+            0x60, 0xFE,
+        ];
+        rom[0x200..0x200 + prog.len()].copy_from_slice(prog);
+
+        let mut core = GenesisCore::new();
+        core.execute(Command::LoadRom(rom));
+        core.execute(Command::StepFrame);
+
+        let sentinel = (u16::from(core.work_ram[0x0000]) << 8) | u16::from(core.work_ram[0x0001]);
+        assert_eq!(
+            sentinel, 0xBEEF,
+            "BUSREQ release-wait loop must terminate and write the sentinel; \
+             got 0x{sentinel:04X} (loop hung on a stuck 'bus taken' read)"
+        );
     }
 
     #[test]
