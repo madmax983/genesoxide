@@ -2840,7 +2840,28 @@ impl GenesisCore {
                 self.step_z80_scanline_with_timing(scanline, scanline_start_tick);
             }
 
-            // Check for H-interrupt (level 4)
+            // Check for H-interrupt (level 4).
+            //
+            // Granularity: HINT delivery is line-granular. The counter is
+            // decremented/reloaded in `begin_scanline` (with the VBlank-reload
+            // fix so it fires on the correct line), and the level-4 IRQ is
+            // delivered here — after this scanline's full CPU budget has run,
+            // i.e. once the beam has crossed the end of active display into
+            // hblank. That is the correct *horizontal* position at line
+            // granularity: the HINT handler's register writes land during
+            // hblank, before the next line is rendered below.
+            //
+            // True sub-instruction beam-crossing delivery (interrupting the
+            // per-instruction loop the moment the beam reaches the H40 hblank
+            // dot) was intentionally NOT threaded into
+            // `step_scanline_with_timing`: doing so would reorder HINT delivery
+            // relative to the Z80 step and the FM/PSG audio write trace within
+            // the scanline, and the same rationale that defers sub-scanline
+            // 68000<->Z80 arbitration (see the long comment below, and the
+            // absence of a bootable Sonic/SMPS regression guard) applies here.
+            // The per-line hblank delivery preserves frame length exactly and
+            // is sufficient for the raster-split cases that change registers per
+            // HINT.
             if self.vdp.h_interrupt_pending() {
                 self.vdp.clear_h_interrupt();
                 let cpu_master_tick =
