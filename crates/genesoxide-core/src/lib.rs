@@ -23,7 +23,7 @@ pub use api::{
 };
 pub use api::{
     FRAME_HEIGHT, FRAME_PERIOD_NS, FRAME_PERIOD_NS_PAL, FRAME_RGBA_BYTES, FRAME_RGBA_BYTES_MAX,
-    FRAME_WIDTH, MAX_FRAME_HEIGHT,
+    FRAME_WIDTH, MAX_FRAME_HEIGHT, MAX_FRAME_HEIGHT_INTERLACED,
 };
 pub use scheduler::Region;
 pub use rewind::{

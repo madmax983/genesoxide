@@ -250,6 +250,17 @@ pub struct Vdp {
     /// every frame (and from the registers on `restore`), NOT persistent state,
     /// so it is intentionally excluded from `VdpSnapshot`.
     frame_width: u16,
+    /// Whether interlace mode 2 (LSM=0b11, reg 0x0C bits 2:1) is latched for the
+    /// current frame, causing both fields to be woven into one framebuffer at
+    /// double vertical resolution.
+    ///
+    /// Like `frame_width`, this is captured once at the start of each frame
+    /// (scanline 0 of `render_scanline`) so a mid-frame reg 0x0C LSM write cannot
+    /// reshape the framebuffer mid-render; a mode change only takes effect at the
+    /// next frame boundary. It is a per-frame derived cache recomputed every frame
+    /// (and from the registers on `restore`), NOT persistent state, so it is
+    /// intentionally excluded from `VdpSnapshot` (preserving snapshot byte-exactness).
+    frame_interlace_double: bool,
     /// V-blank flag.
     in_vblank: bool,
     /// H-blank flag.
@@ -324,6 +335,7 @@ impl Vdp {
             region: Region::Ntsc,
             framebuffer: Box::new([0; FRAME_RGBA_BYTES_MAX]),
             frame_width: FRAME_WIDTH as u16,
+            frame_interlace_double: false,
             in_vblank: false,
             in_hblank: false,
             dma_pending: false,
@@ -346,7 +358,22 @@ impl Vdp {
     /// or 240 in PAL V30. Both dimensions are packed at the latched width stride.
     #[must_use]
     fn framebuffer_len(&self) -> usize {
-        self.frame_width as usize * self.active_height() * 4
+        self.frame_width as usize * self.framebuffer_height() * 4
+    }
+
+    /// Physical output height of the current frame's framebuffer, in pixels.
+    /// Equals [`Vdp::active_height`] normally, doubled when interlace mode 2
+    /// (LSM=0b11, reg 0x0C bits 2:1) is latched for this frame (both fields
+    /// woven into one buffer). Mirrors the per-frame non-serialized `frame_width`
+    /// cache: latched at frame start so it is stable for the whole frame.
+    #[inline]
+    #[must_use]
+    pub fn framebuffer_height(&self) -> usize {
+        if self.frame_interlace_double {
+            self.active_height() * 2
+        } else {
+            self.active_height()
+        }
     }
 
     /// Returns a reference to the active RGBA framebuffer for the current frame.
@@ -1331,19 +1358,32 @@ impl Vdp {
 
     /// Fetches a single pixel from a tile pattern in VRAM.
     ///
-    /// `tile_index`: pattern number (each tile is 32 bytes).
-    /// `row`: pixel row within tile (0-7).
+    /// `tile_index`: pattern number.
+    /// `row`: pixel row within the cell (0-7 normally, 0-15 in interlace mode 2).
     /// `col`: pixel column within tile (0-7).
     /// `hflip`, `vflip`: mirror flags.
+    /// `im2`: interlace mode 2 (LSM=0b11) — cells are 16px tall and each tile
+    ///   occupies 64 bytes (16 rows × 4 bytes) instead of 32 (8 rows × 4 bytes);
+    ///   vertical flip mirrors across 16 rows (`row ^ 15`) instead of 8 (`7-row`).
     ///
     /// Returns the 4-bit palette index (0 = transparent).
     #[must_use]
-    fn tile_pixel(&self, tile_index: u16, row: u8, col: u8, hflip: bool, vflip: bool) -> u8 {
-        let actual_row = if vflip { 7 - row } else { row };
+    fn tile_pixel(
+        &self,
+        tile_index: u16,
+        row: u8,
+        col: u8,
+        hflip: bool,
+        vflip: bool,
+        im2: bool,
+    ) -> u8 {
+        // IM2 doubles the cell height: 16 rows / 64-byte tile stride vs 8 / 32.
+        let (last_row, tile_stride) = if im2 { (15u8, 64usize) } else { (7u8, 32usize) };
+        let actual_row = if vflip { last_row - row } else { row };
         let actual_col = if hflip { 7 - col } else { col };
 
-        // Each tile = 32 bytes, each row = 4 bytes
-        let tile_addr = usize::from(tile_index) * 32 + usize::from(actual_row) * 4;
+        // Each row = 4 bytes; tile stride is 32 (normal) or 64 (IM2) bytes.
+        let tile_addr = usize::from(tile_index) * tile_stride + usize::from(actual_row) * 4;
         let byte_offset = usize::from(actual_col / 2);
         let addr = (tile_addr + byte_offset) & (VRAM_SIZE - 1);
         let byte = self.vram[addr];
@@ -1365,6 +1405,11 @@ impl Vdp {
     /// Render one plane pixel for a scroll plane.
     /// Returns `Some((rgba, priority))` if the pixel is non-transparent.
     #[must_use]
+    ///
+    /// `pixel_y` is the plane-vertical coordinate already reduced modulo the
+    /// plane height (`v_cells*8` normally, `v_cells*16` in interlace mode 2).
+    /// When `im2` is set the plane cell is 16px tall: the tile row is `pixel_y>>4`
+    /// and the tile pattern uses the doubled 64-byte-stride addressing.
     fn render_plane_pixel(
         &self,
         nametable_base: usize,
@@ -1372,10 +1417,13 @@ impl Vdp {
         pixel_y: u16,
         h_cells: u16,
         v_cells: u16,
+        im2: bool,
     ) -> Option<([u8; 4], bool)> {
+        // Cell is 8px tall normally, 16px in interlace mode 2 (LSM=0b11).
+        let cell_h = if im2 { 16 } else { 8 };
         // Which tile in the nametable
         let tile_col = (pixel_x / 8) % h_cells;
-        let tile_row = (pixel_y / 8) % v_cells;
+        let tile_row = (pixel_y / cell_h) % v_cells;
         // Nametable entry address
         let nt_offset = (tile_row * h_cells + tile_col) as usize * 2;
         let nt_addr = nametable_base + nt_offset;
@@ -1387,10 +1435,10 @@ impl Vdp {
         let hflip = entry & 0x0800 != 0;
         let tile_index = entry & 0x07FF;
 
-        let row_in_tile = (pixel_y % 8) as u8;
+        let row_in_cell = (pixel_y % cell_h) as u8;
         let col_in_tile = (pixel_x % 8) as u8;
 
-        let color_index = self.tile_pixel(tile_index, row_in_tile, col_in_tile, hflip, vflip);
+        let color_index = self.tile_pixel(tile_index, row_in_cell, col_in_tile, hflip, vflip, im2);
         if color_index == 0 {
             return None; // Transparent
         }
@@ -1407,20 +1455,48 @@ impl Vdp {
     /// 4. Render sprites
     /// 5. Handle priority: high-priority tiles/sprites draw over low-priority
     pub fn render_scanline(&mut self, line: u16) {
-        // Latch the active display width once at the start of the frame so the
-        // whole frame uses one consistent stride even if reg 0x0C is written
-        // mid-frame; a mode change only takes effect at the next frame boundary.
+        // Latch the per-frame framebuffer shape once at the start of the frame so
+        // the whole frame uses one consistent stride/height even if reg 0x0C is
+        // written mid-frame; a mode change only takes effect at the next frame
+        // boundary. `frame_width` fixes the horizontal stride (H32/H40) and
+        // `frame_interlace_double` fixes whether interlace mode 2 (LSM=0b11) weaves
+        // both fields into a double-height buffer.
         if line == 0 {
             self.frame_width = self.screen_width();
+            self.frame_interlace_double = self.interlace_double();
         }
+        // Interlace mode 2 weaves BOTH fields into one framebuffer every frame:
+        // for a source scanline `line`, emit output rows out_y in {2*line, 2*line+1}
+        // (field = out_y & 1), each computed independently from its own doubled
+        // vertical coordinate `out_y`. Otherwise a single row out_y == line.
+        if self.frame_interlace_double {
+            self.render_row(line, line << 1, true);
+            self.render_row(line, (line << 1) | 1, true);
+        } else {
+            self.render_row(line, line, false);
+        }
+    }
+
+    /// Renders one output row `out_y` for source scanline `line` into the
+    /// framebuffer.
+    ///
+    /// `out_y` is the physical framebuffer row (== `line` normally; the doubled
+    /// weave coordinate `2*line` or `2*line+1` in interlace mode 2). `im2` selects
+    /// interlace-mode-2 (LSM=0b11) addressing: plane/window/sprite vertical
+    /// geometry is computed from `out_y` with 16px-tall cells and 64-byte tile
+    /// strides, while horizontal geometry, hscroll (indexed by source `line`) and
+    /// the window active-region test (per source field line) are unchanged. With
+    /// `im2 == false` and `out_y == line` this reproduces the non-interlaced
+    /// output byte-for-byte.
+    fn render_row(&mut self, line: u16, out_y: u16, im2: bool) {
         let width = self.frame_width;
         let stride = width as usize;
         let active_height = self.active_height();
         if line as usize >= active_height || !self.display_enabled() {
             // During V-blank or if display disabled, fill with background.
             let bg = self.background_color();
-            let y = line as usize;
-            if y < active_height {
+            let y = out_y as usize;
+            if (line as usize) < active_height {
                 for x in 0..stride {
                     let offset = (y * stride + x) * 4;
                     self.framebuffer[offset..offset + 4].copy_from_slice(&bg);
@@ -1429,7 +1505,11 @@ impl Vdp {
             return;
         }
 
-        let y = line as usize;
+        // Physical framebuffer row: the source line normally, the doubled weave
+        // coordinate (2*line or 2*line+1) in interlace mode 2. The plane vertical
+        // geometry is threaded into `render_planes_span` (via `out_y`/`im2`) so
+        // the fast and span paths both weave correctly.
+        let y = out_y as usize;
 
         // Per-pixel compositing buffers
         // We use a simple layered approach with a priority scheme.
@@ -1456,18 +1536,32 @@ impl Vdp {
         if self.line_events.is_empty() || self.line_baseline.is_none() {
             // FAST PATH — byte-identical to the pre-mid-line atomic render.
             let hscroll = self.hscroll_for_line(line);
-            self.render_planes_span(line, 0, width, hscroll, &mut pixel_color, &mut pixel_priority);
+            self.render_planes_span(
+                line,
+                out_y,
+                0,
+                width,
+                hscroll,
+                im2,
+                &mut pixel_color,
+                &mut pixel_priority,
+            );
         } else {
             // SPAN PATH. Save end-of-line state, rewind the tracked quantities to
             // the baseline, walk events applying each at its dot, then restore
             // the end-of-line state (so sprites / S/H / left-column below use the
             // final register/CRAM values).
+            //
+            // The baseline is CLONED (not taken) and the event buffer is restored
+            // below, so in interlace mode 2 the second woven field (`out_y | 1`)
+            // re-runs this identical span walk from the same start-of-line state.
+            // `begin_scanline` clears both per line.
             let saved_registers = self.registers;
             let saved_cram = self.cram;
             let saved_vsram = self.vsram;
-            let baseline = self
+            let baseline = *self
                 .line_baseline
-                .take()
+                .as_ref()
                 .expect("baseline present when events recorded");
             let events = std::mem::take(&mut self.line_events);
 
@@ -1480,9 +1574,11 @@ impl Vdp {
                 let dot = ev.dot.min(width);
                 self.render_planes_span(
                     line,
+                    out_y,
                     span_start,
                     dot,
                     hscroll,
+                    im2,
                     &mut pixel_color,
                     &mut pixel_priority,
                 );
@@ -1511,9 +1607,11 @@ impl Vdp {
             // Final span from the last event to the right edge.
             self.render_planes_span(
                 line,
+                out_y,
                 span_start,
                 width,
                 hscroll,
+                im2,
                 &mut pixel_color,
                 &mut pixel_priority,
             );
@@ -1539,12 +1637,13 @@ impl Vdp {
 
         // Step 4: Sprites
         self.render_sprites_on_line(
-            line,
+            out_y,
             width,
             &mut pixel_color,
             &mut pixel_priority,
             sh,
             &mut sh_op,
+            im2,
         );
 
         // Step 5: Left column blank (register 0, bit 5)
@@ -1596,13 +1695,22 @@ impl Vdp {
     /// `self`, so the span reflects whatever register/CRAM/VSRAM state the caller
     /// has installed for this span. Called once at full width on the fast path
     /// (byte-identical to the atomic render) and once per span on the span path.
+    ///
+    /// `out_y` is the physical framebuffer row (== `line` normally, the doubled
+    /// weave coordinate in interlace mode 2) and drives the plane vertical
+    /// geometry; `im2` selects interlace-mode-2 addressing (16px-tall cells,
+    /// `v_cells*16` vertical modulus, 64-byte tile stride). The window
+    /// active-region test stays keyed on the source `line`. With `im2 == false`
+    /// and `out_y == line` the span is byte-identical to the atomic render.
     #[allow(clippy::too_many_arguments)]
     fn render_planes_span(
         &self,
         line: u16,
+        out_y: u16,
         x0: u16,
         x1: u16,
         hscroll: (i16, i16),
+        im2: bool,
         pixel_color: &mut [[u8; 4]; 320],
         pixel_priority: &mut [u8; 320],
     ) {
@@ -1618,6 +1726,9 @@ impl Vdp {
         let nt_a = self.scroll_a_nametable_addr();
         let nt_b = self.scroll_b_nametable_addr();
         let bg_color = self.background_color();
+        // Plane vertical modulus: 8px cells normally, 16px cells in interlace
+        // mode 2 (LSM=0b11), so the plane wraps over v_cells*16 doubled rows.
+        let v_mod = if im2 { v_cells * 16 } else { v_cells * 8 };
 
         // Step 1: Background fill
         for x in x0..x1 {
@@ -1627,13 +1738,13 @@ impl Vdp {
         // Step 2: Scroll B (lowest priority plane)
         for x in x0..x1 {
             let vscroll_b = self.vscroll_for_column(x / 8, 1);
-            let plane_y = line.wrapping_add(vscroll_b) % (v_cells * 8);
+            let plane_y = out_y.wrapping_add(vscroll_b) % v_mod;
             // H-scroll: the scroll value is SUBTRACTED (scrolls right = positive value
             // moves the view left). Genesis H-scroll is a positive offset = scroll left.
             let plane_x = (x as i16).wrapping_sub(hscroll_b) as u16 % (h_cells * 8);
 
             if let Some((color, pri)) =
-                self.render_plane_pixel(nt_b, plane_x, plane_y, h_cells, v_cells)
+                self.render_plane_pixel(nt_b, plane_x, plane_y, h_cells, v_cells, im2)
             {
                 let xi = x as usize;
                 let pri_level = if pri { 2 } else { 1 };
@@ -1659,10 +1770,12 @@ impl Vdp {
             let in_window = window_active_on_line && x >= win_left && x < win_right;
 
             if in_window {
-                // Window plane: does NOT scroll, coordinates are screen-relative
-
+                // Window plane: does NOT scroll, coordinates are screen-relative.
+                // In interlace mode 2 the cell is 16px tall, so the cell row is
+                // out_y>>4 and the row-in-cell is out_y&15 with 64-byte tile stride.
+                let cell_h = if im2 { 16 } else { 8 };
                 let tile_col = x / 8;
-                let tile_row = line / 8;
+                let tile_row = out_y / cell_h;
                 let nt_offset = (tile_row * win_nt_width + tile_col) as usize * 2;
                 let nt_addr = nt_win + nt_offset;
                 let entry = self.vram_read_word(nt_addr);
@@ -1673,11 +1786,11 @@ impl Vdp {
                 let hflip = entry & 0x0800 != 0;
                 let tile_index = entry & 0x07FF;
 
-                let row_in_tile = (line % 8) as u8;
+                let row_in_cell = (out_y % cell_h) as u8;
                 let col_in_tile = (x % 8) as u8;
 
                 let color_index =
-                    self.tile_pixel(tile_index, row_in_tile, col_in_tile, hflip, vflip);
+                    self.tile_pixel(tile_index, row_in_cell, col_in_tile, hflip, vflip, im2);
                 if color_index != 0 {
                     // Non-transparent window pixel replaces Scroll A
                     let pri_level = if priority { 2 } else { 1 };
@@ -1690,11 +1803,11 @@ impl Vdp {
             } else {
                 // Outside window region: render Scroll A as normal
                 let vscroll_a = self.vscroll_for_column(x / 8, 0);
-                let plane_y = line.wrapping_add(vscroll_a) % (v_cells * 8);
+                let plane_y = out_y.wrapping_add(vscroll_a) % v_mod;
                 let plane_x = (x as i16).wrapping_sub(hscroll_a) as u16 % (h_cells * 8);
 
                 if let Some((color, pri)) =
-                    self.render_plane_pixel(nt_a, plane_x, plane_y, h_cells, v_cells)
+                    self.render_plane_pixel(nt_a, plane_x, plane_y, h_cells, v_cells, im2)
                 {
                     let pri_level = if pri { 2 } else { 1 };
                     // Scroll A draws over Scroll B at same or higher priority
@@ -1707,15 +1820,23 @@ impl Vdp {
         }
     }
 
-    /// Renders sprites that intersect the given scanline.
+    /// Renders sprites that intersect the given output row `out_y`.
+    ///
+    /// `out_y` is the doubled vertical weave coordinate in interlace mode 2
+    /// (== the source line otherwise). When `im2` is set, sprite Y is un-doubled
+    /// (SAT_Y - 0x100), sprite height and rows are doubled (v_size*16 lines,
+    /// 16 rows/cell), the tile name is masked to 10 bits and the tile pattern
+    /// uses the 64-byte-stride addressing. Horizontal geometry, per-line sprite
+    /// limits, masking and shadow/highlight handling are unchanged.
     fn render_sprites_on_line(
         &self,
-        line: u16,
+        out_y: u16,
         width: u16,
         pixel_color: &mut [[u8; 4]; 320],
         pixel_priority: &mut [u8; 320],
         sh: bool,
         sh_op: &mut [u8; 320],
+        im2: bool,
     ) {
         let sat_base = self.sprite_table_addr();
         let mut sprites_on_line: usize = 0;
@@ -1749,15 +1870,19 @@ impl Vdp {
             let word2 = self.vram_read_word(entry_addr + 4);
             let word3 = self.vram_read_word(entry_addr + 6);
 
-            let sprite_y = (word0 & 0x03FF).wrapping_sub(128);
+            // In interlace mode 2 the sprite Y field is the un-doubled top (so it
+            // is offset by 0x100 = 256, not 128) and each vertical cell spans 16
+            // doubled lines. Otherwise the classic 8px-cell, -128 offset applies.
+            let cell: u8 = if im2 { 16 } else { 8 };
+            let sprite_y = (word0 & 0x03FF).wrapping_sub(if im2 { 0x100 } else { 128 });
             let v_size = ((word1 >> 8) & 0x03) as u8 + 1; // 1-4 tiles
             let h_size = ((word1 >> 10) & 0x03) as u8 + 1;
             let link = (word1 & 0x7F) as u8;
 
-            let sprite_height = u16::from(v_size) * 8;
+            let sprite_height = u16::from(v_size) * u16::from(cell);
 
-            // Check if this sprite intersects the current scanline
-            if line >= sprite_y && line < sprite_y.wrapping_add(sprite_height) {
+            // Check if this sprite intersects the current output row
+            if out_y >= sprite_y && out_y < sprite_y.wrapping_add(sprite_height) {
                 if sprites_on_line >= max_per_line {
                     break; // Max sprites per line reached
                 }
@@ -1770,17 +1895,18 @@ impl Vdp {
                 let palette = ((word2 >> 13) & 0x03) as u8;
                 let vflip = word2 & 0x1000 != 0;
                 let hflip = word2 & 0x0800 != 0;
-                let base_tile = word2 & 0x07FF;
+                // IM2 masks the tile name to 10 bits (vs 11 normally).
+                let base_tile = word2 & if im2 { 0x03FF } else { 0x07FF };
 
-                let row_in_sprite = (line.wrapping_sub(sprite_y)) as u8;
+                let row_in_sprite = (out_y.wrapping_sub(sprite_y)) as u8;
                 let actual_row = if vflip {
-                    v_size * 8 - 1 - row_in_sprite
+                    v_size * cell - 1 - row_in_sprite
                 } else {
                     row_in_sprite
                 };
 
-                let tile_row = actual_row / 8;
-                let pixel_row = actual_row % 8;
+                let tile_row = actual_row / cell;
+                let pixel_row = actual_row % cell;
 
                 for hcell in 0..h_size {
                     let actual_hcell = if hflip { h_size - 1 - hcell } else { hcell };
@@ -1799,7 +1925,7 @@ impl Vdp {
 
                         let actual_pcol = if hflip { 7 - pixel_col } else { pixel_col };
                         let color_index =
-                            self.tile_pixel(tile_index, pixel_row, actual_pcol, false, false);
+                            self.tile_pixel(tile_index, pixel_row, actual_pcol, false, false, im2);
                         if color_index == 0 {
                             continue; // Transparent
                         }
@@ -1899,10 +2025,12 @@ impl Vdp {
         self.vint_pending = snap.vint_pending;
         self.dma_busy_cpu_cycles = snap.dma_busy_cpu_cycles;
         self.region = snap.region;
-        // frame_width is a derived per-frame cache (not serialized). Recompute
-        // it from the restored registers so the returned framebuffer length is
-        // coherent even before the next frame renders.
+        // frame_width and frame_interlace_double are derived per-frame caches
+        // (not serialized). Recompute them from the restored registers so the
+        // returned framebuffer dimensions are coherent even before the next frame
+        // renders.
         self.frame_width = self.screen_width();
+        self.frame_interlace_double = self.interlace_double();
     }
 }
 
@@ -2445,7 +2573,7 @@ mod tests {
         write_tile_pattern(&mut vdp, 0, &pattern);
 
         for (col, &expected) in row0.iter().enumerate() {
-            let got = vdp.tile_pixel(0, 0, col as u8, false, false);
+            let got = vdp.tile_pixel(0, 0, col as u8, false, false, false);
             assert_eq!(got, expected, "tile_pixel at col {col}");
         }
     }
