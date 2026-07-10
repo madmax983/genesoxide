@@ -167,6 +167,47 @@ const RS0: u8 = 0x01;
 /// RS1 (bit 7) — horizontal resolution select, high bit.
 const RS1: u8 = 0x80;
 
+/// A single render-relevant state change recorded mid-scanline.
+///
+/// See [`LineEvent`]. `Register` carries the register index and its new 8-bit
+/// value; `Cram`/`Vsram` carry the entry index and the already-masked value;
+/// `Hscroll` carries the plane (0 = A, 1 = B) and the new horizontal-scroll word
+/// (as written to the plane's HSCROLL slot in VRAM for this line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineChange {
+    Register { reg: u8, value: u8 },
+    Cram { index: u8, value: u16 },
+    Vsram { index: u8, value: u16 },
+    Hscroll { plane: u8, value: u16 },
+}
+
+/// A mid-line register/memory change recorded during the current scanline,
+/// tagged with the beam dot (pixel column) at which it took effect.
+///
+/// Events are appended in ascending `dot` order because the 68000 executes
+/// instructions in beam order across the line, so the recording path never
+/// needs to sort. Transient per-line state — never serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineEvent {
+    dot: u16,
+    change: LineChange,
+}
+
+/// Start-of-line snapshot of the render-relevant state, captured lazily on the
+/// first recorded [`LineEvent`] of a scanline (before that write mutates the
+/// live state). The span renderer replays from this baseline, applying each
+/// event at its dot, so the pixels left of an event reflect the pre-write state
+/// and the pixels right of it reflect the post-write state.
+///
+/// Transient per-line state — never serialized (not part of [`VdpSnapshot`]).
+#[derive(Debug, Clone, Copy)]
+struct LineBaseline {
+    registers: [u8; VDP_REGISTER_COUNT],
+    cram: [u16; CRAM_ENTRIES],
+    vsram: [u16; VSRAM_ENTRIES],
+    hscroll: (i16, i16),
+}
+
 /// The VDP.
 pub struct Vdp {
     /// 64KB Video RAM.
@@ -244,6 +285,25 @@ pub struct Vdp {
     /// It is decremented as CPU cycles elapse and reaches zero when the
     /// transfer completes.
     dma_busy_cpu_cycles: u32,
+
+    // ---- Mid-line raster recording (transient per-line state) ----
+    //
+    // These three fields implement TRUE mid-line raster: a register/CRAM/VSRAM/
+    // HSCROLL write that lands part-way through an active scanline splits the
+    // line so the pixels left of the write use the old state and the pixels
+    // right of it use the new state. They are reset every scanline in
+    // `begin_scanline` and are deliberately NOT part of `VdpSnapshot` (like
+    // `frame_width`, they are per-line derived state, so save/rewind stays
+    // byte-identical).
+    /// Mid-line changes recorded during the current line, in ascending dot order.
+    /// Empty on the overwhelmingly common line (fast render path).
+    line_events: Vec<LineEvent>,
+    /// Start-of-line snapshot, captured lazily on the first recorded event of a
+    /// line. `None` until (and unless) a mid-line event is recorded.
+    line_baseline: Option<LineBaseline>,
+    /// True while an active, display-enabled line is being executed, so timed
+    /// CPU writes on that line get recorded as [`LineEvent`]s.
+    recording_line: bool,
 }
 
 impl Vdp {
@@ -274,6 +334,9 @@ impl Vdp {
             odd_frame: false,
             vint_pending: false,
             dma_busy_cpu_cycles: 0,
+            line_events: Vec::new(),
+            line_baseline: None,
+            recording_line: false,
         }
     }
 
@@ -366,7 +429,13 @@ impl Vdp {
     /// Writes to the VDP control port.
     ///
     /// Handles the two-word command sequence and register writes.
-    pub fn write_control(&mut self, value: u16) {
+    ///
+    /// `dot` is the intra-line beam position (pixel column) of a timed live-CPU
+    /// write: `Some(x)` records a mid-line register change when the current line
+    /// is being recorded (see [`Vdp::record_dot`]); `None` is an untimed write
+    /// (DMA, debug, interrupt-handler / between-lines delivery) that applies
+    /// globally and records nothing.
+    pub fn write_control(&mut self, value: u16, dot: Option<u16>) {
         match self.control_state {
             ControlState::Idle => {
                 // Check if this is a register write: 100x xxxx xxxx xxxx
@@ -374,6 +443,19 @@ impl Vdp {
                     let reg = ((value >> 8) & 0x1F) as usize;
                     let data = (value & 0xFF) as u8;
                     if reg < VDP_REGISTER_COUNT {
+                        // LAZY BASELINE: `self.registers` still holds the
+                        // start-of-line value for this register (this write has
+                        // not applied yet), so snapshot the baseline BEFORE
+                        // mutating, then record the change at its dot.
+                        if let Some(x) = self.record_dot(dot) {
+                            self.record_change(
+                                x,
+                                LineChange::Register {
+                                    reg: reg as u8,
+                                    value: data,
+                                },
+                            );
+                        }
                         self.registers[reg] = data;
                         if reg == 0x0F {
                             self.auto_increment = u16::from(data);
@@ -427,7 +509,12 @@ impl Vdp {
     }
 
     /// Writes to the VDP data port.
-    pub fn write_data(&mut self, value: u16) {
+    ///
+    /// `dot` has the same meaning as in [`Vdp::write_control`]: `Some(x)` is a
+    /// timed live-CPU write whose CRAM / VSRAM / (per-line HSCROLL-slot) VRAM
+    /// change is recorded as a mid-line event; `None` applies globally without
+    /// recording.
+    pub fn write_data(&mut self, value: u16, dot: Option<u16>) {
         // Reset control state on data port access
         self.control_state = ControlState::Idle;
 
@@ -438,9 +525,20 @@ impl Vdp {
             return;
         }
 
+        let record = self.record_dot(dot);
         match self.access_type {
             Some(AccessType::VramWrite) => {
                 let addr = self.address as usize;
+                // A VRAM write only produces a mid-line split if it lands on
+                // this line's HSCROLL slot (plane A / B); ordinary nametable /
+                // tile-data VRAM writes are applied to `self.vram` immediately
+                // and thus already visible to the whole line's plane fetch, as
+                // before (out of scope for the span model).
+                if let Some(x) = record
+                    && let Some(plane) = self.hscroll_slot_plane(self.scanline, self.address)
+                {
+                    self.record_change(x, LineChange::Hscroll { plane, value });
+                }
                 if addr < VRAM_SIZE - 1 {
                     self.vram[addr] = (value >> 8) as u8;
                     self.vram[addr + 1] = value as u8;
@@ -448,19 +546,127 @@ impl Vdp {
             }
             Some(AccessType::CramWrite) => {
                 let index = (self.address >> 1) as usize;
+                let masked = value & 0x0EEE; // 9-bit: 0BBB0GGG0RRR
                 if index < CRAM_ENTRIES {
-                    self.cram[index] = value & 0x0EEE; // 9-bit: 0BBB0GGG0RRR
+                    if let Some(x) = record {
+                        self.record_change(
+                            x,
+                            LineChange::Cram {
+                                index: (index & 0x3F) as u8,
+                                value: masked,
+                            },
+                        );
+                    }
+                    self.cram[index] = masked;
                 }
             }
             Some(AccessType::VsramWrite) => {
                 let index = (self.address >> 1) as usize;
+                let masked = value & 0x07FF; // 11-bit scroll value
                 if index < VSRAM_ENTRIES {
-                    self.vsram[index] = value & 0x07FF; // 11-bit scroll value
+                    if let Some(x) = record {
+                        self.record_change(
+                            x,
+                            LineChange::Vsram {
+                                index: index as u8,
+                                value: masked,
+                            },
+                        );
+                    }
+                    self.vsram[index] = masked;
                 }
             }
             _ => {}
         }
         self.address = self.address.wrapping_add(self.auto_increment);
+    }
+
+    /// Returns the recordable beam dot for a timed write, or `None` when the
+    /// write must not be recorded.
+    ///
+    /// A change is recorded only when (a) the write is timed (`dot` is `Some`),
+    /// (b) the current line is actively recording (an active, display-enabled
+    /// line — see [`Vdp::begin_scanline`]), and (c) the dot lies strictly inside
+    /// the active display (`1..width`). Dot 0 (and the line edges) are excluded:
+    /// a write there is indistinguishable from a start-of-line / hblank write
+    /// and applying it as the baseline is already correct.
+    #[inline]
+    fn record_dot(&self, dot: Option<u16>) -> Option<u16> {
+        let x = dot?;
+        if self.recording_line && x >= 1 && x < self.screen_width() {
+            Some(x)
+        } else {
+            None
+        }
+    }
+
+    /// Records a mid-line change at beam dot `x`: captures the start-of-line
+    /// baseline (once per line) and appends the event. Must be called BEFORE the
+    /// triggering write mutates the live state, so the lazy baseline snapshots the
+    /// true start-of-line values (see [`Vdp::capture_line_baseline`]).
+    fn record_change(&mut self, x: u16, change: LineChange) {
+        self.capture_line_baseline();
+        self.line_events.push(LineEvent { dot: x, change });
+    }
+
+    /// Captures the start-of-line baseline on the first recorded event of a line.
+    ///
+    /// Must be called BEFORE the triggering write mutates `self.registers` /
+    /// `self.cram` / `self.vsram` / the HSCROLL VRAM slot, so the snapshot holds
+    /// the true start-of-line values. Idempotent within a line.
+    fn capture_line_baseline(&mut self) {
+        if self.line_baseline.is_none() {
+            self.line_baseline = Some(LineBaseline {
+                registers: self.registers,
+                cram: self.cram,
+                vsram: self.vsram,
+                hscroll: self.hscroll_for_line(self.scanline),
+            });
+        }
+    }
+
+    /// If `addr` is the VRAM word address of this `line`'s HSCROLL slot, returns
+    /// the plane it belongs to (0 = A, 1 = B); otherwise `None`.
+    ///
+    /// Mirrors the addressing in [`Vdp::hscroll_for_line`]: base from reg 0x0D,
+    /// offset by the reg 0x0B H-scroll mode (full / per-cell / per-line). Plane A
+    /// occupies the slot word, plane B the following word.
+    #[must_use]
+    fn hscroll_slot_plane(&self, line: u16, addr: u16) -> Option<u8> {
+        let base = self.hscroll_table_addr();
+        let mode = self.registers[0x0B] & 0x03;
+        let offset = match mode {
+            0b00 => 0,
+            0b10 => (line as usize / 8) * 4,
+            0b11 => line as usize * 4,
+            _ => 0,
+        };
+        let slot = (base + offset) & (VRAM_SIZE - 1);
+        let a = addr as usize;
+        if a == slot {
+            Some(0)
+        } else if a == (slot + 2) & (VRAM_SIZE - 1) {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// Maps an intra-line master-tick offset to a beam dot (pixel column).
+    ///
+    /// Linear map `((offset.min(line-1) * width) / line)` where `width` is the
+    /// current horizontal resolution (320 in H40, 256 in H32) and `line` is
+    /// [`MASTER_TICKS_PER_LINE_H40`]. This is a deliberate approximation that
+    /// ignores the ~13% horizontal-blank porch: it is monotonic and
+    /// self-consistent (the same offset always maps to the same dot), which is
+    /// what the span renderer needs. Exact dot-accurate positioning — including
+    /// the HCounter's mid-line jump over hblank, the accurate model used by
+    /// [`Vdp::read_hv_counter`] / `hcounter_from_offset` — is a documented
+    /// refinement, not required for the mid-line split mechanism.
+    #[must_use]
+    pub fn dot_from_line_offset(&self, offset: u64) -> u16 {
+        let width = u64::from(self.screen_width());
+        ((offset.min(MASTER_TICKS_PER_LINE_H40 - 1) * width) / MASTER_TICKS_PER_LINE_H40) as u16
     }
 
     /// Reads from the VDP data port.
@@ -850,6 +1056,18 @@ impl Vdp {
         self.scanline = line;
         self.in_hblank = true;
 
+        // Reset the mid-line raster recording for this line. `Vec::clear`
+        // retains capacity, so an active line that records events does not
+        // allocate after the first frame. Recording is enabled only on an
+        // active, display-enabled line — the only lines `render_scanline`
+        // actually composites from planes; blanked / display-off lines just
+        // fill the backdrop and never consult the events. This runs at the
+        // very start of the line, BEFORE that line's CPU budget, so the
+        // lazily-captured baseline sees untouched start-of-line state.
+        self.line_events.clear();
+        self.line_baseline = None;
+        self.recording_line = (line as usize) < self.active_height() && self.display_enabled();
+
         // H-interrupt counter (reg 0x0A) behaviour, per the Genesis Software
         // Manual / Charles MacDonald VDP notes: the counter is reloaded from
         // reg 0x0A at the top of the frame (line 0) AND on every VBlank line.
@@ -1036,6 +1254,26 @@ impl Vdp {
 
     /// Get V-scroll value for a given column and plane.
     /// `plane`: 0 = Scroll A, 1 = Scroll B.
+    ///
+    /// # Hardware behaviour
+    ///
+    /// Register 0x0B bit 2 selects the vertical-scroll mode:
+    /// - **Full-plane** (bit clear): a single VSRAM value scrolls the whole
+    ///   plane — `vsram[0]` for Scroll A, `vsram[1]` for Scroll B. Every column
+    ///   uses the same value.
+    /// - **2-cell-column** (bit set): VSRAM holds an independent vertical scroll
+    ///   for each 16-pixel (2-cell) column, stored as interleaved A/B pairs —
+    ///   `vsram[2*c]` = Scroll A, `vsram[2*c+1]` = Scroll B for column pair `c`.
+    ///
+    /// VSCROLL is consumed per-column as the beam advances left-to-right across
+    /// the line, so a VSRAM write made part-way through the active line only
+    /// affects the 2-cell columns the beam has not yet rendered. The span-based
+    /// renderer models this: a recorded mid-line VSRAM change is applied at its
+    /// beam dot, so columns to its right pick up the new value while columns to
+    /// its left keep the old one.
+    ///
+    /// Sources: Charles MacDonald, "Sega Genesis VDP documentation" (vdp.txt),
+    /// and the plutiedev.com VDP scrolling documentation.
     #[must_use]
     fn vscroll_for_column(&self, col: u16, plane: u8) -> u16 {
         let per_2cell = self.registers[0x0B] & 0x04 != 0;
@@ -1153,12 +1391,6 @@ impl Vdp {
             return;
         }
 
-        let (h_cells, v_cells) = self.scroll_size();
-        let (hscroll_a, hscroll_b) = self.hscroll_for_line(line);
-        let nt_a = self.scroll_a_nametable_addr();
-        let nt_b = self.scroll_b_nametable_addr();
-
-        let bg_color = self.background_color();
         let y = line as usize;
 
         // Per-pixel compositing buffers
@@ -1170,22 +1402,192 @@ impl Vdp {
         //   2 = high-priority plane/sprite pixel
         let mut pixel_color = [[0u8; 4]; 320];
         let mut pixel_priority = [0u8; 320];
-
-        // Shadow/highlight mode gate (reg 0x0C bit 3). When disabled, rendering
-        // is byte-identical to a build without S/H support (no operator
-        // special-casing, plain framebuffer copy at writeback).
-        let sh = self.registers[0x0C] & 0x08 != 0;
         // Per-pixel operator-sprite modifier: 0 = none, 1 = shadow op, 2 = highlight op.
         // Only populated by render_sprites_on_line when `sh` is true.
         let mut sh_op = [0u8; 320];
 
+        // ---- Steps 1-3: backdrop + Scroll B + Scroll A/Window ----
+        //
+        // The plane layers are composited across the beam. On the common line no
+        // mid-line write was recorded, so a SINGLE full-width span reproduces the
+        // original atomic render byte-for-byte (FAST PATH). When mid-line events
+        // exist, the line is split into spans: render from the start-of-line
+        // baseline, apply each recorded change at its dot, and render the next
+        // span — so a palette / backdrop / scroll / VSRAM write part-way across
+        // the line is reflected only in the pixels to its right (SPAN PATH).
+        if self.line_events.is_empty() || self.line_baseline.is_none() {
+            // FAST PATH — byte-identical to the pre-mid-line atomic render.
+            let hscroll = self.hscroll_for_line(line);
+            self.render_planes_span(line, 0, width, hscroll, &mut pixel_color, &mut pixel_priority);
+        } else {
+            // SPAN PATH. Save end-of-line state, rewind the tracked quantities to
+            // the baseline, walk events applying each at its dot, then restore
+            // the end-of-line state (so sprites / S/H / left-column below use the
+            // final register/CRAM values).
+            let saved_registers = self.registers;
+            let saved_cram = self.cram;
+            let saved_vsram = self.vsram;
+            let baseline = self
+                .line_baseline
+                .take()
+                .expect("baseline present when events recorded");
+            let events = std::mem::take(&mut self.line_events);
+
+            self.registers = baseline.registers;
+            self.cram = baseline.cram;
+            self.vsram = baseline.vsram;
+            let mut hscroll = baseline.hscroll;
+            let mut span_start: u16 = 0;
+            for ev in &events {
+                let dot = ev.dot.min(width);
+                self.render_planes_span(
+                    line,
+                    span_start,
+                    dot,
+                    hscroll,
+                    &mut pixel_color,
+                    &mut pixel_priority,
+                );
+                match ev.change {
+                    LineChange::Register { reg, value } => {
+                        self.registers[reg as usize] = value;
+                    }
+                    LineChange::Cram { index, value } => {
+                        self.cram[index as usize] = value;
+                    }
+                    LineChange::Vsram { index, value } => {
+                        if (index as usize) < VSRAM_ENTRIES {
+                            self.vsram[index as usize] = value;
+                        }
+                    }
+                    LineChange::Hscroll { plane, value } => {
+                        if plane == 0 {
+                            hscroll.0 = value as i16;
+                        } else {
+                            hscroll.1 = value as i16;
+                        }
+                    }
+                }
+                span_start = dot;
+            }
+            // Final span from the last event to the right edge.
+            self.render_planes_span(
+                line,
+                span_start,
+                width,
+                hscroll,
+                &mut pixel_color,
+                &mut pixel_priority,
+            );
+
+            // Restore the end-of-line state and hand the (now-empty of interest)
+            // event buffer back so its capacity is retained for the next line.
+            self.registers = saved_registers;
+            self.cram = saved_cram;
+            self.vsram = saved_vsram;
+            self.line_events = events;
+        }
+
+        // Shadow/highlight mode gate (reg 0x0C bit 3). When disabled, rendering
+        // is byte-identical to a build without S/H support (no operator
+        // special-casing, plain framebuffer copy at writeback). Sprites and the
+        // S/H writeback use END-OF-LINE CRAM / registers: the supported mid-line
+        // split is backdrop / plane / palette across the beam for the scroll
+        // layers, while sprite colors and the S/H pass sample the final CRAM
+        // (a documented approximation — mid-line CRAM changes are reflected in
+        // plane pixels per span but not retroactively in sprites).
+        let sh = self.registers[0x0C] & 0x08 != 0;
+        let bg_color = self.background_color();
+
+        // Step 4: Sprites
+        self.render_sprites_on_line(
+            line,
+            width,
+            &mut pixel_color,
+            &mut pixel_priority,
+            sh,
+            &mut sh_op,
+        );
+
+        // Step 5: Left column blank (register 0, bit 5)
+        if self.registers[0] & 0x20 != 0 {
+            for pixel in pixel_color.iter_mut().take(8) {
+                *pixel = bg_color;
+            }
+        }
+
+        // Write final pixel data to framebuffer
+        if sh {
+            // Shadow/highlight: derive per-pixel base intensity from the winning
+            // pixel's priority, fold in any operator-sprite modifier, then apply.
+            for (x, color) in pixel_color.iter().take(stride).enumerate() {
+                // Base: high-priority winners are Normal, everything else Shadow.
+                let base: u8 = if pixel_priority[x] == 2 { 1 } else { 0 };
+                let intensity = match (base, sh_op[x]) {
+                    (_, 0) => base,                    // no operator
+                    (0, 2) => 1,                       // Shadow  + Highlight op -> Normal
+                    (1, 2) => 2,                       // Normal  + Highlight op -> Highlight
+                    (2, 2) => 2,                       // Highlight + Highlight op -> Highlight
+                    (2, 1) => 1,                       // Highlight + Shadow op -> Normal
+                    (1, 1) => 0,                       // Normal  + Shadow op -> Shadow
+                    (0, 1) => 0,                       // Shadow  + Shadow op -> Shadow
+                    _ => base,
+                };
+                let out = Self::apply_intensity(*color, intensity);
+                let offset = (y * stride + x) * 4;
+                self.framebuffer[offset..offset + 4].copy_from_slice(&out);
+            }
+        } else {
+            for (x, color) in pixel_color.iter().take(stride).enumerate() {
+                let offset = (y * stride + x) * 4;
+                self.framebuffer[offset..offset + 4].copy_from_slice(color);
+            }
+        }
+
+        self.in_hblank = false;
+    }
+
+    /// Composites the backdrop + Scroll B + Scroll A/Window planes into the
+    /// pixel buffers for the half-open pixel range `[x0, x1)` of `line`.
+    ///
+    /// This is exactly the original render_scanline Steps 1-3, parameterised by
+    /// an x span and the horizontal-scroll pair to use (passed in rather than
+    /// re-derived, because HSCROLL for a span comes from the mid-line-tracked
+    /// value, not a fresh VRAM read). Every other input — backdrop color, scroll
+    /// sizes, nametable bases, VSRAM, CRAM, window geometry — is read from
+    /// `self`, so the span reflects whatever register/CRAM/VSRAM state the caller
+    /// has installed for this span. Called once at full width on the fast path
+    /// (byte-identical to the atomic render) and once per span on the span path.
+    #[allow(clippy::too_many_arguments)]
+    fn render_planes_span(
+        &self,
+        line: u16,
+        x0: u16,
+        x1: u16,
+        hscroll: (i16, i16),
+        pixel_color: &mut [[u8; 4]; 320],
+        pixel_priority: &mut [u8; 320],
+    ) {
+        let width = self.frame_width;
+        let x0 = x0.min(width);
+        let x1 = x1.min(width);
+        if x0 >= x1 {
+            return;
+        }
+
+        let (h_cells, v_cells) = self.scroll_size();
+        let (hscroll_a, hscroll_b) = hscroll;
+        let nt_a = self.scroll_a_nametable_addr();
+        let nt_b = self.scroll_b_nametable_addr();
+        let bg_color = self.background_color();
+
         // Step 1: Background fill
-        for pixel in pixel_color.iter_mut().take(stride) {
-            *pixel = bg_color;
+        for x in x0..x1 {
+            pixel_color[x as usize] = bg_color;
         }
 
         // Step 2: Scroll B (lowest priority plane)
-        for x in 0..width {
+        for x in x0..x1 {
             let vscroll_b = self.vscroll_for_column(x / 8, 1);
             let plane_y = line.wrapping_add(vscroll_b) % (v_cells * 8);
             // H-scroll: the scroll value is SUBTRACTED (scrolls right = positive value
@@ -1214,7 +1616,7 @@ impl Vdp {
         let nt_win = self.window_nametable_addr();
         let win_nt_width = self.window_nametable_width();
 
-        for x in 0..width {
+        for x in x0..x1 {
             let xi = x as usize;
             let in_window = window_active_on_line && x >= win_left && x < win_right;
 
@@ -1265,53 +1667,6 @@ impl Vdp {
                 }
             }
         }
-
-        // Step 4: Sprites
-        self.render_sprites_on_line(
-            line,
-            width,
-            &mut pixel_color,
-            &mut pixel_priority,
-            sh,
-            &mut sh_op,
-        );
-
-        // Step 5: Left column blank (register 0, bit 5)
-        if self.registers[0] & 0x20 != 0 {
-            for pixel in pixel_color.iter_mut().take(8) {
-                *pixel = bg_color;
-            }
-        }
-
-        // Write final pixel data to framebuffer
-        if sh {
-            // Shadow/highlight: derive per-pixel base intensity from the winning
-            // pixel's priority, fold in any operator-sprite modifier, then apply.
-            for (x, color) in pixel_color.iter().take(stride).enumerate() {
-                // Base: high-priority winners are Normal, everything else Shadow.
-                let base: u8 = if pixel_priority[x] == 2 { 1 } else { 0 };
-                let intensity = match (base, sh_op[x]) {
-                    (_, 0) => base,                    // no operator
-                    (0, 2) => 1,                       // Shadow  + Highlight op -> Normal
-                    (1, 2) => 2,                       // Normal  + Highlight op -> Highlight
-                    (2, 2) => 2,                       // Highlight + Highlight op -> Highlight
-                    (2, 1) => 1,                       // Highlight + Shadow op -> Normal
-                    (1, 1) => 0,                       // Normal  + Shadow op -> Shadow
-                    (0, 1) => 0,                       // Shadow  + Shadow op -> Shadow
-                    _ => base,
-                };
-                let out = Self::apply_intensity(*color, intensity);
-                let offset = (y * stride + x) * 4;
-                self.framebuffer[offset..offset + 4].copy_from_slice(&out);
-            }
-        } else {
-            for (x, color) in pixel_color.iter().take(stride).enumerate() {
-                let offset = (y * stride + x) * 4;
-                self.framebuffer[offset..offset + 4].copy_from_slice(color);
-            }
-        }
-
-        self.in_hblank = false;
     }
 
     /// Renders sprites that intersect the given scanline.
@@ -1530,7 +1885,7 @@ mod tests {
     fn register_write() {
         let mut vdp = Vdp::new();
         // Write 0x42 to register 5: command = 0x8542
-        vdp.write_control(0x8542);
+        vdp.write_control(0x8542, None);
         assert_eq!(vdp.registers[5], 0x42);
     }
 
@@ -1538,7 +1893,7 @@ mod tests {
     fn auto_increment_register() {
         let mut vdp = Vdp::new();
         // Set auto-increment (reg 0x0F) to 2
-        vdp.write_control(0x8F02);
+        vdp.write_control(0x8F02, None);
         assert_eq!(vdp.auto_increment, 2);
     }
 
@@ -1546,18 +1901,18 @@ mod tests {
     fn vram_write_and_read() {
         let mut vdp = Vdp::new();
         // Set auto-increment to 2
-        vdp.write_control(0x8F02);
+        vdp.write_control(0x8F02, None);
         // Set up VRAM write to address 0x0000
         // First word:  CD1-0=01 (VRAM write), A13-0=0x0000 -> 0x4000
         // Second word: CD5-2=0000, A15-14=00 -> 0x0000
-        vdp.write_control(0x4000);
-        vdp.write_control(0x0000);
+        vdp.write_control(0x4000, None);
+        vdp.write_control(0x0000, None);
         // Write data
-        vdp.write_data(0xABCD);
+        vdp.write_data(0xABCD, None);
 
         // Set up VRAM read from address 0x0000
-        vdp.write_control(0x0000);
-        vdp.write_control(0x0000);
+        vdp.write_control(0x0000, None);
+        vdp.write_control(0x0000, None);
         let val = vdp.read_data();
         assert_eq!(val, 0xABCD);
     }
@@ -1565,14 +1920,14 @@ mod tests {
     #[test]
     fn cram_write_masks_to_9bit() {
         let mut vdp = Vdp::new();
-        vdp.write_control(0x8F02);
+        vdp.write_control(0x8F02, None);
         // CRAM write: CD=0011 -> first word has CD1-0=11, addr=0
-        vdp.write_control(0xC000);
-        vdp.write_control(0x0000);
-        vdp.write_data(0xFFFF);
+        vdp.write_control(0xC000, None);
+        vdp.write_control(0x0000, None);
+        vdp.write_data(0xFFFF, None);
         // Should be masked to 0x0EEE
-        vdp.write_control(0x0000); // CRAM read setup
-        vdp.write_control(0x0020); // CD5-2=1000
+        vdp.write_control(0x0000, None); // CRAM read setup
+        vdp.write_control(0x0020, None); // CD5-2=1000
         // Direct check via snapshot
         let snap = vdp.snapshot();
         assert_eq!(snap.cram[0], 0x0EEE);
@@ -1943,7 +2298,7 @@ mod tests {
 
         // The fill value comes from data port write
         // High byte (0xFF) gets written to each address
-        vdp.write_data(0xFF00);
+        vdp.write_data(0xFF00, None);
 
         // First word should be the full write value
         assert_eq!(vdp.vram[0], 0xFF);
@@ -1983,8 +2338,8 @@ mod tests {
         // -> first = 0x4000
         // Second word: bits 7-2 = CD5-2 = 1000_00, bits 1-0 = addr high = 00
         // -> second = 0x0080
-        vdp.write_control(0x4000);
-        vdp.write_control(0x0080);
+        vdp.write_control(0x4000, None);
+        vdp.write_control(0x0080, None);
 
         // DMA should now be pending
         assert!(vdp.dma_pending());
