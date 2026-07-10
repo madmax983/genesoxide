@@ -69,15 +69,15 @@ Z80_VENDORED=(
     "dd 21" "dd cb __ 46"
 )
 # m68k: upstream opcode base names (converter appends .json.bin on output).
-# NOTE: BTST/BSET (cycle timing), LINK (LINK A7 quirk) and DIVU (N flag) are
-# deliberately omitted from the committed vendored set — the current 68000 core
-# disagrees with upstream on those (real core bugs). Re-add them here to
-# regenerate vectors for debugging against the full corpus.
+# NOTE: BTST/BSET (cycle timing), LINK (LINK A7 quirk) and DIVU (overflow N/Z)
+# were previously omitted for known core discrepancies; those core bugs are now
+# fixed, so the four opcodes are vendored and covered at 100%.
 M68K_VENDORED=(
     "MOVE.b" "MOVE.l" "MOVEA.l" "MOVEM.l" "ADD.w" "ADDA.l" "SUB.w" "ADDX.w"
     "CMP.l" "AND.w" "OR.l" "EOR.w" "NOT.l" "ASL.w" "LSR.l" "ROXL.w"
     "Bcc" "DBcc" "JSR" "RTS" "PEA" "Scc" "SWAP"
     "EXG" "LEA" "TST.l" "CLR.w" "MULU" "ABCD"
+    "BTST" "BSET" "LINK" "DIVU"
 )
 
 # URL-encode spaces (the only special char in these names) as %20.

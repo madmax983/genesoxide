@@ -82,7 +82,9 @@ use std::path::{Path, PathBuf};
 
 /// Minimum number of committed m68k vendored opcode files a clean checkout MUST
 /// contain. Fewer than this means the committed data was stripped — a hard fail.
-pub const M68K_VENDORED_MIN: usize = 25;
+/// The committed set is 33 opcodes (including the now-fixed BTST/BSET/LINK/DIVU);
+/// this floor keeps a small margin so a partial strip still fails loudly.
+pub const M68K_VENDORED_MIN: usize = 29;
 /// Minimum number of committed z80 vendored opcode files a clean checkout MUST
 /// contain.
 pub const Z80_VENDORED_MIN: usize = 25;

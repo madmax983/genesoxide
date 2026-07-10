@@ -32,8 +32,8 @@ Attribution: test vectors © the SingleStepTests project; see the upstream repo.
 The upstream gzipped JSON is converted to the packed little-endian `.json.bin`
 format by our own tool, `crates/genesoxide-test-harness/examples/sst_json2bin.rs`
 (freely licensed as part of genesoxide). Only a **representative subset** is
-committed: 29 curated opcodes, each **truncated to the first 150 vectors**
-(upstream ships thousands per opcode), for a ~1.6 MB footprint. The exact list is
+committed: 33 curated opcodes, each **truncated to the first 150 vectors**
+(upstream ships thousands per opcode), for a ~1.8 MB footprint. The exact list is
 the `VENDORED` constant in `m68k_suite.rs`.
 
 The converter injects the two prefetch words (opcode + first extension word) into
@@ -44,20 +44,21 @@ doc comment in `sst_json2bin.rs` for the byte-exact format and the prefetch mode
 These files MUST be present in a clean checkout: `m68k_suite.rs` **panics** (does
 not skip) if a vendored file is missing.
 
-### Excluded opcodes (known core discrepancies)
+### Previously-excluded opcodes (now fixed & covered)
 
-Four surveyed opcodes are intentionally NOT vendored because the current 68000
-core disagrees with the upstream vectors — real, pre-existing core bugs the
-harness now surfaces:
+Four opcodes were previously excluded because the 68000 core disagreed with the
+upstream vectors. Those core bugs are now **fixed**, and all four are vendored and
+covered here at 100%:
 
-- **BSET / BTST** — bit-op cycle counts off by 2
-- **LINK** — the `LINK A7` quirk (pushes the old SP instead of the decremented SP)
-- **DIVU** — N flag after division computed differently
+- **BTST** — `BTST Dn,#imm` timing corrected to 10 cycles (was 8)
+- **BSET** — register-destination timing is bit-dependent: 6/8 (dynamic) and
+  10/12 (static), 2 clocks faster when the target bit is in the low word
+- **LINK** — the `LINK A7` quirk now pushes the *decremented* SP (SP-4), not the
+  old SP
+- **DIVU** — overflow now **preserves** the incoming N/Z flags (the real MC68000
+  leaves N/Z unchanged on a DIVU overflow)
 
-They remain exercised by the opt-in full corpus; fixing them is left to the CPU
-workstream.
-
-Additionally, address-error / privilege exception vectors are skipped at run time
+Address-error / privilege exception vectors are skipped at run time
 (our core does not implement the group-0 exception stack frames these vectors
 assert — see `is_exception_test` and the `no_exception_suite` runner).
 

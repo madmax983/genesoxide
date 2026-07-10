@@ -1528,10 +1528,11 @@ fn exec_divu(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let remainder = dividend % divisor;
 
     if quotient > 0xFFFF {
-        // Overflow: register unchanged, V=1, C=0, N=1, Z=0
-        // (hardware always sets N on overflow since the result is large)
-        cpu.sr.set_flag(StatusRegister::N, true);
-        cpu.sr.set_flag(StatusRegister::Z, false);
+        // Overflow: register unchanged, V=1, C=0. N and Z are PRESERVED at
+        // their incoming values — the real MC68000 does not modify N/Z on a
+        // DIVU overflow. Empirically verified against all 625 SingleStepTests
+        // DIVU overflow vectors (initial N/Z == expected N/Z in every case;
+        // the "undefined" N=1/Z=0 used by some emulators does NOT match silicon).
         cpu.sr.set_flag(StatusRegister::V, true);
         cpu.sr.set_flag(StatusRegister::C, false);
     } else {
@@ -2207,6 +2208,16 @@ fn exec_btst(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             // BTST register (MC68000UM): dynamic = 6, static = 10.
             if dynamic { 6 } else { 10 }
         }
+        AddressingMode::Immediate => {
+            // BTST with an immediate-data source EA. The generic byte-EA cost
+            // (4 + ea = 8) runs 2 clocks low here; SST measures dynamic
+            // BTST Dn,#imm at 10. (Static #imm,#imm is not exercised by the
+            // corpus; 12 by symmetry with the memory static path.)
+            let bit = bit_num % 8;
+            let val = read_ea(cpu, ea, InstructionSize::Byte, bus);
+            cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
+            if dynamic { 10 } else { 12 }
+        }
         _ => {
             // Byte memory: bit mod 8
             let bit = bit_num % 8;
@@ -2231,8 +2242,16 @@ fn exec_bset(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
             let val = cpu.d[reg as usize];
             cpu.sr.set_flag(StatusRegister::Z, val & (1 << bit) == 0);
             cpu.d[reg as usize] = val | (1 << bit);
-            // BSET register (MC68000UM): dynamic = 8, static = 12.
-            if dynamic { 8 } else { 12 }
+            // Register-destination BSET is 2 clocks faster when the target bit
+            // lies in the low word ((bit % 32) < 16) — SST-measured on real
+            // silicon. dynamic = 6/8, static = 10/12.
+            let fast = bit < 16;
+            match (dynamic, fast) {
+                (true, true) => 6,
+                (true, false) => 8,
+                (false, true) => 10,
+                (false, false) => 12,
+            }
         }
         _ => {
             let (val, addr) = read_ea_with_addr(cpu, ea, InstructionSize::Byte, bus);
@@ -2524,7 +2543,13 @@ fn exec_rtr(cpu: &mut Cpu, bus: &mut dyn Bus) -> u32 {
 fn exec_link(cpu: &mut Cpu, opcode: u16, bus: &mut dyn Bus) -> u32 {
     let reg = (opcode & 7) as u8;
     let displacement = fetch_word(cpu, bus) as i16 as i32;
-    push_long(cpu, bus, cpu.read_a(reg));
+    // Predecrement SP BEFORE reading the register to push. For An == A7 this
+    // pushes the *decremented* SP itself (the documented "LINK A7" quirk); for
+    // any other An it pushes the register's unaffected value. Matches the SST
+    // LINK A7 (0x4E57) vectors, which expect the pushed longword to be SP-4.
+    let sp = cpu.sp().wrapping_sub(4);
+    cpu.set_sp(sp);
+    write_long(bus, sp & 0x00FF_FFFF, cpu.read_a(reg));
     cpu.write_a(reg, cpu.sp());
     let new_sp = (cpu.sp() as i32).wrapping_add(displacement) as u32;
     cpu.set_sp(new_sp);
