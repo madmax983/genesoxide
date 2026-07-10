@@ -482,7 +482,7 @@ fn sonic_green_hill_live_replay_matches_captured_audio() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); long-horizon replay, run with -- --ignored"]
 fn sonic_green_hill_long_live_replay_matches_captured_audio() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -1114,7 +1114,7 @@ fn sonic_z80_smps_trace() {
 
 /// Debug: dump VDP state during zone title card to diagnose z-ordering.
 #[test]
-#[ignore]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); VDP z-ordering diagnostic, run with -- --ignored"]
 fn sonic_title_card_debug() {
     let rom = match load_sonic() {
         Some(r) => r,

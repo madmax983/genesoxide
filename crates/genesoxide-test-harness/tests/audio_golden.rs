@@ -180,11 +180,15 @@ fn load_reference(path: &Path) -> Option<(u32, Vec<f32>)> {
 }
 
 #[test]
+#[ignore = "requires a local commercial Sonic ROM (see SONIC_ROM_PATH); run with -- --ignored"]
 fn advance_to_green_hill_music_leaves_capture_near_live_ym_activity() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "[genesoxide][audio_golden] Sonic ROM not found at SONIC_ROM_PATH — \
+                 place a commercial Sonic ROM there and run with -- --ignored to exercise this test."
+            );
             return;
         }
     };
@@ -7788,7 +7792,7 @@ fn sample_jump_metrics_reports_large_transitions() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_spectral_delta() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -7867,7 +7871,7 @@ fn diagnose_ghz_spectral_delta() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_mid_side_delta() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -7959,7 +7963,7 @@ fn diagnose_ghz_mid_side_delta() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_left_right_delta() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8051,7 +8055,7 @@ fn diagnose_ghz_left_right_delta() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_phase_delta() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8131,7 +8135,7 @@ fn diagnose_ghz_phase_delta() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_chip_balance() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8208,7 +8212,7 @@ fn diagnose_ghz_chip_balance() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_source_fit() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8332,7 +8336,7 @@ fn diagnose_ghz_source_fit() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_fixed_trusted_window_chip_isolation() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8448,7 +8452,7 @@ fn diagnose_ghz_fixed_trusted_window_chip_isolation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_fixed_trusted_window_ym_reference_isolation() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8603,7 +8607,7 @@ fn diagnose_ghz_fixed_trusted_window_ym_reference_isolation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_reference_normalization_consensus() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8808,7 +8812,7 @@ fn diagnose_ghz_reference_normalization_consensus() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_reference_normalized_profile_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -8992,7 +8996,7 @@ fn diagnose_ghz_reference_normalized_profile_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_reference_residual_stability() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -9187,7 +9191,7 @@ fn diagnose_ghz_reference_residual_stability() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_trusted_window_sections() {
     #[derive(Debug, Clone)]
     struct SectionMetrics {
@@ -9445,7 +9449,7 @@ fn diagnose_ghz_trusted_window_sections() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_worst_section_local_realign() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -9631,7 +9635,7 @@ fn diagnose_ghz_worst_section_local_realign() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_worst_section_reference_integrity() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -9867,7 +9871,7 @@ fn diagnose_ghz_worst_section_reference_integrity() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_worst_section_cross_capture_alignment() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10057,7 +10061,7 @@ fn diagnose_ghz_worst_section_cross_capture_alignment() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_sectioned_consensus_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10150,7 +10154,7 @@ fn diagnose_ghz_sectioned_consensus_profiles() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_sectioned_consensus_leaders() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10243,7 +10247,7 @@ fn diagnose_ghz_sectioned_consensus_leaders() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_mono_first_consensus_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10338,7 +10342,7 @@ fn diagnose_ghz_mono_first_consensus_profiles() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_mono_first_consensus_leaders() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10434,7 +10438,7 @@ fn diagnose_ghz_mono_first_consensus_leaders() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_mono_consensus_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10528,7 +10532,7 @@ fn diagnose_ghz_mono_consensus_profiles() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_mono_consensus_leaders() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10626,7 +10630,7 @@ fn diagnose_ghz_mono_consensus_leaders() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10722,7 +10726,7 @@ fn diagnose_ghz_hybrid_mono_consensus_profiles() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_leaders() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10826,7 +10830,7 @@ fn diagnose_ghz_hybrid_mono_consensus_leaders() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_psg_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10906,7 +10910,7 @@ fn diagnose_ghz_hybrid_mono_consensus_psg_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_crossfeed_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -10986,7 +10990,7 @@ fn diagnose_ghz_hybrid_mono_consensus_crossfeed_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_side_eq_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11089,7 +11093,7 @@ fn diagnose_ghz_hybrid_mono_consensus_side_eq_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_side_lowmid_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11192,7 +11196,7 @@ fn diagnose_ghz_hybrid_mono_consensus_side_lowmid_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_refined_side_lowmid_candidate_vs_current() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11282,7 +11286,7 @@ fn diagnose_ghz_refined_side_lowmid_candidate_vs_current() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_hybrid_mono_consensus_side_lowmid_q_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11380,7 +11384,7 @@ fn diagnose_ghz_hybrid_mono_consensus_side_lowmid_q_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_refined_side_lowmid_q_candidate_vs_current() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11470,7 +11474,7 @@ fn diagnose_ghz_refined_side_lowmid_q_candidate_vs_current() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_sectioned_side_consensus_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11670,7 +11674,7 @@ fn diagnose_ghz_sectioned_side_consensus_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_sectioned_side_weak_sections() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -11848,7 +11852,7 @@ fn diagnose_ghz_sectioned_side_weak_sections() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_sectioned_side_dynamics() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -12060,7 +12064,7 @@ fn diagnose_ghz_sectioned_side_dynamics() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_section_chip_side_balance() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -12217,7 +12221,7 @@ fn diagnose_ghz_dominant_section_chip_side_balance() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_pan_behavior_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -12406,7 +12410,7 @@ fn diagnose_ghz_dominant_pan_behavior_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_dynamics_primary_stereo_mix_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -12587,7 +12591,7 @@ fn diagnose_ghz_side_dynamics_primary_stereo_mix_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_dynamics_primary_side_eq_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -12762,7 +12766,7 @@ fn diagnose_ghz_side_dynamics_primary_side_eq_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_dynamics_primary_stereo_eq_combo_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -12954,7 +12958,7 @@ fn diagnose_ghz_side_dynamics_primary_stereo_eq_combo_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_pan_write_delay_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13104,7 +13108,7 @@ fn diagnose_ghz_pan_write_delay_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_pan_write_delay_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13220,7 +13224,7 @@ fn diagnose_ghz_pan_write_delay_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_ym_pan_edge_persistence_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13405,7 +13409,7 @@ fn diagnose_ghz_ym_pan_edge_persistence_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_pan_state_change_delay_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13551,7 +13555,7 @@ fn diagnose_ghz_pan_state_change_delay_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_ym_pan_states() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13694,7 +13698,7 @@ fn diagnose_ghz_dominant_ym_pan_states() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_ym_pan_history() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13854,7 +13858,7 @@ fn diagnose_ghz_dominant_ym_pan_history() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_reference_side_authority() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -13974,7 +13978,7 @@ fn diagnose_ghz_dominant_reference_side_authority() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_centered_ym_side_leak() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -14108,7 +14112,7 @@ fn diagnose_ghz_centered_ym_side_leak() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_forced_centered_pan_history() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -14243,7 +14247,7 @@ fn diagnose_ghz_forced_centered_pan_history() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_pan_history_horizon() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -14403,7 +14407,7 @@ fn diagnose_ghz_pan_history_horizon() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_pan_history_contributions() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -14654,7 +14658,7 @@ fn diagnose_ghz_channel_pan_history_contributions() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_side_softening_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -14831,7 +14835,7 @@ fn diagnose_ghz_channel_stem_side_softening_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_side_boost_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -15014,7 +15018,7 @@ fn diagnose_ghz_channel_stem_side_boost_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_side_transient_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -15194,7 +15198,7 @@ fn diagnose_ghz_channel_stem_side_transient_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_key_persistence_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -15472,7 +15476,7 @@ fn diagnose_ghz_channel_stem_key_persistence_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_key_delayed_persistence_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -15746,7 +15750,7 @@ fn diagnose_ghz_channel_stem_key_delayed_persistence_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_key_triggered_transient_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -15993,7 +15997,7 @@ fn diagnose_ghz_channel_stem_key_triggered_transient_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_soundlog_tone_change_transient_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -16260,7 +16264,7 @@ fn diagnose_ghz_soundlog_tone_change_transient_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_side_delay_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -16520,7 +16524,7 @@ fn diagnose_ghz_channel_stem_side_delay_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_side_delay_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -16785,7 +16789,7 @@ fn diagnose_ghz_channel_stem_side_delay_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_channel_stem_delay_transient_hybrid() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -16962,7 +16966,7 @@ fn diagnose_ghz_channel_stem_delay_transient_hybrid() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_transient_mix_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17099,7 +17103,7 @@ fn diagnose_ghz_side_transient_mix_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_weak_section_reference_side_transients() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17220,7 +17224,7 @@ fn diagnose_ghz_weak_section_reference_side_transients() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_trusted_window_side_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17351,7 +17355,7 @@ fn diagnose_ghz_trusted_window_side_profiles() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_reference_consensus() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17438,7 +17442,7 @@ fn diagnose_ghz_reference_consensus() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_consensus_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17517,7 +17521,7 @@ fn diagnose_ghz_consensus_profiles() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_consensus_leaders() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17752,7 +17756,7 @@ fn ym2612_event_kind_index(kind: Ym2612TrackedEventKind) -> usize {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_soundlog_ym2612_events() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -17856,7 +17860,7 @@ fn diagnose_ghz_soundlog_ym2612_events() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_soundlog_dominant_sections() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -18036,7 +18040,7 @@ fn diagnose_ghz_soundlog_dominant_sections() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_tone_change_causality() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -18256,7 +18260,7 @@ fn diagnose_ghz_dominant_tone_change_causality() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_key_causality() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -18427,7 +18431,7 @@ fn diagnose_ghz_dominant_key_causality() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_key_delay_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -18599,7 +18603,7 @@ fn diagnose_ghz_dominant_key_delay_sweep() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_dominant_key_delay_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -18752,7 +18756,7 @@ fn diagnose_ghz_dominant_key_delay_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_ch4_tone_change_causality() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -18921,7 +18925,7 @@ fn diagnose_ghz_ch4_tone_change_causality() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_ch4_windowed_pan_causality() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19100,7 +19104,7 @@ fn compare_audio(emu: &[f32], reference: &[f32]) -> (f32, f32, f32) {
 ///   cargo run -p genesoxide-desktop -- dump-audio <sonic_rom> \
 ///     --skip 320 --frames 600 --output sonic_ghz_emu.wav
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_core_ym_channel_side_memory_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19222,7 +19226,7 @@ fn diagnose_ghz_core_ym_channel_side_memory_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_core_ym_channel_side_memory_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19364,7 +19368,7 @@ fn diagnose_ghz_core_ym_channel_side_memory_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_core_ym_channel_side_memory_ch45_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19521,7 +19525,7 @@ fn diagnose_ghz_core_ym_channel_side_memory_ch45_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_width_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19680,7 +19684,7 @@ fn diagnose_ghz_side_memory_width_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_strength_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19843,7 +19847,7 @@ fn diagnose_ghz_side_memory_strength_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_core_ym_channel_key_delay_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -19977,7 +19981,7 @@ fn diagnose_ghz_core_ym_channel_key_delay_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_reference_authority_and_ablation() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -20098,7 +20102,7 @@ fn diagnose_ghz_reference_authority_and_ablation() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_16bap_side_weight_sweep() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -20181,11 +20185,15 @@ fn diagnose_ghz_16bap_side_weight_sweep() {
 }
 
 #[test]
+#[ignore = "requires a local commercial Sonic ROM (see SONIC_ROM_PATH) + GHZ reference audio (sonic_ghz.flac/.wav) in tests/reference_audio/; run with -- --ignored"]
 fn sonic_ghz_audio_comparison() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "[genesoxide][audio_golden] Sonic ROM not found at SONIC_ROM_PATH — \
+                 place a commercial Sonic ROM there and run with -- --ignored to exercise this test."
+            );
             return;
         }
     };
@@ -20200,8 +20208,10 @@ fn sonic_ghz_audio_comparison() {
     let ref_path = match ref_path {
         Some(p) => p,
         None => {
-            eprintln!("No reference audio found in {REFERENCE_DIR}, skipping comparison");
-            eprintln!("Place sonic_ghz.flac or sonic_ghz.wav there to enable this test");
+            eprintln!(
+                "[genesoxide][audio_golden] No GHZ reference audio in {REFERENCE_DIR} — \
+                 place sonic_ghz.flac or sonic_ghz.wav there to enable this comparison."
+            );
             return;
         }
     };
@@ -20789,7 +20799,7 @@ fn sonic_ghz_audio_comparison() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_output_profiles() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21118,7 +21128,7 @@ fn diagnose_ghz_output_profiles() {
 /// Self-test: generate a WAV dump of the emulator's audio for manual inspection.
 /// This writes to the reference_audio dir for easy A/B comparison.
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn generate_sonic_ghz_wav() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21149,7 +21159,7 @@ fn generate_sonic_ghz_wav() {
 /// Generate a WAV of the title screen music (FM-active period).
 /// Skips to frame 480 (after SEGA jingle finishes) and records 300 frames (~5s).
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn generate_sonic_title_wav() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21216,7 +21226,7 @@ fn generate_sonic_title_wav() {
 /// Distortion characterization: analyzes the Sonic title audio for specific
 /// distortion signatures (clipping, aliasing, discontinuities).
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn distortion_analysis() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21330,7 +21340,7 @@ fn distortion_analysis() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_title_distortion_sign_align_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21387,7 +21397,7 @@ fn diagnose_title_distortion_sign_align_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_distortion_sign_align_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21444,7 +21454,7 @@ fn diagnose_ghz_distortion_sign_align_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_master_gain_clip_tradeoff() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21570,7 +21580,7 @@ fn write_wav(path: &Path, sample_rate: u32, samples: &[f32]) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_decay_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21730,7 +21740,7 @@ fn diagnose_ghz_side_memory_decay_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_micro_decay_candidates() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -21890,7 +21900,7 @@ fn diagnose_ghz_side_memory_micro_decay_candidates() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_micro_decay_amount_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -22050,7 +22060,7 @@ fn diagnose_ghz_side_memory_micro_decay_amount_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_micro_decay_amount_refine_2() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -22228,7 +22238,7 @@ fn diagnose_ghz_side_memory_micro_decay_amount_refine_2() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_stereo_candidate_tradeoffs_after_side_memory_promotion() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -22365,7 +22375,7 @@ fn diagnose_ghz_stereo_candidate_tradeoffs_after_side_memory_promotion() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_post_q_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -22520,7 +22530,7 @@ fn diagnose_ghz_side_memory_post_q_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_post_q_refine_2() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -22686,7 +22696,7 @@ fn diagnose_ghz_side_memory_post_q_refine_2() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_post_q_refine_3() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -22843,7 +22853,7 @@ fn diagnose_ghz_side_memory_post_q_refine_3() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_transient_mix_refine() {
     let rom = match load_sonic() {
         Some(r) => r,
@@ -23019,7 +23029,7 @@ fn diagnose_ghz_side_memory_transient_mix_refine() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "opt-in GHZ/Sonic audio-tuning diagnostic; requires a local commercial Sonic ROM (see SONIC_ROM_PATH) and/or reference audio in tests/reference_audio/. Run with -- --ignored"]
 fn diagnose_ghz_side_memory_sign_align_refine() {
     let rom = match load_sonic() {
         Some(r) => r,

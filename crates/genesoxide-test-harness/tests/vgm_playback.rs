@@ -459,7 +459,7 @@ fn frequency_multiplier() {
 /// Play a VGM file through our YM2612 and save output WAV.
 /// Optionally compare against a Nuked-OPN2 reference WAV.
 #[test]
-#[ignore] // Run explicitly: cargo test --test vgm_playback vgm_file_playback -- --ignored --nocapture
+#[ignore = "requires .vgm/.vgz files in tests/vgm_files/ (optional reference WAVs in tests/vgm_reference/); run with -- --ignored"]
 fn vgm_file_playback() {
     ensure_output_dir();
     let vgm_dir = Path::new(VGM_DIR);
