@@ -150,6 +150,27 @@ pub struct VdpSnapshot {
     /// mode. Defaults to NTSC for save states written before region support.
     #[serde(default)]
     pub region: Region,
+    /// Latched sprite-overflow status flag (status bit 6) — set during sprite
+    /// rendering when the per-line sprite count or dot budget is exceeded,
+    /// cleared when the status register is read.
+    #[serde(default)]
+    pub sprite_overflow: bool,
+    /// Latched sprite-collision status flag (status bit 5) — set when two
+    /// non-transparent sprite pixels overlap on a line, cleared when the status
+    /// register is read.
+    #[serde(default)]
+    pub sprite_collision: bool,
+    /// Whether the PREVIOUS scanline overflowed its sprite budget. Consumed by
+    /// the X=0 sprite-masking "Mode 2" exception (see `render_sprites_on_line`).
+    #[serde(default)]
+    pub prev_line_sprite_overflow: bool,
+    /// Number of entries currently queued in the VDP write FIFO (0..=4). Drives
+    /// the FIFO-empty (status bit 9) and FIFO-full (status bit 8) bits.
+    #[serde(default)]
+    pub fifo_len: u8,
+    /// CPU cycles remaining until the next FIFO slot drains an entry.
+    #[serde(default)]
+    pub fifo_drain_counter: u16,
 }
 
 /// Maximum sprites evaluated per frame (H40 mode).
@@ -297,6 +318,39 @@ pub struct Vdp {
     /// transfer completes.
     dma_busy_cpu_cycles: u32,
 
+    // ---- Sprite overflow / collision (persistent, read-to-clear) ----
+    //
+    /// Latched sprite-overflow flag (status bit 6). Set during sprite rendering
+    /// when a line exceeds the per-line sprite COUNT limit (20 H40 / 16 H32) or
+    /// the per-line sprite pixel-DOT budget (320 H40 / 256 H32). Cleared when
+    /// the status register is read (read-to-clear).
+    sprite_overflow: bool,
+    /// Latched sprite-collision flag (status bit 5). Set when two non-transparent
+    /// sprite pixels would occupy the same screen position on a line. Cleared
+    /// when the status register is read (read-to-clear).
+    sprite_collision: bool,
+    /// Whether the PREVIOUS scanline overflowed its sprite budget. The X=0
+    /// sprite-masking "Mode 2" exception consults this (see
+    /// [`Vdp::render_sprites_on_line`]); it is updated at the end of each line so
+    /// the current line always sees the previous line's value.
+    prev_line_sprite_overflow: bool,
+
+    // ---- Write FIFO (persistent status/timing; data write is instant) ----
+    //
+    /// Number of entries queued in the VDP write FIFO (0..=4). The FIFO models
+    /// write back-pressure timing and the empty/full status bits ONLY; the
+    /// underlying VRAM/CRAM/VSRAM write is still applied instantly (see
+    /// [`Vdp::write_data`]), a deliberate documented approximation that keeps
+    /// memory contents and read-back deterministic.
+    fifo_len: u8,
+    /// CPU cycles remaining until the next FIFO slot drains one queued entry.
+    fifo_drain_counter: u16,
+    /// Extra CPU cycles the 68000 owes because a data-port write found the FIFO
+    /// full and was stalled off the bus. Accumulated by [`Vdp::write_data`] and
+    /// drained by the core after the instruction completes. Transient (per
+    /// instruction), so it is NOT part of [`VdpSnapshot`].
+    pending_write_stall: u32,
+
     // ---- Mid-line raster recording (transient per-line state) ----
     //
     // These three fields implement TRUE mid-line raster: a register/CRAM/VSRAM/
@@ -346,6 +400,12 @@ impl Vdp {
             odd_frame: false,
             vint_pending: false,
             dma_busy_cpu_cycles: 0,
+            sprite_overflow: false,
+            sprite_collision: false,
+            prev_line_sprite_overflow: false,
+            fifo_len: 0,
+            fifo_drain_counter: 0,
+            pending_write_stall: 0,
             line_events: Vec::new(),
             line_baseline: None,
             recording_line: false,
@@ -541,16 +601,29 @@ impl Vdp {
     /// timed live-CPU write whose CRAM / VSRAM / (per-line HSCROLL-slot) VRAM
     /// change is recorded as a mid-line event; `None` applies globally without
     /// recording.
-    pub fn write_data(&mut self, value: u16, dot: Option<u16>) {
+    ///
+    /// Returns the extra CPU cycles the 68000 must stall because the write FIFO
+    /// was full when this data-port write arrived (0 on the common non-full
+    /// path). The value is also accumulated into `pending_write_stall` so the
+    /// core can charge it after the instruction even when the caller ignores the
+    /// return value.
+    pub fn write_data(&mut self, value: u16, dot: Option<u16>) -> u32 {
         // Reset control state on data port access
         self.control_state = ControlState::Idle;
 
-        // Check if this data write triggers a VRAM fill DMA
+        // Check if this data write triggers a VRAM fill DMA. A fill is charged
+        // via the DMA-busy cycle budget, not the FIFO, so no FIFO entry here.
         if self.dma_fill_pending {
             self.dma_fill_pending = false;
             self.execute_dma_fill(value);
-            return;
+            return 0;
         }
+
+        // Each data-port write enqueues one FIFO entry; if the FIFO was full the
+        // CPU is stalled until a slot drains. The data itself is still written
+        // instantly below (documented approximation — see the FIFO section).
+        let stall = self.fifo_push(self.in_blanking());
+        self.pending_write_stall = self.pending_write_stall.saturating_add(stall);
 
         let record = self.record_dot(dot);
         match self.access_type {
@@ -606,6 +679,7 @@ impl Vdp {
             _ => {}
         }
         self.address = self.address.wrapping_add(self.auto_increment);
+        stall
     }
 
     /// Returns the recordable beam dot for a timed write, or `None` when the
@@ -742,12 +816,22 @@ impl Vdp {
         }
     }
 
-    /// Reads the VDP status register.
+    /// Computes the VDP status-register value WITHOUT any read side effects.
+    ///
+    /// This is the non-mutating peek used by the debug bus. The real 68000 /
+    /// Z80 status read goes through [`Vdp::read_status`], which additionally
+    /// clears the read-to-clear sprite flags.
     #[must_use]
-    pub fn read_status(&self) -> u16 {
+    pub fn status_bits(&self) -> u16 {
         let mut status: u16 = 0x3400; // Always set bits
-        // Bit 9: FIFO empty (always set — no FIFO emulation)
-        status |= 0x0200;
+        // Bit 9: FIFO empty — set only when the write FIFO has drained fully.
+        if self.fifo_len == 0 {
+            status |= 0x0200;
+        }
+        // Bit 8: FIFO full — set when all four FIFO slots are occupied.
+        if self.fifo_len >= 4 {
+            status |= 0x0100;
+        }
         // Bit 3: V-blank
         if self.in_vblank {
             status |= 0x0008;
@@ -772,7 +856,34 @@ impl Vdp {
         if self.vint_pending {
             status |= 0x0080;
         }
+        // Bit 6: Sprite overflow (latched, read-to-clear).
+        if self.sprite_overflow {
+            status |= 0x0040;
+        }
+        // Bit 5: Sprite collision (latched, read-to-clear).
+        if self.sprite_collision {
+            status |= 0x0020;
+        }
         status
+    }
+
+    /// Reads the VDP status register, applying the hardware read-to-clear side
+    /// effect: the sprite-overflow (bit 6) and sprite-collision (bit 5) latches
+    /// are cleared once their state has been sampled into the returned value.
+    pub fn read_status(&mut self) -> u16 {
+        let status = self.status_bits();
+        // Read-to-clear: the sprite overflow/collision flags reset on read.
+        self.sprite_overflow = false;
+        self.sprite_collision = false;
+        status
+    }
+
+    /// Returns true while the beam is in horizontal or vertical blanking. Used
+    /// to select the FIFO drain rate (blanking has far more external access
+    /// slots than active display).
+    #[must_use]
+    pub fn in_blanking(&self) -> bool {
+        self.in_vblank || self.in_hblank
     }
 
     /// Returns the current HV counter value for a given intra-line beam position.
@@ -914,6 +1025,85 @@ impl Vdp {
     /// the core as the 68000 (or a stall) consumes cycles.
     pub fn advance_dma_busy(&mut self, cycles: u32) {
         self.dma_busy_cpu_cycles = self.dma_busy_cpu_cycles.saturating_sub(cycles);
+    }
+
+    // ---- Write FIFO back-pressure ----
+    //
+    // PRECISION: the FIFO models write back-pressure timing (the CPU stall a
+    // data-port write incurs when the FIFO is full) and the FIFO empty/full
+    // status bits ONLY. The actual VRAM/CRAM/VSRAM data write is still applied
+    // instantly in `write_data`, so memory contents and read-back stay correct
+    // and deterministic. This is a deliberate, documented approximation.
+
+    /// CPU cycles per FIFO drain slot for the current H32/H40 mode and beam
+    /// phase. The external-access slot counts per scanline (18/205 in H40,
+    /// 16/167 in H32 for active/blanking) mirror the same Software-Manual slot
+    /// rates the DMA byte/line table uses; the period is the per-line CPU-cycle
+    /// budget divided by the slots available on that line.
+    #[must_use]
+    fn fifo_slot_period_cpu(&self, blanking: bool) -> u16 {
+        let h40 = self.is_h40();
+        let slots_per_line: u32 = match (h40, blanking) {
+            (true, true) => 205,
+            (true, false) => 18,
+            (false, true) => 167,
+            (false, false) => 16,
+        };
+        (Self::CPU_CYCLES_PER_LINE / slots_per_line).max(1) as u16
+    }
+
+    /// Drains the write FIFO as `cpu_cycles` CPU cycles elapse, freeing one slot
+    /// each time the per-slot drain period is reached. `blanking` selects the
+    /// (much faster) blanking drain rate.
+    pub fn advance_fifo(&mut self, cpu_cycles: u32, blanking: bool) {
+        let period = self.fifo_slot_period_cpu(blanking).max(1);
+        let mut c = cpu_cycles;
+        while c > 0 && self.fifo_len > 0 {
+            let d = self.fifo_drain_counter as u32;
+            if c >= d {
+                c -= d;
+                self.fifo_len -= 1;
+                self.fifo_drain_counter = period;
+            } else {
+                self.fifo_drain_counter = (d - c) as u16;
+                c = 0;
+            }
+        }
+        if self.fifo_len == 0 {
+            self.fifo_drain_counter = period;
+        }
+    }
+
+    /// Enqueues one entry into the write FIFO and returns the extra CPU cycles
+    /// the 68000 must stall because the FIFO was full. When the FIFO already
+    /// holds four entries the CPU is held off the bus until a slot drains, so
+    /// the caller owes `fifo_drain_counter` cycles before the entry is accepted.
+    fn fifo_push(&mut self, blanking: bool) -> u32 {
+        let period = self.fifo_slot_period_cpu(blanking).max(1);
+        // Filling a previously-empty FIFO arms the head entry with a full drain
+        // period (mirrors `advance_fifo`'s empty-FIFO reset). Without this the
+        // drain counter could still be 0 from power-on, making a full-FIFO push
+        // report a zero stall.
+        if self.fifo_len == 0 {
+            self.fifo_drain_counter = period;
+        }
+        let mut stall = 0u32;
+        if self.fifo_len >= 4 {
+            // FIFO full: CPU is held off the bus until a slot drains.
+            stall = self.fifo_drain_counter as u32;
+            self.fifo_len -= 1;
+            self.fifo_drain_counter = period;
+        }
+        self.fifo_len += 1;
+        stall
+    }
+
+    /// Takes (and resets) the pending write-stall the CPU owes from a FIFO-full
+    /// data write during the just-executed instruction. Called by the core so
+    /// the stall cycles are charged to the 68000 / scheduler.
+    #[must_use]
+    pub fn take_pending_write_stall(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_write_stall)
     }
 
     /// Returns true if a V-interrupt (VIP) is latched and awaiting delivery.
@@ -1829,7 +2019,7 @@ impl Vdp {
     /// uses the 64-byte-stride addressing. Horizontal geometry, per-line sprite
     /// limits, masking and shadow/highlight handling are unchanged.
     fn render_sprites_on_line(
-        &self,
+        &mut self,
         out_y: u16,
         width: u16,
         pixel_color: &mut [[u8; 4]; 320],
@@ -1841,18 +2031,28 @@ impl Vdp {
         let sat_base = self.sprite_table_addr();
         let mut sprites_on_line: usize = 0;
         // Per-mode sprite limits: H40 evaluates 80 sprites/frame and 20/line,
-        // H32 evaluates 64/frame and 16/line. (The 256-px/line horizontal extent
-        // is already enforced by the `screen_x >= width` clip below; a separate
-        // per-line sprite-dot budget is future work.)
+        // H32 evaluates 64/frame and 16/line.
         let (max_total, max_per_line) = if self.is_h40() {
             (MAX_SPRITES_TOTAL_H40, MAX_SPRITES_PER_LINE_H40)
         } else {
             (MAX_SPRITES_TOTAL_H32, MAX_SPRITES_PER_LINE_H32)
         };
+        // Per-line sprite pixel-DOT budget: H40 fetches up to 320 sprite pixels
+        // per line, H32 up to 256. Once the cumulative width of the sprites
+        // processed this line exceeds it, the remaining (lower-priority) sprites
+        // are cut and the overflow flag is set — games rely on this for masking.
+        let dot_budget: u32 = if self.is_h40() { 320 } else { 256 };
+        let mut dot_total: u32 = 0;
         // Track which pixels already have a sprite — earlier sprites in the
         // link list have higher visual priority and should not be overwritten
         // by later sprites at the same priority level.
         let mut pixel_has_sprite = [false; 320];
+        // X=0 sprite masking bookkeeping (see the mask handling below).
+        let mut first_sprite_on_line = true;
+        // Whether THIS line overflowed (count or dot budget). Recorded into
+        // `prev_line_sprite_overflow` only at the very end, so the current line's
+        // masking logic sees the PREVIOUS line's value, not this line's.
+        let mut line_overflowed = false;
 
         // Walk the sprite link list
         let mut sprite_index: u8 = 0;
@@ -1883,12 +2083,68 @@ impl Vdp {
 
             // Check if this sprite intersects the current output row
             if out_y >= sprite_y && out_y < sprite_y.wrapping_add(sprite_height) {
+                // Per-line sprite COUNT limit reached: this is an overflow
+                // condition (like exceeding the dot budget) — latch it and stop.
                 if sprites_on_line >= max_per_line {
-                    break; // Max sprites per line reached
+                    self.sprite_overflow = true;
+                    line_overflowed = true;
+                    break;
                 }
 
-                let sprite_x = (word3 & 0x01FF).wrapping_sub(128);
+                // Raw X BEFORE the -128 screen offset. A raw X of 0 marks a
+                // "mask sprite" used for the sprite-masking mechanism.
+                let raw_x = word3 & 0x01FF;
+
+                // ---- X=0 sprite masking ----
+                // Source: Charles MacDonald's Genesis VDP notes and the
+                // Nemesis "Sprite Masking and Overflow Test" ROM, which document
+                // two masking modes:
+                //   Mode 1: a raw-X==0 mask sprite that is NOT the first sprite
+                //           on the line hides every remaining (lower-priority)
+                //           sprite on that scanline.
+                //   Mode 2: if the FIRST sprite on the line is a mask sprite AND
+                //           the PREVIOUS line overflowed its sprite budget, that
+                //           first mask sprite also masks the line.
+                // A first-on-line mask sprite with no prior-line overflow is
+                // inert: it sits fully off-screen (X = -128) and draws nothing,
+                // but still consumes a sprite/dot slot before the next sprite.
+                if raw_x == 0 {
+                    if !first_sprite_on_line || self.prev_line_sprite_overflow {
+                        // Mode 1 (not first) or Mode 2 (first + prev-line
+                        // overflow): masking triggers — stop the sprite walk.
+                        break;
+                    }
+                    // Inert first-on-line mask: count it (sprite + dot slot) and
+                    // move on without drawing anything.
+                    first_sprite_on_line = false;
+                    sprites_on_line += 1;
+                    dot_total += u32::from(h_size) * 8;
+                    if dot_total > dot_budget {
+                        self.sprite_overflow = true;
+                        line_overflowed = true;
+                        break;
+                    }
+                    if link == 0 {
+                        break;
+                    }
+                    sprite_index = link;
+                    continue;
+                }
+
+                first_sprite_on_line = false;
                 sprites_on_line += 1;
+
+                // Per-line sprite dot budget: accumulate this sprite's pixel
+                // width; if the running total exceeds the budget, cut it (and the
+                // rest of the line) and latch overflow.
+                dot_total += u32::from(h_size) * 8;
+                if dot_total > dot_budget {
+                    self.sprite_overflow = true;
+                    line_overflowed = true;
+                    break;
+                }
+
+                let sprite_x = raw_x.wrapping_sub(128);
 
                 // Decode sprite attributes
                 let priority = word2 & 0x8000 != 0;
@@ -1945,6 +2201,13 @@ impl Vdp {
                             continue;
                         }
 
+                        // Sprite collision: an opaque sprite pixel is about to be
+                        // placed where another opaque sprite pixel already sits on
+                        // this line — latch the collision flag (status bit 5).
+                        if pixel_has_sprite[xi] {
+                            self.sprite_collision = true;
+                        }
+
                         let pri_level = if priority { 2 } else { 1 };
 
                         // Sprite compositing rules:
@@ -1971,6 +2234,11 @@ impl Vdp {
             }
             sprite_index = link;
         }
+
+        // Publish this line's overflow state for the NEXT line's X=0 masking
+        // (Mode 2 exception). Done last so the walk above saw the previous
+        // line's value.
+        self.prev_line_sprite_overflow = line_overflowed;
     }
 
     /// Snapshot for save states.
@@ -1998,6 +2266,11 @@ impl Vdp {
             vint_pending: self.vint_pending,
             dma_busy_cpu_cycles: self.dma_busy_cpu_cycles,
             region: self.region,
+            sprite_overflow: self.sprite_overflow,
+            sprite_collision: self.sprite_collision,
+            prev_line_sprite_overflow: self.prev_line_sprite_overflow,
+            fifo_len: self.fifo_len,
+            fifo_drain_counter: self.fifo_drain_counter,
         }
     }
 
@@ -2025,6 +2298,11 @@ impl Vdp {
         self.vint_pending = snap.vint_pending;
         self.dma_busy_cpu_cycles = snap.dma_busy_cpu_cycles;
         self.region = snap.region;
+        self.sprite_overflow = snap.sprite_overflow;
+        self.sprite_collision = snap.sprite_collision;
+        self.prev_line_sprite_overflow = snap.prev_line_sprite_overflow;
+        self.fifo_len = snap.fifo_len;
+        self.fifo_drain_counter = snap.fifo_drain_counter;
         // frame_width and frame_interlace_double are derived per-frame caches
         // (not serialized). Recompute them from the restored registers so the
         // returned framebuffer dimensions are coherent even before the next frame
@@ -2887,7 +3165,7 @@ mod tests {
 
     #[test]
     fn status_register_fifo_empty_set() {
-        let vdp = Vdp::new();
+        let mut vdp = Vdp::new();
         assert_ne!(
             vdp.read_status() & 0x0200,
             0,
@@ -3166,7 +3444,7 @@ mod tests {
     /// in `read_status` until a transfer charges its cycle countdown.
     #[test]
     fn dma_busy_defaults_clear() {
-        let vdp = Vdp::new();
+        let mut vdp = Vdp::new();
         assert_eq!(vdp.dma_busy_cpu_cycles(), 0);
         assert!(!vdp.dma_busy());
         assert_eq!(vdp.read_status() & 0x0002, 0);
@@ -3298,5 +3576,193 @@ mod tests {
         restored.restore(&snap);
         assert!(restored.vint_pending());
         assert_eq!(restored.dma_busy_cpu_cycles(), 1234);
+    }
+
+    // ---- Sprite overflow / collision / masking + FIFO status ----
+
+    /// Writes one sprite entry (4 words) at `slot` in the active sprite table.
+    /// `y_raw`/`x_raw` are the raw hardware fields (screen = raw - 128).
+    /// `v_size`/`h_size` are the raw 2-bit size FIELDS (0-3 → 1-4 tiles).
+    fn write_sprite_entry(
+        vdp: &mut Vdp,
+        slot: usize,
+        y_raw: u16,
+        v_size: u8,
+        h_size: u8,
+        link: u8,
+        attr: u16,
+        x_raw: u16,
+    ) {
+        let sat = vdp.sprite_table_addr();
+        let base = sat + slot * 8;
+        let word1 =
+            (u16::from(h_size & 3) << 10) | (u16::from(v_size & 3) << 8) | u16::from(link & 0x7F);
+        vram_write_word(vdp, base, y_raw);
+        vram_write_word(vdp, base + 2, word1);
+        vram_write_word(vdp, base + 4, attr);
+        vram_write_word(vdp, base + 6, x_raw);
+    }
+
+    #[test]
+    fn sprite_overflow_bit_sets_and_clears_on_read() {
+        let mut vdp = Vdp::new();
+        vdp.sprite_overflow = true;
+        assert_ne!(vdp.read_status() & 0x0040, 0, "overflow bit 6 reported");
+        assert_eq!(
+            vdp.read_status() & 0x0040,
+            0,
+            "overflow bit is read-to-clear (cleared on the first read)"
+        );
+    }
+
+    #[test]
+    fn sprite_collision_bit_sets_and_clears_on_read() {
+        let mut vdp = Vdp::new();
+        vdp.sprite_collision = true;
+        assert_ne!(vdp.read_status() & 0x0020, 0, "collision bit 5 reported");
+        assert_eq!(
+            vdp.read_status() & 0x0020,
+            0,
+            "collision bit is read-to-clear (cleared on the first read)"
+        );
+    }
+
+    #[test]
+    fn fifo_empty_and_full_bits() {
+        let mut vdp = setup_vdp_for_rendering();
+        // Fresh: FIFO empty (bit 9 set), not full (bit 8 clear).
+        assert_ne!(vdp.status_bits() & 0x0200, 0, "empty bit set when drained");
+        assert_eq!(vdp.status_bits() & 0x0100, 0, "full bit clear when drained");
+
+        // Push four entries -> FIFO full.
+        for _ in 0..4 {
+            vdp.fifo_push(false);
+        }
+        assert_ne!(vdp.status_bits() & 0x0100, 0, "full bit set at 4 entries");
+        assert_eq!(vdp.status_bits() & 0x0200, 0, "empty bit clear when full");
+
+        // Drain enough cycles to empty the FIFO -> empty bit set again.
+        vdp.advance_fifo(10_000, false);
+        assert_eq!(vdp.fifo_len, 0, "FIFO fully drained");
+        assert_ne!(vdp.status_bits() & 0x0200, 0, "empty bit set after draining");
+        assert_eq!(vdp.status_bits() & 0x0100, 0, "full bit clear after draining");
+    }
+
+    #[test]
+    fn fifo_push_stalls_only_when_full() {
+        let mut vdp = setup_vdp_for_rendering();
+        // Not full: the first four pushes never stall.
+        for _ in 0..4 {
+            assert_eq!(vdp.fifo_push(false), 0, "no stall while the FIFO has room");
+        }
+        // Now full: the fifth push must stall for the current drain period.
+        let period = vdp.fifo_slot_period_cpu(false);
+        let stall = vdp.fifo_push(false);
+        assert_eq!(
+            stall,
+            u32::from(period),
+            "a full-FIFO push stalls for one drain period"
+        );
+    }
+
+    #[test]
+    fn exceeding_per_line_sprite_count_sets_overflow() {
+        let mut vdp = setup_vdp_for_rendering();
+        // A solid opaque tile so the sprites actually draw.
+        vdp.cram[1] = 0x000E;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+
+        // 25 one-cell sprites all on line 0 (y_raw 128 -> screen y 0), chained
+        // in link order 0->1->...->24, the last terminating the list. H40 allows
+        // only 20 sprites/line, so the 21st trips the overflow latch.
+        let attr = 0x0001; // palette 0, tile 1, low priority
+        for slot in 0..25usize {
+            let link = if slot == 24 { 0 } else { (slot + 1) as u8 };
+            let x_raw = 128 + (slot as u16 % 30) * 8;
+            write_sprite_entry(&mut vdp, slot, 0x0080, 1, 1, link, attr, x_raw);
+        }
+
+        vdp.render_scanline(0);
+        assert!(
+            vdp.sprite_overflow,
+            "more than 20 sprites on a line must latch the overflow flag"
+        );
+        assert_ne!(vdp.read_status() & 0x0040, 0, "overflow visible in status");
+    }
+
+    #[test]
+    fn exceeding_dot_budget_sets_overflow() {
+        let mut vdp = setup_vdp_for_rendering();
+        vdp.cram[1] = 0x000E;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+
+        // Eleven 4-cell-wide sprites (h_size field 3 -> 4 tiles = 32 px) on line
+        // 0: 11 * 32 = 352 px > the 320-px H40 dot budget, while 11 sprites stays
+        // under the 20/line COUNT limit, isolating the DOT-budget overflow path.
+        let attr = 0x0001;
+        for slot in 0..11usize {
+            let link = if slot == 10 { 0 } else { (slot + 1) as u8 };
+            write_sprite_entry(&mut vdp, slot, 0x0080, 0, 3, link, attr, 128);
+        }
+
+        vdp.render_scanline(0);
+        assert!(
+            vdp.sprite_overflow,
+            "exceeding the per-line sprite dot budget must latch overflow"
+        );
+    }
+
+    #[test]
+    fn overlapping_sprites_set_collision() {
+        let mut vdp = setup_vdp_for_rendering();
+        vdp.cram[1] = 0x000E;
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+
+        // Two opaque sprites occupying the same screen cell (x_raw 160 -> screen
+        // x 32) on line 0. The second sprite's pixels overlap the first's, so the
+        // collision flag must latch.
+        write_sprite_entry(&mut vdp, 0, 0x0080, 1, 1, 1, 0x0001, 160);
+        write_sprite_entry(&mut vdp, 1, 0x0080, 1, 1, 0, 0x0001, 160);
+
+        vdp.render_scanline(0);
+        assert!(
+            vdp.sprite_collision,
+            "two overlapping opaque sprite pixels must latch collision"
+        );
+        assert_ne!(vdp.read_status() & 0x0020, 0, "collision visible in status");
+    }
+
+    #[test]
+    fn x0_mask_after_first_sprite_hides_later_sprites() {
+        let mut vdp = setup_vdp_for_rendering();
+        vdp.cram[1] = 0x000E; // red, for the visible sprites
+        write_tile_pattern(&mut vdp, 1, &[[1u8; 8]; 8]);
+
+        // Sprite 0: a normal, visible sprite at screen x=32 (raw 160).
+        write_sprite_entry(&mut vdp, 0, 0x0080, 1, 1, 1, 0x0001, 160);
+        // Sprite 1: a mask sprite (raw X == 0). It is NOT the first sprite on the
+        // line, so it masks — every later sprite on the line is hidden.
+        write_sprite_entry(&mut vdp, 1, 0x0080, 1, 1, 2, 0x0001, 0);
+        // Sprite 2: a normal sprite at screen x=64 (raw 192) that MUST be hidden.
+        write_sprite_entry(&mut vdp, 2, 0x0080, 1, 1, 0, 0x0001, 192);
+
+        vdp.render_scanline(0);
+
+        let red = Vdp::color_to_rgba(0x000E);
+        // Sprite 0 drew at x=32.
+        let off0 = 32 * 4;
+        assert_eq!(
+            &vdp.framebuffer[off0..off0 + 4],
+            &red,
+            "the first (pre-mask) sprite is visible"
+        );
+        // Sprite 2 at x=64 was masked -> background (black backdrop).
+        let bg = vdp.background_color();
+        let off2 = 64 * 4;
+        assert_eq!(
+            &vdp.framebuffer[off2..off2 + 4],
+            &bg,
+            "the sprite behind the X=0 mask is hidden"
+        );
     }
 }

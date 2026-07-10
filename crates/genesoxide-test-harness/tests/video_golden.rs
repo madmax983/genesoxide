@@ -1395,3 +1395,117 @@ fn interlace_mode_switch() {
 
     check_golden("interlace_mode_switch", &switched);
 }
+
+// ---------------------------------------------------------------------------
+// Scene: X=0 sprite masking
+// ---------------------------------------------------------------------------
+
+/// Builds the X=0 sprite-masking scene. Three sprites share one scanline band
+/// (screen y = 100..107) in link order:
+///   sprite 0 — a normal, visible red sprite at screen x=32,
+///   sprite 1 — a raw-X==0 MASK sprite (not the first sprite on the line),
+///   sprite 2 — a normal red sprite at screen x=64 that MUST be hidden.
+/// Because the mask sprite is not the first on the line, it masks every later
+/// sprite on the scanline (Charles MacDonald / Nemesis "Sprite Masking" Mode 1),
+/// so sprite 2 never draws.
+fn build_sprite_x0_mask_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // reg 0x0C = H40 only (0x81), S/H off. Backdrop black (palette 0 color 0).
+    base_registers(&mut b, 0x81, 0x00);
+
+    b.set_cram_color(1, 0x000E); // red
+    b.write_solid_tile(1, 1); // solid red tile (color index 1)
+
+    // Scroll A stays all-transparent (tile 0), so any non-sprite pixel is the
+    // black backdrop — this isolates the sprite masking behavior.
+    let y_raw = 100 + 128; // screen y = 100
+    // sprite 0: visible red sprite at screen x=32 (raw 160), links to sprite 1.
+    write_sprite(&mut b, 0, y_raw, 0, 0, 1, 0x0001, 32 + 128);
+    // sprite 1: raw X == 0 mask sprite (not first on line), links to sprite 2.
+    write_sprite(&mut b, 1, y_raw, 0, 0, 2, 0x0001, 0);
+    // sprite 2: red sprite at screen x=64 (raw 192) that must be masked away.
+    write_sprite(&mut b, 2, y_raw, 0, 0, 0, 0x0001, 64 + 128);
+
+    b.finish()
+}
+
+#[test]
+fn sprite_x0_mask() {
+    let rom = build_sprite_x0_mask_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    let red = normal_rgba(0x000E); // [255,0,0,255]
+    let black = [0u8, 0, 0, 0xFF];
+    assert_eq!(red, [255, 0, 0, 255]);
+
+    let y = 103; // inside the sprite band (100..107)
+    // The pre-mask sprite (sprite 0) is visible at screen x=32..39.
+    assert_eq!(pixel(&fb, 35, y), red, "sprite before the X=0 mask is visible");
+    // The sprite behind the X=0 mask (sprite 2, x=64..71) is hidden -> backdrop.
+    assert_eq!(
+        pixel(&fb, 67, y),
+        black,
+        "sprite behind the X=0 mask is hidden (backdrop shows through)"
+    );
+    // A pixel between them, covered by neither sprite, is also backdrop.
+    assert_eq!(pixel(&fb, 50, y), black, "gap between sprites is backdrop");
+
+    check_golden("sprite_x0_mask", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene: per-line sprite dot-budget cutoff
+// ---------------------------------------------------------------------------
+
+/// Builds the dot-budget cutoff scene. Ten 4-cell-wide (32 px) red sprites stack
+/// at screen x=0 on one line, exactly filling the 320-px H40 sprite dot budget.
+/// An eleventh, distinctly-placed red "victim" sprite at screen x=200 is next in
+/// link order, so it pushes the running dot total past the budget (352 > 320)
+/// and is cut — its pixels stay backdrop even though the sprite count (11) is
+/// well under the 20/line limit, isolating the dot-budget path.
+fn build_sprite_dot_budget_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    base_registers(&mut b, 0x81, 0x00); // H40, backdrop black.
+
+    b.set_cram_color(1, 0x000E); // red
+    // A 4-cell-wide sprite reads tiles base..base+3 (column-major, v_size=1), so
+    // tiles 1..4 must all be solid red for the filler sprites.
+    for t in 1..=4 {
+        b.write_solid_tile(t, 1);
+    }
+
+    let y_raw = 100 + 128; // screen y = 100
+    // Ten filler sprites: h_size field 3 -> 4 tiles = 32 px, stacked at screen
+    // x=0 (raw 128). 10 * 32 = 320 px == the budget, so all ten draw.
+    for slot in 0..10u16 {
+        write_sprite(&mut b, slot, y_raw, 0, 3, (slot + 1) as u8, 0x0001, 128);
+    }
+    // Victim: a 1-cell red sprite at screen x=200 (raw 328), last in the link
+    // list. Processing it pushes the dot total to 328 > 320 -> cut (not drawn).
+    write_sprite(&mut b, 10, y_raw, 0, 0, 0, 0x0001, 200 + 128);
+
+    b.finish()
+}
+
+#[test]
+fn sprite_dot_budget_cutoff() {
+    let rom = build_sprite_dot_budget_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    let red = normal_rgba(0x000E); // [255,0,0,255]
+    let black = [0u8, 0, 0, 0xFF];
+    assert_eq!(red, [255, 0, 0, 255]);
+
+    let y = 103; // inside the sprite band (100..107)
+    // The filler sprites (screen x 0..31) drew within budget.
+    assert_eq!(pixel(&fb, 0, y), red, "in-budget filler sprite draws at x=0");
+    assert_eq!(pixel(&fb, 31, y), red, "in-budget filler sprite draws at x=31");
+    // The victim sprite (screen x 200..207) was cut by the dot budget -> backdrop.
+    assert_eq!(
+        pixel(&fb, 203, y),
+        black,
+        "sprite past the per-line dot budget is cut (backdrop shows through)"
+    );
+
+    check_golden("sprite_dot_budget_cutoff", &fb);
+}

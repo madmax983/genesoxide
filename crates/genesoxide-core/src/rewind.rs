@@ -133,6 +133,11 @@ pub struct VdpMeta {
     pub vint_pending: bool,
     pub dma_busy_cpu_cycles: u32,
     pub region: Region,
+    pub sprite_overflow: bool,
+    pub sprite_collision: bool,
+    pub prev_line_sprite_overflow: bool,
+    pub fifo_len: u8,
+    pub fifo_drain_counter: u16,
 }
 
 impl VdpMeta {
@@ -158,6 +163,11 @@ impl VdpMeta {
             vint_pending: v.vint_pending,
             dma_busy_cpu_cycles: v.dma_busy_cpu_cycles,
             region: v.region,
+            sprite_overflow: v.sprite_overflow,
+            sprite_collision: v.sprite_collision,
+            prev_line_sprite_overflow: v.prev_line_sprite_overflow,
+            fifo_len: v.fifo_len,
+            fifo_drain_counter: v.fifo_drain_counter,
         }
     }
 
@@ -182,6 +192,11 @@ impl VdpMeta {
         v.vint_pending = self.vint_pending;
         v.dma_busy_cpu_cycles = self.dma_busy_cpu_cycles;
         v.region = self.region;
+        v.sprite_overflow = self.sprite_overflow;
+        v.sprite_collision = self.sprite_collision;
+        v.prev_line_sprite_overflow = self.prev_line_sprite_overflow;
+        v.fifo_len = self.fifo_len;
+        v.fifo_drain_counter = self.fifo_drain_counter;
     }
 
     fn estimated_bytes(&self) -> usize {
@@ -983,6 +998,11 @@ mod tests {
         target.vdp.vint_pending = true;
         target.vdp.dma_busy_cpu_cycles = 12_345;
         target.vdp.region = Region::Pal;
+        target.vdp.sprite_overflow = true;
+        target.vdp.sprite_collision = true;
+        target.vdp.prev_line_sprite_overflow = true;
+        target.vdp.fifo_len = 3;
+        target.vdp.fifo_drain_counter = 77;
         target.region = Region::Pal;
         target.overseas = false;
         target.region_override = Some(Region::Pal);
@@ -1015,6 +1035,14 @@ mod tests {
         assert_eq!(recon.vdp.vint_pending, target.vdp.vint_pending);
         assert_eq!(recon.vdp.dma_busy_cpu_cycles, target.vdp.dma_busy_cpu_cycles);
         assert_eq!(recon.vdp.region, target.vdp.region);
+        assert_eq!(recon.vdp.sprite_overflow, target.vdp.sprite_overflow);
+        assert_eq!(recon.vdp.sprite_collision, target.vdp.sprite_collision);
+        assert_eq!(
+            recon.vdp.prev_line_sprite_overflow,
+            target.vdp.prev_line_sprite_overflow
+        );
+        assert_eq!(recon.vdp.fifo_len, target.vdp.fifo_len);
+        assert_eq!(recon.vdp.fifo_drain_counter, target.vdp.fifo_drain_counter);
         assert_eq!(recon.region, target.region);
         assert_eq!(recon.overseas, target.overseas);
         assert_eq!(recon.region_override, target.region_override);
