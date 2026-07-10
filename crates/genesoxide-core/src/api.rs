@@ -36,6 +36,12 @@ pub const FRAME_HEIGHT: usize = 224;
 /// The VDP framebuffer is always allocated at this height so a V28→V30 mode
 /// switch never reallocates; the active slice is sized to the current mode.
 pub const MAX_FRAME_HEIGHT: usize = 240;
+/// Maximum physical frame height in pixels when interlace mode 2 (LSM=0b11)
+/// is latched: both fields are woven into one framebuffer, doubling the
+/// vertical resolution (320x480 in H40 / PAL V30). This is `MAX_FRAME_HEIGHT`
+/// doubled and bounds the framebuffer allocation so a mid-stream LSM change
+/// never overflows the buffer.
+pub const MAX_FRAME_HEIGHT_INTERLACED: usize = MAX_FRAME_HEIGHT * 2;
 /// Framebuffer byte count for RGBA8 format at the nominal 320x224 (H40 / V28).
 ///
 /// The slice returned by [`GenesisCore::framebuffer_rgba`] can be narrower (H32 =
@@ -44,9 +50,10 @@ pub const MAX_FRAME_HEIGHT: usize = 240;
 /// [`GenesisCore::framebuffer_dimensions`].
 pub const FRAME_RGBA_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 4;
 /// Framebuffer allocation byte count for RGBA8 at the maximum size
-/// (H40 width × V30 height, 320×240): large enough that neither an H32↔H40 width
-/// change nor a V28↔V30 height change ever reallocates.
-pub const FRAME_RGBA_BYTES_MAX: usize = FRAME_WIDTH * MAX_FRAME_HEIGHT * 4;
+/// (H40 width × interlaced V30 height, 320×480): large enough that neither an
+/// H32↔H40 width change, a V28↔V30 height change, nor an interlace-mode-2
+/// (LSM=0b11) weave that doubles the vertical resolution ever reallocates.
+pub const FRAME_RGBA_BYTES_MAX: usize = FRAME_WIDTH * MAX_FRAME_HEIGHT_INTERLACED * 4;
 /// NTSC frame rate in millihertz (59.92 Hz * 1000).
 pub const FPS_MILLI: u32 = 59_920;
 /// NTSC frame period in nanoseconds.
@@ -2147,7 +2154,7 @@ impl GenesisCore {
     pub fn framebuffer_dimensions(&self) -> (u32, u32) {
         (
             u32::from(self.vdp.display_width()),
-            self.vdp.active_height() as u32,
+            self.vdp.framebuffer_height() as u32,
         )
     }
 
@@ -2577,7 +2584,10 @@ impl GenesisCore {
     /// mode switches.
     #[must_use]
     pub fn frame_dimensions(&self) -> (usize, usize) {
-        (self.vdp.display_width() as usize, self.vdp.active_height())
+        (
+            self.vdp.display_width() as usize,
+            self.vdp.framebuffer_height(),
+        )
     }
 
     /// Nominal frame period in nanoseconds for the effective region (NTSC

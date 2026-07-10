@@ -1126,3 +1126,261 @@ fn midline_vscroll_split() {
 
     check_golden("midline_vscroll_split", &fb);
 }
+
+// ---------------------------------------------------------------------------
+// Scene 8: Interlace mode 1 (LSM=01) — same-resolution render path
+// ---------------------------------------------------------------------------
+//
+// Interlace mode 1 (reg 0x0C LSM1:LSM0 = 0b01, i.e. bit 1 set) does NOT change
+// the framebuffer geometry: the active area is still H40 320×224 and every tile
+// is an 8px/32-byte cell. It only affects the status field flag, the HV counter
+// V field bit, and (for double-res mode 2) sprite Y interpretation. This scene
+// therefore renders an ordinary plane+sprite scene with LSM=01 set and locks in
+// that the render path is byte-for-byte a normal frame — the framebuffer stays
+// single-height (320×224), not doubled.
+
+fn build_interlace_mode1_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // reg 0x0C = H40 (0x81 = RS0|RS1) | LSM0 (0x02) => interlace mode 1.
+    base_registers(&mut b, 0x81 | 0x02, 0x00);
+
+    // Colors: blue plane at index 1, green sprite at index 2.
+    b.set_cram_color(1, 0x0E00); // blue
+    b.set_cram_color(2, 0x00E0); // green
+
+    b.write_solid_tile(1, 1); // blue plane tile (normal 8px cell)
+    // 16x16 green sprite: 2x2 tiles column-major (tiles 2..5), normal 8px cells.
+    for t in 2..=5 {
+        b.write_solid_tile(t, 2);
+    }
+
+    // Scroll A: solid blue, low priority, every row.
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    // One high-priority green sprite (palette 0, tile 2) at screen (64,64),
+    // 16x16 px. In mode 1 the sprite Y offset is the classic -128.
+    write_sprite(&mut b, 0, 64 + 128, 1, 1, 0, 0x8000 | 2, 64 + 128);
+
+    b.finish()
+}
+
+#[test]
+fn interlace_mode1_render() {
+    let rom = build_interlace_mode1_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    // Mode 1 keeps normal resolution: NOT doubled. A doubled (mode-2) weave
+    // would make this 320*448*4 = 573440 bytes; asserting the single height
+    // proves LSM=01 did not reshape the framebuffer.
+    assert_eq!(
+        fb.len(),
+        FRAME_W * FRAME_H * 4,
+        "interlace mode 1 keeps single-height 320x224 RGBA (not doubled)"
+    );
+
+    let blue = normal_rgba(0x0E00); // [0,0,255,255]
+    let green = normal_rgba(0x00E0); // [0,255,0,255]
+    assert_eq!(blue, [0, 0, 255, 255]);
+    assert_eq!(green, [0, 255, 0, 255]);
+
+    // Plane and sprite render exactly as a normal frame.
+    assert_eq!(pixel(&fb, 8, 8), blue, "plane background is blue");
+    assert_eq!(pixel(&fb, 200, 200), blue, "plane background is blue");
+    assert_eq!(pixel(&fb, 70, 70), green, "sprite draws green over plane");
+    assert_eq!(pixel(&fb, 80, 70), blue, "just right of sprite is blue");
+
+    check_golden("interlace_mode1", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 9: Interlace mode 2 (LSM=11) — double-res field weave
+// ---------------------------------------------------------------------------
+//
+// Interlace mode 2 (reg 0x0C LSM1:LSM0 = 0b11, i.e. bits 2 AND 1 set) weaves
+// BOTH fields into one framebuffer at DOUBLE vertical resolution: NTSC V28
+// (224 lines) becomes 448 physical rows (out row 2*line = field 0, 2*line+1 =
+// field 1). Planes use 16px-tall cells backed by 64-byte (16-row) tiles; the
+// tile row is `out_y >> 4` and the row-in-cell is `out_y & 15`.
+//
+// This scene uses H40 (320 wide) so the framebuffer is 320×448. Scroll A is
+// filled with a distinctive two-tone 16px cell: rows 0..7 red, rows 8..15
+// green. Under the doubled addressing that produces horizontal bands that
+// repeat every 16 output rows (8 red, 8 green), which is only visible if the
+// 16px-cell weave is correct. A high-priority blue sprite (mode-2 Y = SAT_Y -
+// 0x100, 16px cell, 64-byte tile) sits entirely in the LOWER weave half
+// (out_y 228..244) to prove content beyond the single-field 224-line height.
+
+/// H40 display width for the mode-2 scene.
+const M2_W: usize = 320;
+/// Doubled active height for NTSC V28 in interlace mode 2 (224 * 2).
+const M2_H: usize = 448;
+
+fn build_interlace_mode2_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // reg 0x0C = H40 (0x81) | LSM1 (0x04) | LSM0 (0x02) = 0x87 => interlace mode 2.
+    base_registers(&mut b, 0x81 | 0x06, 0x00);
+
+    // Palette: red (1), green (2), blue (3).
+    b.set_cram_color(1, 0x000E); // red
+    b.set_cram_color(2, 0x00E0); // green
+    b.set_cram_color(3, 0x0E00); // blue
+
+    // Plane tile 1 as a 16-row / 64-byte interlace-mode-2 cell: rows 0..7 solid
+    // color 1 (red), rows 8..15 solid color 2 (green). Mode-2 tile stride is 64
+    // bytes, so tile index 1 lives at VRAM byte 1*64 = 0x40. Each row is two
+    // words; a solid color C row is the word 0xCCCC repeated.
+    let mut plane_tile = Vec::with_capacity(32);
+    for r in 0..16u16 {
+        let w: u16 = if r < 8 { 0x1111 } else { 0x2222 };
+        plane_tile.push(w);
+        plane_tile.push(w);
+    }
+    b.write_vram(1 * 64, &plane_tile);
+
+    // Sprite tile 4 as a 16-row / 64-byte solid color 3 (blue) cell at VRAM byte
+    // 4*64 = 0x100.
+    let sprite_tile = vec![0x3333u16; 32]; // 16 rows * 2 words
+    b.write_vram(4 * 64, &sprite_tile);
+
+    // Scroll A nametable: tile 1 everywhere, low priority, palette 0.
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    // One high-priority blue sprite (1x1 cell = 8x16px in the doubled space),
+    // palette 0, tile 4. Mode-2 sprite Y = (SAT_Y & 0x3FF) - 0x100, so SAT_Y =
+    // 228 + 256 = 484 puts its top at out_y 228 (lower weave half); it spans
+    // out_y 228..244. x = 100 => x_raw = 100 + 128 = 228.
+    write_sprite(&mut b, 0, 228 + 256, 0, 0, 0, 0x8000 | 4, 100 + 128);
+
+    b.finish()
+}
+
+#[test]
+fn interlace_mode2_double_res() {
+    let rom = build_interlace_mode2_rom();
+    let fb = run_rom_frames(rom, FRAMES);
+
+    // Mode 2 weaves both fields: the framebuffer is DOUBLE height (320x448).
+    assert_eq!(
+        fb.len(),
+        M2_W * M2_H * 4,
+        "interlace mode 2 weaves both fields into a 320x448 RGBA buffer (573440 bytes)"
+    );
+
+    // Local pixel accessor for the doubled 320x448 buffer (the shared `pixel`
+    // helper caps y < 224, which the lower weave half exceeds).
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        assert!(x < M2_W && y < M2_H, "px ({x},{y}) out of bounds");
+        let o = (y * M2_W + x) * 4;
+        [fb[o], fb[o + 1], fb[o + 2], fb[o + 3]]
+    };
+
+    let red = normal_rgba(0x000E); // [255,0,0,255]
+    let green = normal_rgba(0x00E0); // [0,255,0,255]
+    let blue = normal_rgba(0x0E00); // [0,0,255,255]
+    assert_eq!(red, [255, 0, 0, 255]);
+    assert_eq!(green, [0, 255, 0, 255]);
+    assert_eq!(blue, [0, 0, 255, 255]);
+
+    // UPPER weave half (y < 224): the 16px cell shows red on rows 0..7 and green
+    // on rows 8..15, repeating every 16 output rows. y=4 -> red, y=12 -> green.
+    assert_eq!(px(8, 4), red, "upper half y=4 (row-in-cell 4) is red");
+    assert_eq!(px(8, 12), green, "upper half y=12 (row-in-cell 12) is green");
+    // Full H40 width is covered (x=300 wraps the 256px plane back onto tile 1).
+    assert_eq!(px(300, 4), red, "upper half far-right column (x=300) is red");
+
+    // LOWER weave half (y >= 224): proves the second field produced real content
+    // beyond the single-field 224-line height. y%16 selects the band.
+    assert_eq!(px(8, 228), red, "lower half y=228 (228%16=4) is red");
+    assert_eq!(px(8, 236), green, "lower half y=236 (236%16=12) is green");
+    assert_eq!(px(8, 440), green, "lower half y=440 (440%16=8) is green");
+    // The lower half is NOT blank/backdrop (backdrop is black) — a broken weave
+    // that only rendered field 0 would leave these rows black.
+    assert_ne!(px(8, 228), [0, 0, 0, 255], "lower half must not be black backdrop");
+    assert_ne!(px(8, 440), [0, 0, 0, 255], "last woven row must not be black backdrop");
+
+    // Sprite in the LOWER weave half (out_y 228..244, x 100..107): mode-2 sprite
+    // addressing (Y - 0x100, 16px cell, 64-byte tile) draws high-priority blue
+    // over the green plane band.
+    assert_eq!(px(103, 232), blue, "mode-2 sprite draws blue in the lower weave half");
+    // Just outside the sprite (same row, different x) is the plane band, not blue.
+    assert_eq!(px(8, 232), green, "outside the sprite the lower-half plane band shows");
+
+    check_golden("interlace_mode2", &fb);
+}
+
+// ---------------------------------------------------------------------------
+// Scene 10: Interlace mode switch — dimension change at the frame boundary
+// ---------------------------------------------------------------------------
+//
+// A reg 0x0C LSM change is latched at scanline 0 of the NEXT frame (like the
+// H40/H32 width latch), so switching interlace mode reshapes the framebuffer at
+// the frame boundary. This scene proves the framebuffer length tracks the mode:
+//
+//   * a pure mode-2 ROM yields a doubled 320×448 buffer;
+//   * a ROM that starts in mode 2 then writes reg 0x0C = non-interlace (0x81)
+//     at the end of setup yields a single-height 320×224 buffer for the final
+//     captured frame.
+//
+// Asserting the two lengths differ (and equal their expected mode geometry)
+// locks in that the switch actually changed the framebuffer dimensions.
+
+fn build_interlace_switch_rom() -> Vec<u8> {
+    let mut b = RomBuilder::new();
+    // Start in interlace mode 2 (H40 | LSM11 = 0x87).
+    base_registers(&mut b, 0x81 | 0x06, 0x00);
+
+    // Red plane using a NORMAL 8px/32-byte tile so the FINAL (non-interlace)
+    // frame renders a visible red plane. (tile 1 at VRAM byte 1*32 = 0x20.)
+    b.set_cram_color(1, 0x000E); // red
+    b.write_solid_tile(1, 1);
+    let row_a = [0x0001u16; 32];
+    fill_nametable_32(&mut b, SCROLL_A_NT, &row_a);
+
+    // Switch OFF interlace at the end of the setup stream: reg 0x0C = H40 only
+    // (0x81, LSM=00). Latched at the next frame boundary, so the captured frame
+    // is a single-height non-interlaced 320x224 frame.
+    b.set_register(0x0C, 0x81);
+
+    b.finish()
+}
+
+#[test]
+fn interlace_mode_switch() {
+    // Reference: pure mode-2 ROM produces a doubled framebuffer.
+    let doubled = run_rom_frames(build_interlace_mode2_rom(), FRAMES);
+    assert_eq!(
+        doubled.len(),
+        M2_W * M2_H * 4,
+        "pure mode-2 frame is doubled height (320x448)"
+    );
+
+    // Switched: mode 2 -> non-interlace collapses to single height for the final
+    // captured frame.
+    let switched = run_rom_frames(build_interlace_switch_rom(), FRAMES);
+    assert_eq!(
+        switched.len(),
+        FRAME_W * FRAME_H * 4,
+        "after switching OFF interlace the final frame is single-height 320x224"
+    );
+
+    // The switch actually changed the framebuffer dimensions at the boundary.
+    assert_ne!(
+        doubled.len(),
+        switched.len(),
+        "the interlace mode switch must change the framebuffer length (448 vs 224 rows)"
+    );
+
+    // The final non-interlaced frame renders the red plane (8px tile path).
+    let red = normal_rgba(0x000E); // [255,0,0,255]
+    assert_eq!(red, [255, 0, 0, 255]);
+    assert_eq!(pixel(&switched, 8, 8), red, "final frame plane is red at left");
+    assert_eq!(
+        pixel(&switched, 300, 200),
+        red,
+        "final frame plane is red across the H40 width"
+    );
+
+    check_golden("interlace_mode_switch", &switched);
+}
