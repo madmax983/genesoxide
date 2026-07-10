@@ -1,5 +1,17 @@
 //! Sonic the Hedgehog integration tests.
-//! Run with: cargo test -p genesoxide-test-harness --test sonic_boot -- --nocapture
+//!
+//! These tests require a commercial Sonic the Hedgehog ROM, which cannot be
+//! committed to this repository. They are therefore all `#[ignore]`d so they
+//! never *silently* pass when the ROM is absent — an ignored test is reported as
+//! ignored, not as a vacuous green. Point [`SONIC_ROM_ENV`] at a local ROM and
+//! run them explicitly:
+//!
+//! ```text
+//! GENESOXIDE_SONIC_ROM=/path/to/sonic.md \
+//!   cargo test -p genesoxide-test-harness --test sonic_boot -- --ignored --nocapture
+//! ```
+//!
+//! The always-run, committed F1 boot proof lives in `f1_boot_proof.rs`.
 
 use genesoxide_core::api::AudioOutputConfig;
 use genesoxide_core::{Command, GenesisCore};
@@ -8,12 +20,15 @@ use genesoxide_test_harness::vgm::{
 };
 use genesoxide_test_harness::ymfm_reference::Ymfm2612Renderer;
 
-const SONIC_ROM_PATH: &str =
-    r"C:\Users\markm\AppData\Local\Temp\sonic_test\Sonic The Hedgehog (USA, Europe).md";
+/// Environment variable holding the path to a commercial Sonic ROM (e.g.
+/// `GENESOXIDE_SONIC_ROM=/path/to/sonic.md`). Unset by default, which is why
+/// every test here is `#[ignore]`d.
+const SONIC_ROM_ENV: &str = "GENESOXIDE_SONIC_ROM";
 const GHZ_GOLDEN_RECORD_FRAMES: u32 = 6087;
 
 fn load_sonic() -> Option<Vec<u8>> {
-    std::fs::read(SONIC_ROM_PATH).ok()
+    let path = std::env::var(SONIC_ROM_ENV).ok()?;
+    std::fs::read(path).ok()
 }
 
 fn run_frames(core: &mut GenesisCore, frames: u32) {
@@ -97,11 +112,15 @@ fn advance_to_green_hill_music(core: &mut GenesisCore) -> u32 {
 }
 
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_boot_diagnostic() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -157,11 +176,15 @@ fn sonic_boot_diagnostic() {
 /// to complete (~200 frames), then pressing Start, then running
 /// a few frames into Green Hill Zone.
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_renders_hud() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -219,11 +242,15 @@ fn sonic_renders_hud() {
 /// Verifies that Sonic produces non-silent audio output.
 /// The SEGA jingle and title screen music should generate audible samples.
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_produces_audio() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -250,11 +277,15 @@ fn sonic_produces_audio() {
 }
 
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_live_ym_trace_replays_against_ymfm() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -309,11 +340,15 @@ fn sonic_live_ym_trace_replays_against_ymfm() {
 }
 
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_green_hill_live_ym_trace_replays_against_ymfm() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -359,11 +394,15 @@ fn sonic_green_hill_live_ym_trace_replays_against_ymfm() {
 }
 
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_green_hill_live_replay_matches_captured_audio() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -448,7 +487,10 @@ fn sonic_green_hill_long_live_replay_matches_captured_audio() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -530,11 +572,15 @@ fn sonic_green_hill_long_live_replay_matches_captured_audio() {
 
 /// Diagnostic: run 600 frames and trace Z80/68K state to find hang point.
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_hang_diagnostic() {
     let rom_data = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -624,11 +670,15 @@ fn sonic_hang_diagnostic() {
 ///
 /// Run with: cargo test -p genesoxide-test-harness --test sonic_boot sonic_ym2612_diagnostic -- --nocapture
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_ym2612_diagnostic() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -939,11 +989,15 @@ fn sonic_ym2612_diagnostic() {
 /// Diagnostic: dump Z80 RAM around the stuck PC to understand what the
 /// SMPS driver is doing (or failing to do).
 #[test]
+#[ignore = "requires GENESOXIDE_SONIC_ROM (commercial ROM); run with -- --ignored"]
 fn sonic_z80_smps_trace() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
@@ -1065,7 +1119,10 @@ fn sonic_title_card_debug() {
     let rom = match load_sonic() {
         Some(r) => r,
         None => {
-            eprintln!("Sonic ROM not found, skipping");
+            eprintln!(
+                "Sonic ROM not found: set {SONIC_ROM_ENV}=/path/to/sonic.md and run with \
+                 `-- --ignored` to exercise this test."
+            );
             return;
         }
     };
