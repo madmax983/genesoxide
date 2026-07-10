@@ -2695,6 +2695,19 @@ impl GenesisCore {
         let cycles_u64 = u64::from(cycles);
         self.cpu.cycles += cycles_u64;
         self.scheduler.advance_cpu(cycles_u64);
+        // Drain the VDP write FIFO by the cycles this instruction consumed.
+        let blanking = self.vdp.in_blanking();
+        self.vdp.advance_fifo(cycles, blanking);
+        // Charge any FIFO-full write stall this instruction incurred: the data
+        // write was held off the bus, so add those dead cycles to the 68000 /
+        // scheduler (mirrors the DMA-busy stall accounting) and let the FIFO
+        // drain across them.
+        let stall = self.vdp.take_pending_write_stall();
+        if stall > 0 {
+            self.cpu.cycles += u64::from(stall);
+            self.scheduler.advance_cpu(u64::from(stall));
+            self.vdp.advance_fifo(stall, blanking);
+        }
         // Advance the controllers' 6-button idle timers so a stalled TH poll
         // resets its phase counter after ~1.5 ms of no TH activity.
         self.port1.advance_cycles(cycles);
@@ -2727,6 +2740,9 @@ impl GenesisCore {
                 self.cpu.cycles += stall;
                 self.scheduler.advance_cpu(stall);
                 self.vdp.advance_dma_busy(stall as u32);
+                // The write FIFO also drains while the CPU is stalled off the bus.
+                let blanking = self.vdp.in_blanking();
+                self.vdp.advance_fifo(stall as u32, blanking);
                 continue;
             }
             self.step_cpu();
@@ -2785,6 +2801,9 @@ impl GenesisCore {
                 self.cpu.cycles += stall;
                 self.scheduler.advance_cpu(stall);
                 self.vdp.advance_dma_busy(stall as u32);
+                // The write FIFO also drains while the CPU is stalled off the bus.
+                let blanking = self.vdp.in_blanking();
+                self.vdp.advance_fifo(stall as u32, blanking);
                 continue;
             }
             let instruction_tick =
@@ -3100,7 +3119,7 @@ impl GenesisCore {
                     sram: &mut self.sram,
                     eeprom: &mut self.eeprom,
                     work_ram: &mut self.work_ram,
-                    vdp: &self.vdp,
+                    vdp: &mut self.vdp,
                     port1: &mut self.port1,
                     port2: &mut self.port2,
                     z80_bank: &mut self.z80_bank,
@@ -3140,7 +3159,7 @@ impl GenesisCore {
                 sram: &mut self.sram,
                 eeprom: &mut self.eeprom,
                 work_ram: &mut self.work_ram,
-                vdp: &self.vdp,
+                vdp: &mut self.vdp,
                 port1: &mut self.port1,
                 port2: &mut self.port2,
                 z80_bank: &mut self.z80_bank,
@@ -3479,8 +3498,10 @@ impl GenesisCore {
                 let vdp_addr = addr & 0x1F;
                 match vdp_addr {
                     0x04 | 0x06 => {
-                        // Status register (read-only)
-                        let status = self.vdp.read_status();
+                        // Status register. This is the read-only DEBUG bus
+                        // (`&self`), so it uses the non-mutating peek and does
+                        // NOT apply the read-to-clear side effect of a real read.
+                        let status = self.vdp.status_bits();
                         if vdp_addr & 1 == 0 {
                             (status >> 8) as u8
                         } else {
@@ -3570,7 +3591,11 @@ impl GenesisCore {
                 let vdp_addr = addr & 0x1F;
                 // Debug/untimed bus: apply globally, never record a mid-line event.
                 match vdp_addr {
-                    0x00 | 0x02 => self.vdp.write_data(val, None),
+                    // Debug/untimed bus: discard the FIFO stall (this path does
+                    // not drive CPU timing).
+                    0x00 | 0x02 => {
+                        self.vdp.write_data(val, None);
+                    }
                     0x04 | 0x06 => self.vdp.write_control(val, None),
                     _ => {}
                 }
@@ -3689,7 +3714,7 @@ fn read_68k_byte(
     sram: &CartSram,
     eeprom: &Eeprom,
     work_ram: &[u8; 0x10000],
-    vdp: &Vdp,
+    vdp: &mut Vdp,
     port1: &ControllerPort,
     port2: &ControllerPort,
     z80_ram: &[u8; 0x2000],
@@ -4168,7 +4193,12 @@ impl Bus for CoreBus<'_> {
                     Some(self.vdp.dot_from_line_offset(offset))
                 };
                 match vdp_addr {
-                    0x00 | 0x02 => self.vdp.write_data(val, dot),
+                    // The FIFO-full stall this write may incur is accumulated
+                    // inside the VDP (`pending_write_stall`) and charged to the
+                    // 68000 by the core after the instruction (see `step_cpu_at`).
+                    0x00 | 0x02 => {
+                        self.vdp.write_data(val, dot);
+                    }
                     0x04 | 0x06 => self.vdp.write_control(val, dot),
                     0x10 | 0x12 | 0x14 | 0x16 => {
                         // PSG port (write low byte)
@@ -4255,7 +4285,9 @@ struct Z80Bus<'a> {
     eeprom: &'a mut Eeprom,
     // Fields backing the banked 0x8000-0xFFFF window's view of full 68000 space.
     work_ram: &'a mut Box<[u8; 0x10000]>,
-    vdp: &'a Vdp,
+    // `&mut` so a status read through the banked window applies the hardware
+    // read-to-clear side effect (sprite overflow/collision flags).
+    vdp: &'a mut Vdp,
     port1: &'a mut ControllerPort,
     port2: &'a mut ControllerPort,
     z80_bank: &'a mut u32,
@@ -4450,7 +4482,7 @@ mod tests {
             sram: &mut core.sram,
             eeprom: &mut core.eeprom,
             work_ram: &mut core.work_ram,
-            vdp: &core.vdp,
+            vdp: &mut core.vdp,
             port1: &mut core.port1,
             port2: &mut core.port2,
             z80_bank: &mut core.z80_bank,
