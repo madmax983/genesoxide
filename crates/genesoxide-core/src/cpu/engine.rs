@@ -40,7 +40,9 @@ impl Cpu {
             d: [0; 8],
             a: [0; 7],
             pc: 0,
-            sr: StatusRegister::new(StatusRegister::S), // supervisor mode on reset
+            // Reset exception state (M68000UM §6.2.2): supervisor bit set,
+            // interrupt mask forced to 7, trace (T) cleared → SR = 0x2700.
+            sr: StatusRegister::new(StatusRegister::S | StatusRegister::IPM_MASK),
             ssp: 0,
             usp: 0,
             cycles: 0,
@@ -143,6 +145,16 @@ mod tests {
         assert!(cpu.sr.supervisor());
         assert!(!cpu.halted);
         assert!(!cpu.stopped);
+    }
+
+    #[test]
+    fn reset_status_register_is_0x2700() {
+        // M68000UM §6.2.2 reset exception: S=1, interrupt mask=7, T=0.
+        let cpu = Cpu::new();
+        assert_eq!(cpu.sr.0, 0x2700);
+        assert!(cpu.sr.supervisor());
+        assert_eq!(cpu.sr.interrupt_mask(), 7);
+        assert!(!cpu.sr.flag(StatusRegister::T));
     }
 
     #[test]

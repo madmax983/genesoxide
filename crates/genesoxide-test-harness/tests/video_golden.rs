@@ -772,9 +772,11 @@ fn hint_raster_bands() {
 // Why mainline and not a HINT handler: mid-line register/CRAM/VSRAM writes are
 // recorded ONLY when the 68000 interrupt mask is < 4. Writes at mask >= 4
 // (inside a level-4 HINT / level-6 VINT handler) are treated as whole-line by
-// design, so that `hint_raster_bands` stays byte-identical. On reset the 68000
-// mask is 0, and these ROMs enable no interrupts, so their mainline write loops
-// run at mask 0 throughout — every write carries a real beam dot.
+// design, so that `hint_raster_bands` stays byte-identical. The 68000 resets
+// with the mask at 7 (0x2700), so — exactly like a real game before it relies
+// on mainline raster timing, and like `hint_raster_bands` — each ROM lowers the
+// mask to 0 (`move.w #0x2000, sr`) in its prologue. Its write loop then runs at
+// mask 0 throughout, so every write carries a real beam dot.
 //
 // Each ROM ends in an INFINITE write loop (not a `bra.s *` spin): the loop runs
 // across every scanline of every frame, so the captured frame (FRAMES-1) shows
@@ -876,6 +878,9 @@ fn build_midline_backdrop_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
     // H40, backdrop starts at index 0. Display on, no interrupts.
     base_registers(&mut b, 0x81, 0x00);
+    // Lower the CPU interrupt mask to 0 (reset leaves it at 7) so the mainline
+    // write loop's VDP writes are recorded dot-accurately. move.w #0x2000, sr.
+    b.emit(&[0x46FC, 0x2000]);
 
     // Preload the backdrop palette (CRAM 0..7). No tiles/sprites are written, so
     // every plane pixel is transparent and the backdrop fills the whole screen —
@@ -948,6 +953,9 @@ fn build_midline_cram_rom() -> Vec<u8> {
     let mut b = RomBuilder::new();
     // H40, backdrop black. Display on, no interrupts.
     base_registers(&mut b, 0x81, 0x00);
+    // Lower the CPU interrupt mask to 0 (reset leaves it at 7) so the mainline
+    // write loop's VDP writes are recorded dot-accurately. move.w #0x2000, sr.
+    b.emit(&[0x46FC, 0x2000]);
 
     // CRAM index 1 starts red; the loop rewrites it live. Tile 1 is solid color
     // index 1, and Scroll A is filled with tile 1 everywhere, so the whole plane
@@ -1047,6 +1055,9 @@ fn build_midline_vscroll_rom() -> Vec<u8> {
     // H40, backdrop black. reg 0x0B = 0x00 -> full-screen vertical scroll (a
     // single VSRAM[0] value drives all of Scroll A). Display on, no interrupts.
     base_registers(&mut b, 0x81, 0x00);
+    // Lower the CPU interrupt mask to 0 (reset leaves it at 7) so the mainline
+    // write loop's VDP writes are recorded dot-accurately. move.w #0x2000, sr.
+    b.emit(&[0x46FC, 0x2000]);
 
     b.set_cram_color(1, VSCROLL_BAND_A); // red
     b.set_cram_color(2, VSCROLL_BAND_B); // blue
