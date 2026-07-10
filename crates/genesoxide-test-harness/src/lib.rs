@@ -68,6 +68,233 @@ pub fn load_test_rom(path: &str) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
+// ── Test coverage self-report ──────────────────────────────────────────────
+//
+// The honesty mechanism for the harness: a single place that inspects the
+// environment at runtime and reports, for every suite, whether it is
+// ALWAYS-RUN, ACTIVE (committed data present), OPT-IN (needs a fetched corpus),
+// or IGNORED (needs a commercial ROM / reference data). A green harness run is
+// then self-documenting — `coverage_summary` prints this and also *asserts* the
+// invariants that must hold on any clean checkout, so a stripped-down tree fails
+// loudly instead of quietly reporting "ok" with everything skipped.
+
+use std::path::{Path, PathBuf};
+
+/// Minimum number of committed m68k vendored opcode files a clean checkout MUST
+/// contain. Fewer than this means the committed data was stripped — a hard fail.
+pub const M68K_VENDORED_MIN: usize = 25;
+/// Minimum number of committed z80 vendored opcode files a clean checkout MUST
+/// contain.
+pub const Z80_VENDORED_MIN: usize = 25;
+
+/// Resolve a path relative to this crate's manifest directory
+/// (`crates/genesoxide-test-harness`). Mirrors the path helpers in the suite
+/// integration tests so the report and the tests agree on where data lives.
+fn harness_path(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+fn count_files_ending(dir: &Path, suffix: &str) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(suffix))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Count of committed m68k vendored `.json.bin` opcode files.
+#[must_use]
+pub fn m68k_vendored_count() -> usize {
+    count_files_ending(&harness_path("../../tests/m68000-tests/v1"), ".json.bin")
+}
+
+/// Count of committed z80 vendored `.json` opcode files.
+#[must_use]
+pub fn z80_vendored_count() -> usize {
+    count_files_ending(
+        &harness_path("../../tests/z80-tests-vendored/v1/v1"),
+        ".json",
+    )
+}
+
+/// Count of opt-in full-corpus m68k opcode files (gitignored, fetched on demand).
+#[must_use]
+pub fn m68k_full_corpus_count() -> usize {
+    count_files_ending(
+        &harness_path("../../tests/m68000-tests-full/v1"),
+        ".json.bin",
+    )
+}
+
+/// Count of opt-in full-corpus z80 opcode files (gitignored, fetched on demand).
+#[must_use]
+pub fn z80_full_corpus_count() -> usize {
+    count_files_ending(&harness_path("../../tests/z80-tests/v1/v1"), ".json")
+}
+
+/// Count of committed video golden `.rgba` reference frames.
+#[must_use]
+pub fn video_golden_count() -> usize {
+    count_files_ending(&harness_path("tests/goldens"), ".rgba")
+}
+
+/// Whether a commercial Sonic ROM is reachable via `GENESOXIDE_SONIC_ROM`
+/// (used by the `sonic_boot` suite).
+#[must_use]
+pub fn sonic_rom_available() -> bool {
+    std::env::var("GENESOXIDE_SONIC_ROM")
+        .ok()
+        .is_some_and(|p| Path::new(&p).exists())
+}
+
+/// Whether the (gitignored) GHZ audio reference directory holds any reference
+/// recordings for the `audio_golden` diagnostics.
+#[must_use]
+pub fn audio_reference_available() -> bool {
+    let dir = harness_path("tests/reference_audio");
+    std::fs::read_dir(&dir)
+        .map(|mut rd| rd.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Produce a multi-line, CI-log-readable report of every suite's coverage state.
+///
+/// Each line is tagged ALWAYS-RUN / ACTIVE / OPT-IN / IGNORED / MISSING so a
+/// reader can tell at a glance what a green run actually exercised versus what
+/// was gated or absent. This is intentionally dependency-light: it only reads
+/// the filesystem and environment, it does not run any emulation.
+#[must_use]
+pub fn coverage_report() -> String {
+    let mut out = String::new();
+
+    let m68k_vendored = m68k_vendored_count();
+    let z80_vendored = z80_vendored_count();
+    let m68k_full = m68k_full_corpus_count();
+    let z80_full = z80_full_corpus_count();
+    let goldens = video_golden_count();
+    let sonic = sonic_rom_available();
+    let audio_ref = audio_reference_available();
+
+    out.push_str("=== genesoxide test coverage ===\n");
+    out.push_str("  legend: ALWAYS-RUN=committed, ACTIVE=vendored data present,\n");
+    out.push_str("          OPT-IN=fetch full corpus, IGNORED=needs commercial ROM/refs,\n");
+    out.push_str("          MISSING=committed data absent (hard fail)\n\n");
+
+    // Aligned columns: area (36) | state (18) | detail.
+    let mut row = |area: &str, state: &str, detail: &str| {
+        out.push_str(&format!("  {area:<36}{state:<18}{detail}\n"));
+    };
+
+    row(
+        "F1 SGDK boot proof",
+        "ALWAYS-RUN",
+        "committed ROM, no external data (f1_boot_proof)",
+    );
+
+    let m68k_state = if m68k_vendored >= M68K_VENDORED_MIN {
+        "ACTIVE"
+    } else {
+        "MISSING"
+    };
+    row(
+        "m68k vendored SST subset",
+        m68k_state,
+        &format!(
+            "{m68k_vendored} .json.bin files (min {M68K_VENDORED_MIN}){}",
+            if m68k_vendored >= M68K_VENDORED_MIN {
+                " — runs by default"
+            } else {
+                " — HARD FAIL: committed data stripped"
+            }
+        ),
+    );
+    row(
+        "m68k full corpus",
+        if m68k_full > 0 {
+            "OPT-IN(ready)"
+        } else {
+            "OPT-IN"
+        },
+        &format!(
+            "{m68k_full} files; fetch: scripts/fetch-sst-corpus.sh --full then \
+             --test m68k_suite full_suite -- --ignored"
+        ),
+    );
+
+    let z80_state = if z80_vendored >= Z80_VENDORED_MIN {
+        "ACTIVE"
+    } else {
+        "MISSING"
+    };
+    row(
+        "z80 vendored SST subset",
+        z80_state,
+        &format!(
+            "{z80_vendored} .json files (min {Z80_VENDORED_MIN}){}",
+            if z80_vendored >= Z80_VENDORED_MIN {
+                " — runs by default"
+            } else {
+                " — HARD FAIL: committed data stripped"
+            }
+        ),
+    );
+    row(
+        "z80 full corpus",
+        if z80_full > 0 {
+            "OPT-IN(ready)"
+        } else {
+            "OPT-IN"
+        },
+        &format!(
+            "{z80_full} files; fetch: scripts/fetch-sst-corpus.sh --full then \
+             --test z80_suite full_suite -- --ignored"
+        ),
+    );
+
+    row(
+        "video goldens",
+        "ALWAYS-RUN",
+        &format!("{goldens} committed .rgba scenes (video_golden)"),
+    );
+
+    row(
+        "sonic_boot (commercial)",
+        if sonic { "ACTIVE" } else { "IGNORED-needs-ROM" },
+        if sonic {
+            "GENESOXIDE_SONIC_ROM set — run with -- --ignored"
+        } else {
+            "set GENESOXIDE_SONIC_ROM=/path/to/sonic.md; 11 #[ignore] tests"
+        },
+    );
+
+    row(
+        "audio_golden diagnostics",
+        "IGNORED-needs-ROM",
+        &format!(
+            "~100 opt-in #[ignore] tuning diagnostics; needs local Sonic ROM + \
+             reference audio (present: {})",
+            if audio_ref { "yes" } else { "no" }
+        ),
+    );
+    row(
+        "vgm / ymfm diagnostics",
+        "IGNORED-opt-in",
+        "vgm_file_playback (needs tests/vgm_files/) + ymfm dump; 10 always-run VGM unit tests",
+    );
+
+    out.push('\n');
+    out.push_str(&format!(
+        "  summary: m68k_vendored={m68k_vendored} z80_vendored={z80_vendored} \
+         goldens={goldens} sonic_rom={} audio_ref={}\n",
+        if sonic { "yes" } else { "no" },
+        if audio_ref { "yes" } else { "no" },
+    ));
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

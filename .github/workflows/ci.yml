@@ -55,8 +55,35 @@ jobs:
       - name: Test genesoxide-config
         run: cargo test -p genesoxide-config
 
-      # The z80_suite test skips gracefully when the SingleStepTests dataset is
-      # absent, and the ymfm reference harness builds vendored C++ via cc (the
-      # ubuntu-latest runner ships a C++ toolchain, so no extra install needed).
+      # This runs, by default: the committed F1 SGDK boot proof, the video
+      # goldens, and the VENDORED SingleStepTests subsets for both the 68000
+      # (m68k_suite) and the Z80 (z80_suite). Those subsets are checked into the
+      # repo, so the suites run for real on every CI job and PANIC if a committed
+      # opcode file is missing — they no longer skip when data is absent. The
+      # full ~300k-case corpus stays opt-in (see the commented job below). The
+      # ymfm reference harness builds vendored C++ via cc (ubuntu-latest ships a
+      # C++ toolchain, so no extra install is needed).
       - name: Test genesoxide-test-harness
         run: cargo test -p genesoxide-test-harness
+
+      # Honest coverage report: an always-run guardrail that prints, in one
+      # place, which suites actually ran versus which were gated/absent, and
+      # FAILS if the committed vendored SST subsets were stripped. Kept as a
+      # separate visible step so the report shows up in the CI log.
+      - name: Coverage summary (honest skip report)
+        run: cargo test -p genesoxide-test-harness --test coverage_summary -- --nocapture
+
+# ── Opt-in: full SingleStepTests corpus ─────────────────────────────────────
+# The vendored subsets above give per-opcode CI signal. To validate against the
+# FULL upstream corpus (~300k cases per instruction, gitignored, not fetched by
+# default), run a job like the following. Left commented because it downloads a
+# large dataset and is not part of the default gate:
+#
+#   full-corpus:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: dtolnay/rust-toolchain@stable
+#       - run: scripts/fetch-sst-corpus.sh --full
+#       - run: cargo test -p genesoxide-test-harness --test m68k_suite full_suite -- --ignored --nocapture
+#       - run: cargo test -p genesoxide-test-harness --test z80_suite full_suite -- --ignored --nocapture

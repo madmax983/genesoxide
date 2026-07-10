@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "opt-in diagnostic: writes genesoxide-vs-ymfm comparison WAVs to tests/vgm_output/ymfm_compare/; run with -- --ignored"]
     fn dump_genesoxide_vs_ymfm_reference_cases() {
         let output_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
