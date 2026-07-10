@@ -28,14 +28,13 @@ fn full_data_dir() -> PathBuf {
 /// corpus by `examples/sst_json2bin.rs`). These MUST be present in a clean
 /// checkout — a missing one is a hard failure, not a silent skip.
 ///
-/// NOTE: four opcodes from the originally-surveyed set are intentionally EXCLUDED
-/// because the current 68000 core disagrees with the upstream vectors (real,
-/// pre-existing core bugs this harness now surfaces):
-///   * BSET / BTST — bit-op cycle counts off by 2
-///   * LINK        — the `LINK A7` quirk (pushes old SP, not the decremented SP)
-///   * DIVU        — N flag after division computed differently
-/// They remain exercised by the opt-in full corpus (`full_suite`); fixing them is
-/// left to the CPU workstream.
+/// NOTE: four opcodes (BSET, BTST, LINK, DIVU) that were previously EXCLUDED for
+/// known core discrepancies are now FIXED in the 68000 core and vendored/covered
+/// here at 100%:
+///   * BSET / BTST — bit-op cycle counts corrected (BTST Dn,#imm = 10; BSET
+///                   register-dest is bit-dependent 6/8·10/12).
+///   * LINK        — the `LINK A7` quirk now pushes the decremented SP (SP-4).
+///   * DIVU        — overflow now PRESERVES the incoming N/Z flags.
 const VENDORED: &[&str] = &[
     "ABCD.json.bin",
     "ADD.w.json.bin",
@@ -43,14 +42,18 @@ const VENDORED: &[&str] = &[
     "ADDX.w.json.bin",
     "AND.w.json.bin",
     "ASL.w.json.bin",
+    "BSET.json.bin",
+    "BTST.json.bin",
     "Bcc.json.bin",
     "CLR.w.json.bin",
     "CMP.l.json.bin",
     "DBcc.json.bin",
+    "DIVU.json.bin",
     "EOR.w.json.bin",
     "EXG.json.bin",
     "JSR.json.bin",
     "LEA.json.bin",
+    "LINK.json.bin",
     "LSR.l.json.bin",
     "MOVE.b.json.bin",
     "MOVE.l.json.bin",
