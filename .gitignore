@@ -18,5 +18,10 @@ third_party/*.zip
 # Local work-in-progress scratch
 *.wip
 
-# Z80 single-step test vectors (downloaded, not checked in)
+# Z80 single-step test vectors — full opt-in corpus (downloaded, not checked in).
+# NOTE: the committed vendored subset lives under tests/z80-tests-vendored/.
 tests/z80-tests/
+
+# m68k single-step test vectors — full opt-in corpus (downloaded, not checked in).
+# NOTE: the committed vendored subset lives under tests/m68000-tests/.
+tests/m68000-tests-full/

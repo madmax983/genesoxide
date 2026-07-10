@@ -7,20 +7,73 @@ use std::path::{Path, PathBuf};
 
 use genesoxide_test_harness::z80_tests;
 
-/// Returns the path to the z80-tests/v1/ directory.
+/// Returns the path to the COMMITTED vendored z80 test directory.
+///
+/// The `.gitignore` blanket-excludes `tests/z80-tests/`, so the committed subset
+/// lives under a sibling `tests/z80-tests-vendored/` tree instead.
 fn test_data_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR = crates/genesoxide-test-harness
-    // test data = ../../tests/z80-tests/v1/v1/
+    // vendored data = ../../tests/z80-tests-vendored/v1/v1/
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest.join("../../tests/z80-tests-vendored/v1/v1")
+}
+
+/// Returns the path to the OPT-IN full-corpus directory (gitignored).
+///
+/// Populated by `scripts/fetch-sst-corpus.sh --full`; consumed only by the
+/// `#[ignore]` [`full_suite`] runner.
+fn full_data_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest.join("../../tests/z80-tests/v1/v1")
 }
+
+/// Committed vendored opcode files. These MUST be present in a clean checkout —
+/// a missing one is a hard failure, not a silent skip.
+const VENDORED: &[&str] = &[
+    "00.json",
+    "01.json",
+    "09.json",
+    "10.json",
+    "18.json",
+    "27.json",
+    "3e.json",
+    "41.json",
+    "80.json",
+    "90.json",
+    "a0.json",
+    "a8.json",
+    "b0.json",
+    "b8.json",
+    "c1.json",
+    "c3.json",
+    "c5.json",
+    "c9.json",
+    "cb 00.json",
+    "cb 40.json",
+    "cb c0.json",
+    "cd.json",
+    "dd 21.json",
+    "dd cb __ 46.json",
+    "ed 41.json",
+    "ed 42.json",
+    "ed b0.json",
+];
 
 /// Helper: run all test cases from a single .json file.
 /// Panics with a summary if any tests fail.
 fn run_opcode_tests(filename: &str) {
     let path = test_data_dir().join(filename);
     if !path.exists() {
-        eprintln!("Skipping {filename}: file not found at {}", path.display());
+        if VENDORED.contains(&filename) {
+            panic!(
+                "Vendored SingleStepTests file missing: {filename}. \
+                 A clean checkout must include it. See tests/z80-tests-vendored/README.md"
+            );
+        }
+        eprintln!(
+            "[genesoxide][full-corpus] {filename} absent — run scripts/fetch-sst-corpus.sh --full \
+             then `cargo test -p genesoxide-test-harness --test z80_suite full_suite -- --ignored` to enable"
+        );
         return;
     }
 
@@ -578,10 +631,13 @@ fn fdcb_set_0_iy_d() {
 #[test]
 #[ignore] // Run explicitly — takes a while with ~1.6M tests
 fn full_suite() {
-    let dir = test_data_dir();
+    // Full corpus lives in the gitignored opt-in directory, populated by
+    // `scripts/fetch-sst-corpus.sh --full`.
+    let dir = full_data_dir();
     if !dir.exists() {
         eprintln!(
-            "Skipping Z80 full suite: directory not found at {}",
+            "Skipping Z80 full suite: directory not found at {}. \
+             Run scripts/fetch-sst-corpus.sh --full to populate it.",
             dir.display()
         );
         return;
