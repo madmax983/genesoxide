@@ -2640,7 +2640,12 @@ impl GenesisCore {
             self.cpu.ssp = self.read_long(0x000000);
             self.cpu.pc = self.read_long(0x000004);
         }
-        self.cpu.sr = super::cpu::StatusRegister::new(super::cpu::StatusRegister::S);
+        // Reset exception (M68000UM §6.2.2): S=1, interrupt mask=7, T=0 →
+        // SR = 0x2700. Forcing the mask to 7 stops a spurious early interrupt
+        // before the boot code raises it.
+        self.cpu.sr = super::cpu::StatusRegister::new(
+            super::cpu::StatusRegister::S | super::cpu::StatusRegister::IPM_MASK,
+        );
         self.cpu.halted = false;
         self.cpu.stopped = false;
     }
@@ -2667,6 +2672,7 @@ impl GenesisCore {
             port1: &mut self.port1,
             port2: &mut self.port2,
             z80_ram: &mut self.z80_ram,
+            z80_bank: &mut self.z80_bank,
             z80_bus_requested: &mut self.z80_bus_requested,
             z80_reset: &mut self.z80_reset,
             z80_reset_pending: &mut self.z80_reset_pending,
@@ -2941,6 +2947,7 @@ impl GenesisCore {
                     port1: &mut self.port1,
                     port2: &mut self.port2,
                     z80_ram: &mut self.z80_ram,
+                    z80_bank: &mut self.z80_bank,
                     z80_bus_requested: &mut self.z80_bus_requested,
                     z80_reset: &mut self.z80_reset,
                     z80_reset_pending: &mut self.z80_reset_pending,
@@ -3015,6 +3022,7 @@ impl GenesisCore {
                     port1: &mut self.port1,
                     port2: &mut self.port2,
                     z80_ram: &mut self.z80_ram,
+                    z80_bank: &mut self.z80_bank,
                     z80_bus_requested: &mut self.z80_bus_requested,
                     z80_reset: &mut self.z80_reset,
                     z80_reset_pending: &mut self.z80_reset_pending,
@@ -3761,6 +3769,19 @@ fn read_68k_byte(
     }
 }
 
+/// Shifts one bit into the Z80 sound-ROM bank register.
+///
+/// The bank register (Z80-side `0x6000-0x60FF`, and the same location the 68000
+/// sees through its `0xA06000` Z80-area window) is a 9-bit serial shift
+/// register: each write feeds bit 0 of `val` in as the new top bit (ROM address
+/// bit 23) and shifts the prior contents down. It supplies address bits 15-23
+/// of the Z80's `0x8000-0xFFFF` banked window. Shared by the Z80's own bus path
+/// and the 68000 window so both program the bank identically.
+#[must_use]
+fn shift_z80_bank_bit(bank: u32, val: u8) -> u32 {
+    ((bank >> 1) | ((u32::from(val) & 1) << 23)) & 0xFF8000
+}
+
 /// Writes one byte to the 68000's 24-bit address space.
 ///
 /// The write-side counterpart to [`read_68k_byte`] and the single source of
@@ -3781,6 +3802,7 @@ fn write_68k_byte(
     z80_ram: &mut [u8; 0x2000],
     ym2612: &mut ym2612::Ym2612,
     psg: &mut psg::Psg,
+    z80_bank: &mut u32,
     z80_bus_requested: &mut bool,
     z80_reset: &mut bool,
     z80_reset_pending: &mut bool,
@@ -3844,6 +3866,13 @@ fn write_68k_byte(
                 0x4001 => trace.record_ym2612(ym2612, 0, val),
                 0x4002 => ym2612.write_address(1, val),
                 0x4003 => trace.record_ym2612(ym2612, 1, val),
+                // Sound-ROM bank register. A 68000 poking 0xA06000 programs the
+                // Z80's bank exactly as a Z80-side write to 0x6000 would.
+                0x6000..=0x60FF => *z80_bank = shift_z80_bank_bit(*z80_bank, val),
+                // PSG (SN76489) at Z80-side 0x7F11; the whole 0x7F00-0x7FFF VDP
+                // window routes here, matching the Z80's own bus. Some games poke
+                // the PSG through this window before the Z80 driver is running.
+                0x7F00..=0x7FFF => trace.record_psg(psg, val),
                 _ => {}
             }
         }
@@ -3891,6 +3920,7 @@ struct CoreBus<'a> {
     port1: &'a mut ControllerPort,
     port2: &'a mut ControllerPort,
     z80_ram: &'a mut Box<[u8; 0x2000]>,
+    z80_bank: &'a mut u32,
     z80_bus_requested: &'a mut bool,
     z80_reset: &'a mut bool,
     z80_reset_pending: &'a mut bool,
@@ -4078,6 +4108,7 @@ impl Bus for CoreBus<'_> {
             &mut **self.z80_ram,
             self.ym2612,
             self.psg,
+            self.z80_bank,
             self.z80_bus_requested,
             self.z80_reset,
             self.z80_reset_pending,
@@ -4314,7 +4345,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
             0x6000..=0x60FF => {
                 // Bank register: shift in one bit at a time (bit 0 of val),
                 // 9 bits forming bits 15-23 of the ROM address.
-                *self.z80_bank = ((*self.z80_bank >> 1) | ((u32::from(val) & 1) << 23)) & 0xFF8000;
+                *self.z80_bank = shift_z80_bank_bit(*self.z80_bank, val);
             }
             0x7F00..=0x7FFF => self.write_psg(val),
             0x8000..=0xFFFF => {
@@ -4343,6 +4374,7 @@ impl z80::execute::Bus for Z80Bus<'_> {
                     &mut **self.z80_ram,
                     self.ym2612,
                     self.psg,
+                    self.z80_bank,
                     self.z80_bus_requested,
                     self.z80_reset,
                     self.z80_reset_pending,
@@ -4388,6 +4420,7 @@ mod tests {
             port1: &mut core.port1,
             port2: &mut core.port2,
             z80_ram: &mut core.z80_ram,
+            z80_bank: &mut core.z80_bank,
             z80_bus_requested: &mut core.z80_bus_requested,
             z80_reset: &mut core.z80_reset,
             z80_reset_pending: &mut core.z80_reset_pending,
@@ -6257,6 +6290,109 @@ mod tests {
 
         core.clear_psg_timed_write_trace();
         assert!(core.psg_timed_write_trace().is_empty());
+    }
+
+    #[test]
+    fn psg_write_through_68k_z80_window_matches_direct_z80_write() {
+        // 68000 poking the PSG through its 0xA00000-0xA0FFFF Z80-area window
+        // (Z80-side address 0x7F11).
+        let mut via_window = GenesisCore::new();
+        {
+            let mut bus = core_bus_with_master_tick(&mut via_window, 0);
+            bus.write_byte(0xA0_7F11, 0x9F);
+        }
+        // The identical byte issued by the Z80 on its own bus at 0x7F11.
+        let mut via_z80 = GenesisCore::new();
+        {
+            let mut bus = z80_bus_with_master_tick(&mut via_z80, 0);
+            bus.write_byte(0x7F11, 0x9F);
+        }
+        // Chip state must be byte-identical between the two paths...
+        assert_eq!(via_window.psg, via_z80.psg);
+        // ...and the window write must actually reach the chip (regression guard
+        // against the old silent no-op).
+        assert_ne!(via_window.psg, GenesisCore::new().psg);
+    }
+
+    #[test]
+    fn bank_register_write_through_68k_z80_window_matches_direct_z80_write() {
+        // A recognizable 9-bit pattern shifted in one bit per write.
+        let bits = [1u8, 0, 1, 1, 0, 0, 1, 0, 1];
+
+        let mut via_window = GenesisCore::new();
+        {
+            let mut bus = core_bus_with_master_tick(&mut via_window, 0);
+            for &b in &bits {
+                bus.write_byte(0xA0_6000, b);
+            }
+        }
+        let mut via_z80 = GenesisCore::new();
+        {
+            let mut bus = z80_bus_with_master_tick(&mut via_z80, 0);
+            for &b in &bits {
+                bus.write_byte(0x6000, b);
+            }
+        }
+        assert_eq!(via_window.z80_bank, via_z80.z80_bank);
+        assert_ne!(
+            via_window.z80_bank, 0,
+            "window bank write must reach the bank register"
+        );
+    }
+
+    #[test]
+    fn z80_window_write_only_regs_read_back_as_open_bus() {
+        // Reverse direction: the bank register (0x6000) and PSG (0x7F11) are
+        // write-only on hardware, so reads through the 68000 window return the
+        // Z80-area open-bus value (0xFF) — the existing behavior, unaffected by
+        // routing the writes. BUSREQ (0xA11100, a different region) still works.
+        let mut core = GenesisCore::new();
+        let (bank_byte, psg_byte, ym_status) = {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            (
+                bus.read_byte(0xA0_6000),
+                bus.read_byte(0xA0_7F11),
+                bus.read_byte(0xA0_4000),
+            )
+        };
+        assert_eq!(bank_byte, 0xFF);
+        assert_eq!(psg_byte, 0xFF);
+        // The YM2612 status port at 0xA04000 keeps returning real status.
+        assert_eq!(ym_status, core.ym2612.read_status());
+    }
+
+    #[test]
+    fn z80_window_psg_and_bank_writes_survive_snapshot_roundtrip() {
+        // Both routed targets (psg, z80_bank) are already part of the serde
+        // snapshot; confirm a window write round-trips through snapshot/restore.
+        let mut core = GenesisCore::new();
+        {
+            let mut bus = core_bus_with_master_tick(&mut core, 0);
+            bus.write_byte(0xA0_7F11, 0x9F);
+            for &b in &[1u8, 0, 1, 1] {
+                bus.write_byte(0xA0_6000, b);
+            }
+        }
+        let snap = core.snapshot();
+        let json = serde_json::to_value(&snap).unwrap();
+        let restored: GenesisCoreSnapshot = serde_json::from_value(json).unwrap();
+        let mut fresh = GenesisCore::new();
+        fresh.restore(&restored);
+        assert_eq!(fresh.psg, core.psg);
+        assert_eq!(fresh.z80_bank, core.z80_bank);
+    }
+
+    #[test]
+    fn soft_reset_sets_status_register_to_0x2700() {
+        use crate::cpu::StatusRegister;
+        let mut core = GenesisCore::new();
+        // Dirty the SR the way running game code would (mask lowered, T set).
+        core.cpu.sr = StatusRegister::new(0x8000);
+        core.reset();
+        assert_eq!(core.cpu.sr.0, 0x2700);
+        assert!(core.cpu.sr.supervisor());
+        assert_eq!(core.cpu.sr.interrupt_mask(), 7);
+        assert!(!core.cpu.sr.flag(StatusRegister::T));
     }
 
     #[test]
