@@ -446,6 +446,32 @@ impl Eeprom {
         &self.mem
     }
 
+    /// Mutable access to the backing store, for the rewind delta encoder to
+    /// resize and apply byte-run deltas (mirrors direct access to
+    /// `CartSram::data`).
+    pub fn mem_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.mem
+    }
+
+    /// A clone carrying only the scalar (non-backing-store) state: the chip,
+    /// mapper, dirty flag, and full I2C machine registers, with an emptied
+    /// `mem`. Used by the rewind delta encoder to diff the small scalar state
+    /// apart from the byte-diffed backing store.
+    #[must_use]
+    pub fn header_clone(&self) -> Eeprom {
+        let mut c = self.clone();
+        c.mem = Vec::new();
+        c
+    }
+
+    /// Restores every scalar field from `header`, leaving the backing store
+    /// (`mem`) untouched (it is reconstructed separately via byte-run deltas).
+    pub fn restore_header(&mut self, header: &Eeprom) {
+        let mem = std::mem::take(&mut self.mem);
+        *self = header.clone();
+        self.mem = mem;
+    }
+
     /// Loads persisted bytes into the EEPROM. Copies up to the chip size; does
     /// not mark dirty (the on-disk copy is current).
     pub fn load(&mut self, bytes: &[u8]) {

@@ -29,6 +29,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{GenesisCoreSnapshot, Mapper};
+use crate::eeprom::Eeprom;
 use crate::rom::SramLayout;
 use crate::scheduler::Region;
 use crate::vdp::{AccessType, ControlState, VdpSnapshot};
@@ -213,6 +214,10 @@ pub struct ScalarState {
     pub sram_start: u32,
     pub sram_end: u32,
     pub sram_layout: SramLayout,
+    /// Serial-EEPROM scalar state (chip, mapper, dirty flag, and the full I2C
+    /// machine registers). The backing store (`mem`) is byte-diffed separately,
+    /// so this header clone carries an emptied buffer.
+    pub eeprom: Eeprom,
 }
 
 impl ScalarState {
@@ -237,6 +242,7 @@ impl ScalarState {
             sram_start: s.sram.start,
             sram_end: s.sram.end,
             sram_layout: s.sram.layout,
+            eeprom: s.eeprom.header_clone(),
         }
     }
 
@@ -260,6 +266,7 @@ impl ScalarState {
         s.sram.start = self.sram_start;
         s.sram.end = self.sram_end;
         s.sram.layout = self.sram_layout;
+        s.eeprom.restore_header(&self.eeprom);
     }
 }
 
@@ -402,6 +409,12 @@ pub struct FrameDelta {
     /// buffer before writing the byte runs so a length change (or an
     /// initially-empty SRAM) reconstructs exactly rather than being clamped.
     pub sram_len: u32,
+    /// Byte diff of the serial-EEPROM backing store (`eeprom.mem`). Empty when
+    /// the cart has no EEPROM or it is unchanged.
+    pub eeprom_deltas: Vec<ArrayDelta>,
+    /// Target length of `eeprom.mem` after this frame, so `apply` can resize the
+    /// buffer before writing the byte runs (mirrors `sram_len`).
+    pub eeprom_len: u32,
     pub fields: FieldDelta,
     pub input: FrameInput,
     /// Sum of changed-byte-run lengths across all buffers; drives the keyframe
@@ -421,13 +434,15 @@ impl FrameDelta {
         let vram_deltas = diff_array(&before.vdp.vram, &after.vdp.vram);
         let z80_ram_deltas = diff_array(&before.z80_ram, &after.z80_ram);
         let sram_deltas = diff_array(&before.sram.data, &after.sram.data);
+        let eeprom_deltas = diff_array(before.eeprom.data(), after.eeprom.data());
         let fields = FieldDelta::compute(before, after);
 
         let run_bytes = |ds: &[ArrayDelta]| ds.iter().map(|d| d.data.len()).sum::<usize>();
         let compressed_size = (run_bytes(&work_ram_deltas)
             + run_bytes(&vram_deltas)
             + run_bytes(&z80_ram_deltas)
-            + run_bytes(&sram_deltas)) as u32;
+            + run_bytes(&sram_deltas)
+            + run_bytes(&eeprom_deltas)) as u32;
 
         Self {
             frame_id: after.frame_count,
@@ -436,6 +451,8 @@ impl FrameDelta {
             z80_ram_deltas,
             sram_deltas,
             sram_len: after.sram.data.len() as u32,
+            eeprom_deltas,
+            eeprom_len: after.eeprom.data().len() as u32,
             fields,
             input,
             compressed_size,
@@ -452,6 +469,9 @@ impl FrameDelta {
         // exactly instead of being clamped by `apply_deltas`' bounds check.
         target.sram.data.resize(self.sram_len as usize, 0);
         apply_deltas(&mut target.sram.data, &self.sram_deltas);
+        // Same treatment for the serial-EEPROM backing store.
+        target.eeprom.mem_mut().resize(self.eeprom_len as usize, 0);
+        apply_deltas(target.eeprom.mem_mut(), &self.eeprom_deltas);
         self.fields.apply(target);
     }
 
@@ -1005,6 +1025,44 @@ mod tests {
         assert_eq!(recon.sram.data, target.sram.data);
 
         // And the whole snapshot round-trips, proving nothing else drifted.
+        assert!(recon == target, "full snapshot mismatch after delta replay");
+    }
+
+    /// Companion to `delta_carries_new_persistent_state` for serial EEPROM: the
+    /// I2C scalar state (chip/mapper/registers/dirty) and the byte-diffed
+    /// backing store must both survive a delta round-trip, not reset to the
+    /// keyframe's absent-EEPROM state.
+    #[test]
+    fn delta_carries_eeprom_state() {
+        use crate::eeprom::{Eeprom, EepromMapper, EepromType};
+
+        let seq = snapshot_sequence(1);
+        let keyframe = seq[0].1.clone();
+        assert!(
+            !keyframe.eeprom.is_present(),
+            "test setup expects the keyframe to have no EEPROM",
+        );
+
+        // Target frame fits a present EEPROM, drives a couple of I2C bus writes
+        // (advancing the I2C machine registers) and mutates the backing store.
+        let mut target = keyframe.clone();
+        let mut ee = Eeprom::new(EepromType::X24C01, EepromMapper::Sega);
+        ee.write(0x20_0001, 0b11); // SCL+SDA high
+        ee.write(0x20_0001, 0b01); // SDA high->low while SCL high (START)
+        ee.mem_mut()[10] = 0xAB;
+        target.eeprom = ee.clone();
+
+        // Sanity: the two frames really differ.
+        assert!(target.eeprom.is_present());
+        assert_ne!(keyframe.eeprom, target.eeprom);
+
+        let delta = FrameDelta::compute(&keyframe, &target, FrameInput::default());
+        let mut recon = keyframe.clone();
+        delta.apply(&mut recon);
+
+        assert!(recon.eeprom.is_present(), "EEPROM presence not reconstructed");
+        assert_eq!(recon.eeprom.data(), target.eeprom.data(), "backing store drifted");
+        assert_eq!(recon.eeprom, target.eeprom, "EEPROM scalar/I2C state drifted");
         assert!(recon == target, "full snapshot mismatch after delta replay");
     }
 
