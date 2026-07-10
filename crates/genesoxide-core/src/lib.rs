@@ -6,6 +6,7 @@
 pub mod api;
 pub mod bus;
 pub mod cpu;
+pub mod eeprom;
 pub mod io;
 pub mod psg;
 pub mod rewind;
